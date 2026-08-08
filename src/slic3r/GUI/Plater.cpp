@@ -2029,6 +2029,17 @@ static std::string serialize_nozzle_option(const NozzleOption& option) {
             oss << static_cast<int>(stat_pair.first) << "#" << stat_pair.second;
         }
     }
+    // Preserve the legacy two-field byte representation for every uniform option. Mixed options
+    // append a third field, so caches written by older versions continue to deserialize unchanged.
+    if (!option.extruder_diameters.empty()) {
+        oss << "|";
+        bool first_diameter = true;
+        for (const auto &[extruder_id, diameter] : option.extruder_diameters) {
+            if (!first_diameter) oss << ",";
+            first_diameter = false;
+            oss << extruder_id << "#" << diameter;
+        }
+    }
     return oss.str();
 }
 
@@ -2037,7 +2048,7 @@ static std::optional<NozzleOption> deserialize_nozzle_option(const std::string& 
 
     std::vector<std::string> parts;
     boost::split(parts, option_str, boost::is_any_of("|"));
-    if (parts.size() != 2) return std::nullopt;
+    if (parts.size() != 2 && parts.size() != 3) return std::nullopt;
 
     NozzleOption option;
     option.diameter = parts[0];
@@ -2069,6 +2080,19 @@ static std::optional<NozzleOption> deserialize_nozzle_option(const std::string& 
         }
 
         option.extruder_nozzle_stats[extruder_id] = stats;
+    }
+
+    if (parts.size() == 3) {
+        std::vector<std::string> diameter_parts;
+        boost::split(diameter_parts, parts[2], boost::is_any_of(","));
+        for (const auto &diameter_part : diameter_parts) {
+            std::vector<std::string> kv;
+            boost::split(kv, diameter_part, boost::is_any_of("#"));
+            if (kv.size() == 2)
+                option.extruder_diameters[std::stoi(kv[0])] = kv[1];
+        }
+        if (option.extruder_diameters.empty())
+            return std::nullopt;
     }
 
     return option;

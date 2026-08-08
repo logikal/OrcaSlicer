@@ -27,6 +27,7 @@
 #include <wx/webview.h>
 
 #include <memory>
+#include <map>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -50,12 +51,16 @@ namespace GUI {
 struct NozzleOption
 {
     std::string diameter;
+    // Populated only for the mixed option. `diameter` remains the display/cache value used by
+    // uniform options so existing app_config entries keep their old representation.
+    std::map<int, std::string> extruder_diameters;
     std::unordered_map<int, std::unordered_map<NozzleVolumeType, int>> extruder_nozzle_stats;
 };
 #else
 struct NozzleOption
 {
     std::string diameter;
+    std::map<int, std::string> extruder_diameters;
     std::unordered_map<int, std::pair<NozzleVolumeType, int>> extruder_nozzle_stats;
 };
 #endif

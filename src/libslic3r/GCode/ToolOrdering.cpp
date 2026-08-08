@@ -1247,6 +1247,58 @@ static std::vector<MultiNozzleUtils::NozzleGroupInfo> build_nozzle_groups(const 
     return nozzle_groups;
 }
 
+// Resolve a fully manual multi-nozzle request while retaining each extruder's own diameter.
+// LayeredNozzleGroupResult's six-argument factory accepts only one diameter; its NozzleInfo-list
+// factory already carries a diameter per physical nozzle, so build that input here instead.
+static std::optional<MultiNozzleUtils::LayeredNozzleGroupResult> build_manual_multi_nozzle_group_result(
+    const PrintConfig&                                  print_config,
+    const std::vector<unsigned int>&                    used_filaments,
+    const std::vector<int>&                             filament_map,
+    const std::vector<int>&                             filament_volume_map,
+    const std::vector<int>&                             filament_nozzle_map)
+{
+    using namespace MultiNozzleUtils;
+
+    const auto nozzle_counts = get_extruder_nozzle_stats(print_config.extruder_nozzle_stats.values);
+    std::vector<NozzleGroupInfo> nozzle_groups;
+    for (size_t extruder_id = 0; extruder_id < nozzle_counts.size(); ++extruder_id) {
+        const double diameter = print_config.nozzle_diameter.values.empty() ? 0.4 : print_config.nozzle_diameter.get_at(extruder_id);
+        for (const auto &[volume_type, count] : nozzle_counts[extruder_id])
+            nozzle_groups.emplace_back(format_diameter_to_str(diameter), volume_type, static_cast<int>(extruder_id), count);
+    }
+
+    auto nozzle_list = build_nozzle_list(std::move(nozzle_groups));
+    std::vector<bool> used_nozzles(nozzle_list.size(), false);
+    std::map<int, int> input_to_output_nozzle;
+    std::vector<int> output_nozzle_map(filament_nozzle_map.size(), 0);
+
+    for (unsigned int filament_id : used_filaments) {
+        const int input_nozzle_id = filament_nozzle_map[filament_id];
+        const auto mapped = input_to_output_nozzle.find(input_nozzle_id);
+        if (mapped != input_to_output_nozzle.end()) {
+            output_nozzle_map[filament_id] = mapped->second;
+            continue;
+        }
+
+        int output_nozzle_id = -1;
+        for (size_t nozzle_id = 0; nozzle_id < nozzle_list.size(); ++nozzle_id) {
+            const auto &nozzle = nozzle_list[nozzle_id];
+            if (used_nozzles[nozzle_id] || nozzle.extruder_id != filament_map[filament_id] ||
+                nozzle.volume_type != NozzleVolumeType(filament_volume_map[filament_id]))
+                continue;
+            output_nozzle_id = static_cast<int>(nozzle_id);
+            input_to_output_nozzle[input_nozzle_id] = output_nozzle_id;
+            used_nozzles[nozzle_id] = true;
+            break;
+        }
+        if (output_nozzle_id < 0)
+            return std::nullopt;
+        output_nozzle_map[filament_id] = output_nozzle_id;
+    }
+
+    return LayeredNozzleGroupResult::create(output_nozzle_map, nozzle_list, used_filaments);
+}
+
 // Build the nozzle-centric FilamentGroupContext.
 // Orca deviations, all inert for the shipping fleet:
 //   * no print->get_filament_usage_type() → FilamentInfo::usage_type stays ModelOnly (the default);
@@ -1498,7 +1550,6 @@ MultiNozzleUtils::LayeredNozzleGroupResult ToolOrdering::get_recommended_filamen
     if (mode == FilamentMapMode::fmmNozzleManual) {
         auto manual_filament_map = print_config.filament_map.values;
         std::transform(manual_filament_map.begin(), manual_filament_map.end(), manual_filament_map.begin(), [](int v) { return v - 1; });
-        float diameter = print_config.nozzle_diameter.values.empty() ? 0.4f : (float)print_config.nozzle_diameter.values.front();
         // Orca: create() indexes the volume/nozzle maps per used filament with no bounds check, so
         // pass them only when a producer sized them to the filament count (mis-sized maps can
         // arrive from stale projects or CLI runs until the per-filament synthesis lands there).
@@ -1507,7 +1558,9 @@ MultiNozzleUtils::LayeredNozzleGroupResult ToolOrdering::get_recommended_filamen
         std::optional<LayeredNozzleGroupResult> nozzle_result;
         if (print_config.filament_volume_map.values.size() == filament_nums &&
             print_config.filament_nozzle_map.values.size() == filament_nums)
-            nozzle_result = LayeredNozzleGroupResult::create(used_filaments, manual_filament_map, print_config.filament_volume_map.values, print_config.filament_nozzle_map.values, get_extruder_nozzle_stats(print_config.extruder_nozzle_stats.values), diameter);
+            nozzle_result = build_manual_multi_nozzle_group_result(print_config, used_filaments, manual_filament_map,
+                                                                   print_config.filament_volume_map.values,
+                                                                   print_config.filament_nozzle_map.values);
         if (!nozzle_result)
             BOOST_LOG_TRIVIAL(error) << "Failed to build nozzle group result from filament nozzle map!";
         return nozzle_result ? *nozzle_result : LayeredNozzleGroupResult();
@@ -1651,8 +1704,9 @@ static MultiNozzleUtils::LayeredNozzleGroupResult build_group_result_from_map(
     if (has_multiple_nozzle &&
         print_config.filament_volume_map.values.size() == filament_nums &&
         print_config.filament_nozzle_map.values.size() == filament_nums) {
-        float diameter = print_config.nozzle_diameter.values.empty() ? 0.4f : static_cast<float>(print_config.nozzle_diameter.values.front());
-        if (auto g = LayeredNozzleGroupResult::create(used_filaments, filament_map_0based, print_config.filament_volume_map.values, print_config.filament_nozzle_map.values, get_extruder_nozzle_stats(print_config.extruder_nozzle_stats.values), diameter))
+        if (auto g = build_manual_multi_nozzle_group_result(print_config, used_filaments, filament_map_0based,
+                                                            print_config.filament_volume_map.values,
+                                                            print_config.filament_nozzle_map.values))
             return *g;
     }
     auto nozzle_list = build_default_nozzle_list(print_config, extruder_nums);
