@@ -105,6 +105,17 @@ size_t get_extruder_index(const GCodeConfig& config, unsigned int filament_id)
     return 0;
 }
 
+size_t get_extruder_index_from_filament_id(const GCodeConfig& config, unsigned int filament_id)
+{
+    if (filament_id == 0)
+        return 0;
+    const unsigned int idx = filament_id - 1;
+    if (idx < config.filament_map.size())
+        return config.filament_map.get_at(idx) - 1;
+    // No materialized filament map for this slot: keep the legacy identity mapping.
+    return idx;
+}
+
 
 // Orca: input shaping values types by flavor
 std::vector<std::string> get_shaper_type_values_for_flavor(GCodeFlavor flavor)

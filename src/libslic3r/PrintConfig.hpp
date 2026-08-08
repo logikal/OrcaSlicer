@@ -2395,6 +2395,7 @@ static void set_flush_volumes_matrix(std::vector<T> &out_matrix, const std::vect
 }
 
 size_t get_extruder_index(const GCodeConfig& config, unsigned int filament_id);
+size_t get_extruder_index_from_filament_id(const GCodeConfig& config, unsigned int filament_id);
 
 } // namespace Slic3r
 

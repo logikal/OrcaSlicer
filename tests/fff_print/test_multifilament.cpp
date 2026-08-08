@@ -270,6 +270,38 @@ TEST_CASE("Each feature prints with its assigned filament", "[MultiFilament]")
     }
 }
 
+TEST_CASE("Wall flow width follows the filament to extruder map", "[MultiFilament][Regression]")
+{
+    const bool swapped = GENERATE(false, true);
+    DYNAMIC_SECTION("filament map " << (swapped ? "2,1" : "1,2")) {
+        const std::vector<int> filament_map = swapped ? std::vector<int>{2, 1} : std::vector<int>{1, 2};
+        DynamicPrintConfig config = multifilament_config(2, {
+            { "nozzle_diameter",          "0.2,0.4" },
+            { "printer_extruder_id",      "1,2" },
+            { "printer_extruder_variant", "Direct Drive Standard,Direct Drive Standard" },
+            { "outer_wall_filament_id",   1 },
+            { "inner_wall_filament_id",   1 },
+            { "outer_wall_line_width",    0 },
+            { "line_width",               0 },
+            { "layer_height",             0.1 },
+        });
+        config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value = fmmManual;
+        config.option<ConfigOptionInts>("filament_map", true)->values = filament_map;
+
+        Print print;
+        Model model;
+        init_print({ cube(20) }, print, model, config);
+        REQUIRE(print.get_filament_maps() == filament_map);
+
+        const PrintObject &object          = *print.objects().front();
+        const Flow         flow            = object.printing_region(0).flow(object, frExternalPerimeter, 0.1, false);
+        const float        expected_nozzle = swapped ? 0.4f : 0.2f;
+        CHECK_THAT(flow.nozzle_diameter(), Catch::Matchers::WithinAbs(expected_nozzle, 1e-6));
+        CHECK_THAT(flow.width(), Catch::Matchers::WithinAbs(
+            Flow::auto_extrusion_width(frExternalPerimeter, expected_nozzle), 1e-6));
+    }
+}
+
 TEST_CASE("Each feature prints with its assigned filament (three filaments)", "[MultiFilament]")
 {
     const std::string gcode = slice({ cube(20) },
@@ -714,4 +746,3 @@ TEST_CASE("Multi-extruder slice stays in bounds with a short max_layer_height", 
     init_and_process_print({ cube(20) }, print, config);
     REQUIRE_FALSE(print.objects().front()->layers().empty());
 }
-
