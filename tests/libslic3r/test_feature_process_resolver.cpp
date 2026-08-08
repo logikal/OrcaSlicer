@@ -1,6 +1,7 @@
 #include <catch2/catch_all.hpp>
 
 #include "libslic3r/FeatureProcessResolver.hpp"
+#include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
 
 #include <algorithm>
@@ -256,4 +257,44 @@ TEST_CASE("Feature process candidates retain incompatible presets with reasons",
     REQUIRE(non_divisor != nullptr);
     CHECK_FALSE(non_divisor->compatible);
     CHECK(non_divisor->why_not == FeatureProcessRejection::LayerHeightNotDivisor);
+}
+
+TEST_CASE("Feature process projection updater refreshes model scopes without changing intent", "[FeatureProcessResolver]")
+{
+    ResolverFixture fixture;
+    DynamicPrintConfig full_config = DynamicPrintConfig::full_print_config();
+    full_config.apply(fixture.printer_config);
+    full_config.option<ConfigOptionFloat>("layer_height", true)->value = 0.2;
+    full_config.option<ConfigOptionInt>("extruder", true)->value = 1;
+    full_config.option<ConfigOptionString>("print_settings_id", true)->value = ResolverFixture::standard_04;
+    full_config.option<ConfigOptionInt>("wall_loops", true)->value = 2;
+    full_config.option<ConfigOptionInt>("outer_wall_filament_id", true)->value = 1;
+
+    Model model;
+    ModelObject *object = model.add_object("cube", "", make_cube(20., 20., 20.));
+    object->add_instance();
+
+    CHECK_FALSE(update_feature_process_projections(model, fixture.bundle, full_config));
+    CHECK_FALSE(object->config.has("wall_process_projection"));
+
+    object->config.set("outer_wall_filament_id", 2);
+    REQUIRE(update_feature_process_projections(model, fixture.bundle, full_config));
+    const auto *projection = dynamic_cast<const ConfigOptionString *>(object->config.option("wall_process_projection"));
+    REQUIRE(projection != nullptr);
+    CHECK(projection->value.find("outer_wall_speed=") != std::string::npos);
+    CHECK(projection->value.find("nozzle_temperature") == std::string::npos);
+    CHECK(projection->value.find("layer_height=") == std::string::npos);
+    const auto *height = dynamic_cast<const ConfigOptionFloat *>(object->config.option("wall_layer_height"));
+    REQUIRE(height != nullptr);
+    CHECK_THAT(height->value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+    CHECK_FALSE(update_feature_process_projections(model, fixture.bundle, full_config));
+
+    object->config.set_key_value("wall_process_policy", new ConfigOptionEnum<FeatureProcessPolicy>(FeatureProcessPolicy::Pinned));
+    object->config.set("wall_process_preset", std::string("Missing process"));
+    REQUIRE(update_feature_process_projections(model, fixture.bundle, full_config));
+    CHECK_FALSE(object->config.has("wall_process_projection"));
+    const auto *policy = dynamic_cast<const ConfigOptionEnum<FeatureProcessPolicy> *>(object->config.option("wall_process_policy"));
+    REQUIRE(policy != nullptr);
+    CHECK(policy->value == FeatureProcessPolicy::Pinned);
+    CHECK(object->config.opt_serialize("wall_process_preset") == "Missing process");
 }

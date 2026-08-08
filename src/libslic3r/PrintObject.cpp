@@ -6,6 +6,7 @@
 #include "ClipperUtils.hpp"
 #include "Clipper2Utils.hpp"
 #include "ElephantFootCompensation.hpp"
+#include "FeatureProcessResolver.hpp"
 #include "Geometry.hpp"
 #include "I18N.hpp"
 #include "Layer.hpp"
@@ -26,6 +27,7 @@
 #include "format.hpp"
 #include "AABBTreeLines.hpp"
 
+#include <cctype>
 #include <cstddef>
 #include <float.h>
 #include <iterator>
@@ -3793,8 +3795,77 @@ struct FeatureFilamentOverrideMask
     bool inner_wall_filament_id    = false;
 };
 
-static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPrintConfig &in, FeatureFilamentOverrideMask &feature_overrides, std::vector<int>& variant_index)
+static std::string_view trim_projection_token(std::string_view token)
 {
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front())))
+        token.remove_prefix(1);
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back())))
+        token.remove_suffix(1);
+    return token;
+}
+
+static unsigned int effective_wall_filament(const PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                            const FeatureFilamentOverrideMask &feature_overrides)
+{
+    const auto *feature = in.option<ConfigOptionInt>("outer_wall_filament_id");
+    if (feature != nullptr && feature->value > 0)
+        return unsigned(feature->value);
+    const auto *base = in.option<ConfigOptionInt>(key_extruder);
+    if (base != nullptr && base->value > 0 && (feature == nullptr ? !feature_overrides.outer_wall_filament_id : feature->value == 0))
+        return unsigned(base->value);
+    return unsigned(std::max(out.outer_wall_filament_id.value, 0));
+}
+
+static void apply_feature_process_projection(PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                             const FeatureFilamentOverrideMask &feature_overrides,
+                                             const PrintConfig &print_config)
+{
+    const auto *serialized = in.option<ConfigOptionString>("wall_process_projection");
+    if (serialized == nullptr || serialized->value.empty())
+        return;
+
+    const std::vector<std::string> &allowed = feature_projection_keys(FeatureRole::Wall);
+    const size_t tool_id = get_extruder_index_from_filament_id(
+        print_config, effective_wall_filament(out, in, feature_overrides));
+    for (size_t begin = 0; begin <= serialized->value.size();) {
+        const size_t end = serialized->value.find(';', begin);
+        const std::string_view entry(serialized->value.data() + begin,
+                                     (end == std::string::npos ? serialized->value.size() : end) - begin);
+        const size_t equals = entry.find('=');
+        const std::string key(trim_projection_token(entry.substr(0, equals)));
+        if (!key.empty()) {
+            if (equals == std::string_view::npos || std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+                BOOST_LOG_TRIVIAL(warning) << "Ignoring non-whitelisted feature process projection key: " << key;
+            } else if (ConfigOption *target = out.option(key, false); target != nullptr) {
+                try {
+                    DynamicPrintConfig parsed;
+                    parsed.set_deserialize_strict(key, std::string(trim_projection_token(entry.substr(equals + 1))));
+                    const ConfigOption *source = parsed.option(key);
+                    if (auto *target_vector = dynamic_cast<ConfigOptionVectorBase *>(target); target_vector != nullptr)
+                        target_vector->set_at(source, tool_id, 0);
+                    else
+                        target->set(source);
+                } catch (...) {
+                    BOOST_LOG_TRIVIAL(warning) << "Ignoring malformed feature process projection key: " << key;
+                }
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "Ignoring unknown feature process projection key: " << key;
+            }
+        }
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+}
+
+static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                         FeatureFilamentOverrideMask &feature_overrides,
+                                         std::vector<int>& variant_index, const PrintConfig &print_config)
+{
+    // Derived process values are the first pass. The explicit loop below is intentionally
+    // second so a user override in this same scope always wins.
+    apply_feature_process_projection(out, in, feature_overrides, print_config);
+
     // 1) Explicit feature filament values take precedence over base extruder fallback.
     auto *opt_extruder = in.opt<ConfigOptionInt>(key_extruder);
     int base_extruder = (opt_extruder != nullptr) ? opt_extruder->value : 0;
@@ -3865,7 +3936,10 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
     }
 }
 
-PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &default_or_parent_region_config, const DynamicPrintConfig *layer_range_config, const ModelVolume &volume, size_t num_extruders, std::vector<int>& variant_index)
+PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &default_or_parent_region_config,
+                                                  const DynamicPrintConfig *layer_range_config,
+                                                  const ModelVolume &volume, size_t num_extruders,
+                                                  std::vector<int>& variant_index, const PrintConfig &print_config)
 {
     PrintRegionConfig config = default_or_parent_region_config;
     FeatureFilamentOverrideMask feature_overrides;
@@ -3883,17 +3957,17 @@ PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &defau
     if (volume.is_model_part()) {
         // default_or_parent_region_config contains the Print's PrintRegionConfig.
         // Override with ModelObject's PrintRegionConfig values.
-        apply_to_print_region_config(config, volume.get_object()->config.get(), feature_overrides, variant_index);
+        apply_to_print_region_config(config, volume.get_object()->config.get(), feature_overrides, variant_index, print_config);
     } else {
         // default_or_parent_region_config contains parent PrintRegion config, which already contains ModelVolume's config.
     }
-    apply_to_print_region_config(config, volume.config.get(), feature_overrides, variant_index);
+    apply_to_print_region_config(config, volume.config.get(), feature_overrides, variant_index, print_config);
     if (! volume.material_id().empty())
-        apply_to_print_region_config(config, volume.material()->config.get(), feature_overrides, variant_index);
+        apply_to_print_region_config(config, volume.material()->config.get(), feature_overrides, variant_index, print_config);
     if (layer_range_config != nullptr) {
         // Not applicable to modifiers.
         assert(volume.is_model_part());
-    	apply_to_print_region_config(config, *layer_range_config, feature_overrides, variant_index);
+        apply_to_print_region_config(config, *layer_range_config, feature_overrides, variant_index, print_config);
     }
     // Resolve feature defaults and clamp invalid extruders to index 1.
     clamp_feature_filament_to_valid(config.sparse_infill_filament_id, num_extruders);
@@ -3960,7 +4034,7 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 		if (model_volume->is_model_part()) {
 			PrintRegion::collect_object_printing_extruders(
 				print_config,
-				region_config_from_model_volume(default_region_config, nullptr, *model_volume, filament_extruders, variant_index),
+				region_config_from_model_volume(default_region_config, nullptr, *model_volume, filament_extruders, variant_index, print_config),
                 object_config.brim_type != btNoBrim && object_config.brim_width > 0.,
 				object_extruders);
 			for (const std::pair<const t_layer_height_range, ModelConfig> &range_and_config : model_object.layer_config_ranges)
@@ -3972,7 +4046,7 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 					range_and_config.second.has("bottom_surface_filament_id"))
 					PrintRegion::collect_object_printing_extruders(
 						print_config,
-						region_config_from_model_volume(default_region_config, &range_and_config.second.get(), *model_volume, filament_extruders, variant_index),
+						region_config_from_model_volume(default_region_config, &range_and_config.second.get(), *model_volume, filament_extruders, variant_index, print_config),
                         object_config.brim_type != btNoBrim && object_config.brim_width > 0.,
 						object_extruders);
 		}

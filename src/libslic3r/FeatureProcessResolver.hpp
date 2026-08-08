@@ -9,6 +9,7 @@ namespace Slic3r {
 
 class Preset;
 class PresetBundle;
+class Model;
 
 enum class FeatureRole {
     Wall,
@@ -81,5 +82,9 @@ FeatureProcessRejection preset_compatible_with_tool(const Preset       &process_
 const std::vector<std::string> &feature_projection_keys(FeatureRole role);
 
 int feature_cadence_ratio(double base_layer_height, double feature_layer_height);
+
+// Refresh derived feature projections stored on object and volume scopes.
+bool update_feature_process_projections(Model &model, const PresetBundle &bundle,
+                                        const DynamicPrintConfig &full_config);
 
 } // namespace Slic3r

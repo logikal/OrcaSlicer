@@ -1,12 +1,15 @@
 #include "FeatureProcessResolver.hpp"
 
+#include "Model.hpp"
 #include "PlaceholderParser.hpp"
 #include "PresetBundle.hpp"
 #include "Slicing.hpp"
 #include "format.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <exception>
 #include <iomanip>
 #include <limits>
 #include <regex>
@@ -19,6 +22,25 @@ namespace {
 
 constexpr double NOZZLE_EPSILON = 1e-6;
 constexpr double DIVISOR_EPSILON = 0.0005;
+
+struct FeatureProjectionDescriptor {
+    FeatureRole role;
+    const char *policy_key;
+    const char *preset_key;
+    const char *height_key;
+    const char *projection_key;
+    const char *filament_key;
+};
+
+const std::array<FeatureProjectionDescriptor, 7> feature_projection_descriptors{{
+    {FeatureRole::Wall,             "wall_process_policy",              "wall_process_preset",              "wall_layer_height",              "wall_process_projection",              "outer_wall_filament_id"},
+    {FeatureRole::SparseInfill,     "sparse_infill_process_policy",     "sparse_infill_process_preset",     "sparse_infill_process_layer_height",     "sparse_infill_process_projection",     "sparse_infill_filament_id"},
+    {FeatureRole::InternalSolid,    "internal_solid_process_policy",    "internal_solid_process_preset",    "internal_solid_process_layer_height",    "internal_solid_process_projection",    "internal_solid_filament_id"},
+    {FeatureRole::TopSurface,       "top_surface_process_policy",       "top_surface_process_preset",       "top_surface_process_layer_height",       "top_surface_process_projection",       "top_surface_filament_id"},
+    {FeatureRole::BottomSurface,    "bottom_surface_process_policy",    "bottom_surface_process_preset",    "bottom_surface_process_layer_height",    "bottom_surface_process_projection",    "bottom_surface_filament_id"},
+    {FeatureRole::Support,          "support_process_policy",           "support_process_preset",           "support_process_layer_height",           "support_process_projection",           "support_filament"},
+    {FeatureRole::SupportInterface, "support_interface_process_policy", "support_interface_process_preset", "support_interface_process_layer_height", "support_interface_process_projection", "support_interface_filament"},
+}};
 
 const ConfigOption *inherited_option(const Preset &preset, const PresetCollection &collection, const std::string &key)
 {
@@ -121,6 +143,125 @@ std::string format_number(double value)
     if (!result.empty() && result.back() == '.')
         result.pop_back();
     return result.empty() ? "0" : result;
+}
+
+std::string serialize_projection(const DynamicPrintConfig &projection)
+{
+    std::vector<std::string> keys = projection.keys();
+    std::sort(keys.begin(), keys.end());
+    std::ostringstream stream;
+    for (const std::string &key : keys) {
+        if (stream.tellp() > 0)
+            stream << ';';
+        stream << key << '=' << projection.opt_serialize(key);
+    }
+    return stream.str();
+}
+
+bool set_model_config_string(ModelConfig &config, const char *key, const std::string &value)
+{
+    const auto *current = dynamic_cast<const ConfigOptionString *>(config.option(key));
+    if (current != nullptr && current->value == value)
+        return false;
+    config.set_key_value(key, new ConfigOptionString(value));
+    return true;
+}
+
+bool set_model_config_float(ModelConfig &config, const char *key, double value)
+{
+    const ConfigOptionFloat replacement(value);
+    const auto *current = dynamic_cast<const ConfigOptionFloat *>(config.option(key));
+    if (current != nullptr && *current == replacement)
+        return false;
+    config.set_key_value(key, replacement.clone());
+    return true;
+}
+
+FeatureProcessPolicy feature_policy(const DynamicPrintConfig &config, const char *key)
+{
+    const auto *option = config.option<ConfigOptionEnum<FeatureProcessPolicy>>(key);
+    return option == nullptr ? FeatureProcessPolicy::AutoNozzleVariant : option->value;
+}
+
+int effective_filament(const DynamicPrintConfig &config, const char *key)
+{
+    const auto *feature = config.option<ConfigOptionInt>(key);
+    if (feature != nullptr && feature->value > 0)
+        return feature->value;
+    const auto *object = config.option<ConfigOptionInt>("extruder");
+    return object == nullptr ? 0 : object->value;
+}
+
+bool feature_tool_differs_from_object(const DynamicPrintConfig &config, int feature_filament)
+{
+    const GCodeConfig gcode_config = gcode_config_from(&config);
+    const auto *diameters = config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (diameters == nullptr || diameters->values.empty())
+        return false;
+    const int object_filament = effective_filament(config, "extruder");
+    const size_t feature_tool = get_extruder_index_from_filament_id(gcode_config, std::max(feature_filament, 0));
+    const size_t object_tool = get_extruder_index_from_filament_id(gcode_config, std::max(object_filament, 0));
+    return std::abs(diameters->get_at(feature_tool) - diameters->get_at(object_tool)) > NOZZLE_EPSILON;
+}
+
+// A volume scope only needs its own resolution when its sparse config actually contributes a
+// feature-relevant key; otherwise it inherits the object's values and writing copies here would
+// materialize overrides into every part's config.
+bool volume_scope_affects_feature(const ModelConfig &config, const FeatureProjectionDescriptor &descriptor)
+{
+    const DynamicPrintConfig &c = config.get();
+    return c.has(descriptor.policy_key) || c.has(descriptor.preset_key) || c.has(descriptor.height_key) ||
+           c.has(descriptor.filament_key) || c.has("extruder") ||
+           (descriptor.role == FeatureRole::Wall && c.has("wall_loops"));
+}
+
+bool update_scope_projection(ModelConfig &scope, const DynamicPrintConfig &effective,
+                             const FeatureProjectionDescriptor &descriptor, const PresetBundle &bundle,
+                             const DynamicPrintConfig &full_config)
+{
+    if (feature_projection_keys(descriptor.role).empty())
+        return false;
+
+    // Phase 1 treats wall_loops as the wall-activity test. Brim-only walls are handled
+    // with the broader feature-presence rules when cadence generation lands in P1.4.
+    if (descriptor.role == FeatureRole::Wall) {
+        const auto *wall_loops = effective.option<ConfigOptionInt>("wall_loops");
+        if (wall_loops != nullptr && wall_loops->value <= 0)
+            return scope.erase(descriptor.projection_key);
+    }
+
+    const FeatureProcessPolicy policy = feature_policy(effective, descriptor.policy_key);
+    const std::string pinned_preset = option_string(effective, descriptor.preset_key);
+    const double requested_height = option_float_or_default(&effective, descriptor.height_key);
+    const int filament = effective_filament(effective, descriptor.filament_key);
+    if (policy == FeatureProcessPolicy::AutoNozzleVariant && pinned_preset.empty() && requested_height <= 0. &&
+        !feature_tool_differs_from_object(effective, filament))
+        return scope.erase(descriptor.projection_key);
+
+    FeatureProcessRequest request;
+    request.role = descriptor.role;
+    request.policy = policy;
+    request.pinned_preset_name = pinned_preset;
+    request.feature_filament = filament;
+    request.requested_layer_height = requested_height;
+    request.effective_object_config = &effective;
+    request.object_process_preset = option_string(full_config, "print_settings_id");
+    if (request.object_process_preset.empty())
+        request.object_process_preset = bundle.prints.get_selected_preset_name();
+    request.bundle = &bundle;
+    request.printer_config = &full_config;
+
+    const FeatureProcessResolution resolution = resolve_feature_process(request);
+    if (!resolution.ok)
+        return scope.erase(descriptor.projection_key);
+
+    bool changed = set_model_config_float(scope, descriptor.height_key, resolution.feature_layer_height);
+    const std::string serialized = serialize_projection(resolution.projection);
+    if (serialized.empty())
+        changed = scope.erase(descriptor.projection_key) || changed;
+    else
+        changed = set_model_config_string(scope, descriptor.projection_key, serialized) || changed;
+    return changed;
 }
 
 std::pair<double, double> tool_layer_height_range(const DynamicPrintConfig &printer_config, unsigned int tool_id)
@@ -444,6 +585,46 @@ FeatureProcessResolution resolve_feature_process(const FeatureProcessRequest &re
         resolution.rejection = request.bundle == nullptr ? FeatureProcessRejection::NoBundle : FeatureProcessRejection::NoVariantFound;
         return resolution;
     }
+}
+
+bool update_feature_process_projections(Model &model, const PresetBundle &bundle,
+                                        const DynamicPrintConfig &full_config)
+{
+    bool changed = false;
+    for (ModelObject *object : model.objects) {
+        if (object == nullptr)
+            continue;
+        try {
+            DynamicPrintConfig effective = full_config;
+            effective.apply(object->config.get(), true);
+            for (const FeatureProjectionDescriptor &descriptor : feature_projection_descriptors)
+                changed = update_scope_projection(object->config, effective, descriptor, bundle, full_config) || changed;
+
+            // Recompose after updating the object so volume scopes inherit the refreshed values.
+            DynamicPrintConfig object_effective = full_config;
+            object_effective.apply(object->config.get(), true);
+            for (ModelVolume *volume : object->volumes) {
+                if (volume == nullptr)
+                    continue;
+                DynamicPrintConfig volume_effective = object_effective;
+                volume_effective.apply(volume->config.get(), true);
+                for (const FeatureProjectionDescriptor &descriptor : feature_projection_descriptors) {
+                    if (!volume_scope_affects_feature(volume->config, descriptor)) {
+                        changed = volume->config.erase(descriptor.projection_key) || changed;
+                        continue;
+                    }
+                    changed = update_scope_projection(volume->config, volume_effective, descriptor, bundle, full_config) || changed;
+                }
+            }
+        } catch (const std::exception &error) {
+            // Model configs and third-party presets are sparse and may be malformed. Projection
+            // refresh is advisory and must never prevent loading or slicing the project.
+            BOOST_LOG_TRIVIAL(warning) << "Feature process projection refresh failed: " << error.what();
+        } catch (...) {
+            BOOST_LOG_TRIVIAL(warning) << "Feature process projection refresh failed with an unknown error";
+        }
+    }
+    return changed;
 }
 
 std::vector<FeatureProcessCandidate> enumerate_feature_process_candidates(const FeatureProcessRequest &request)

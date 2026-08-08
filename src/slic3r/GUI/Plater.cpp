@@ -67,6 +67,7 @@
 #include "libslic3r/Format/AMF.hpp"
 //#include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/FeatureProcessResolver.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/SLA/Hollowing.hpp"
@@ -8914,6 +8915,7 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
 
     Print::ApplyStatus invalidated;
     const auto& preset_bundle = wxGetApp().preset_bundle;
+    DynamicPrintConfig full_config;
     if (preset_bundle->get_printer_extruder_count() > 1) {
         PartPlate* cur_plate = background_process.get_current_plate();
         std::vector<int> f_maps = cur_plate->get_real_filament_maps(preset_bundle->project_config);
@@ -8921,11 +8923,15 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
         if (f_volume_maps.empty()) {
             f_volume_maps = preset_bundle->get_default_nozzle_volume_types_for_filaments(f_maps);
         }
-        invalidated = background_process.apply(this->model, preset_bundle->full_config(false, f_maps, f_volume_maps));
-        background_process.fff_print()->set_extruder_filament_info(get_extruder_filament_info());
+        full_config = preset_bundle->full_config(false, f_maps, f_volume_maps);
     }
     else
-        invalidated = background_process.apply(this->model, preset_bundle->full_config(false));
+        full_config = preset_bundle->full_config(false);
+
+    update_feature_process_projections(this->model, *preset_bundle, full_config);
+    invalidated = background_process.apply(this->model, full_config);
+    if (preset_bundle->get_printer_extruder_count() > 1)
+        background_process.fff_print()->set_extruder_filament_info(get_extruder_filament_info());
 
     if ((invalidated == Print::APPLY_STATUS_CHANGED) || (invalidated == Print::APPLY_STATUS_INVALIDATED))
         // BBS: add only gcode mode
