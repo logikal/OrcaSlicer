@@ -59,6 +59,7 @@
 #include <wx/clrpicker.h>
 #include <wx/tokenzr.h>
 #include <wx/aui/aui.h>
+#include <wx/numformatter.h>
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Format/STL.hpp"
@@ -1119,6 +1120,284 @@ struct DynamicFilamentList : DynamicList
     }
 };
 
+namespace {
+
+wxString feature_process_number(double value)
+{
+    return wxNumberFormatter::ToString(value, 3, wxNumberFormatter::Style_NoTrailingZeroes);
+}
+
+wxString feature_process_rejection_text(FeatureProcessRejection rejection, double preset_nozzle = 0.)
+{
+    switch (rejection) {
+    case FeatureProcessRejection::None:
+        return {};
+    case FeatureProcessRejection::PresetMissing:
+        return _L("preset is missing");
+    case FeatureProcessRejection::PrinterModelMismatch:
+        return _L("for a different printer model");
+    case FeatureProcessRejection::NozzleMismatch:
+        return preset_nozzle > 0. ?
+                   format_wxstr(_L("needs %1% mm nozzle"), feature_process_number(preset_nozzle)) :
+                   _L("needs a different nozzle");
+    case FeatureProcessRejection::LayerHeightNotDivisor:
+        return _L("layer height does not divide the object layer height");
+    case FeatureProcessRejection::LayerHeightOutOfToolRange:
+        return _L("layer height is outside the tool range");
+    case FeatureProcessRejection::NoVariantFound:
+        return _L("no compatible process preset found");
+    case FeatureProcessRejection::PolicyRequiresMatchingNozzle:
+        return _L("object process requires a matching nozzle");
+    case FeatureProcessRejection::NoBundle:
+        return _L("process presets are unavailable");
+    }
+    return _L("incompatible");
+}
+
+FeatureProcessPolicy wall_process_policy(const DynamicPrintConfig &config)
+{
+    const auto *policy = config.option<ConfigOptionEnum<FeatureProcessPolicy>>("wall_process_policy");
+    return policy == nullptr ? FeatureProcessPolicy::AutoNozzleVariant : policy->value;
+}
+
+FeatureProcessRequest wall_process_request(const DynamicPrintConfig &config, const PresetBundle &bundle)
+{
+    // Phase 2 uses the selected global context for every instantiated tab. Per-object scope
+    // resolution belongs with the per-scope GUI refinement in Phase 3.
+    FeatureProcessRequest request;
+    request.role = FeatureRole::Wall;
+    request.policy = wall_process_policy(config);
+    if (const auto *pinned = config.option<ConfigOptionString>("wall_process_preset"); pinned != nullptr)
+        request.pinned_preset_name = pinned->value;
+    if (const auto *height = config.option<ConfigOptionFloat>("wall_layer_height"); height != nullptr)
+        request.requested_layer_height = height->value;
+    if (const auto *filament = config.option<ConfigOptionInt>("outer_wall_filament_id"); filament != nullptr)
+        request.feature_filament = filament->value;
+    if (request.feature_filament <= 0) {
+        if (const auto *object_filament = config.option<ConfigOptionInt>("extruder"); object_filament != nullptr)
+            request.feature_filament = object_filament->value;
+    }
+    if (const auto *process = config.option<ConfigOptionString>("print_settings_id"); process != nullptr)
+        request.object_process_preset = process->value;
+    if (request.object_process_preset.empty())
+        request.object_process_preset = bundle.prints.get_selected_preset_name();
+    request.effective_object_config = &config;
+    request.bundle = &bundle;
+    request.printer_config = &config;
+    return request;
+}
+
+wxString resolved_feature_process_name(const FeatureProcessRequest &request,
+                                       const FeatureProcessResolution &resolution)
+{
+    if (!resolution.resolved_preset.empty())
+        return from_u8(resolution.resolved_preset);
+    if (request.policy == FeatureProcessPolicy::Pinned && !request.pinned_preset_name.empty())
+        return from_u8(request.pinned_preset_name);
+    return _L("Same as object");
+}
+
+wxString feature_process_readout_text(const FeatureProcessRequest &request,
+                                      const FeatureProcessResolution &resolution)
+{
+    const wxString target = resolved_feature_process_name(request, resolution);
+    if (!resolution.ok) {
+        wxString shown_target = target;
+        if (resolution.rejection == FeatureProcessRejection::PresetMissing)
+            shown_target = format_wxstr(_L("%1% (missing)"), shown_target);
+        return format_wxstr(_L("Resolves to: %1% — %2%"), shown_target,
+                            feature_process_rejection_text(resolution.rejection, resolution.nozzle_diameter));
+    }
+
+    if (resolution.cadence_ratio > 1) {
+        return format_wxstr(_L("Resolves to: %1% — %2% mm nozzle — %3% fine layers per %4% mm layer"),
+                            target, feature_process_number(resolution.nozzle_diameter), resolution.cadence_ratio,
+                            feature_process_number(resolution.base_layer_height));
+    }
+    return format_wxstr(_L("Resolves to: %1% — %2% mm nozzle — same layer cadence"), target,
+                        feature_process_number(resolution.nozzle_diameter));
+}
+
+} // namespace
+
+struct DynamicProcessPresetList : DynamicList
+{
+    struct Item {
+        std::string value;
+        wxString    label;
+    };
+
+    std::vector<Item>          items;
+    std::vector<std::string>   missing_names;
+    std::vector<wxStaticText*> readouts;
+    std::vector<std::pair<Choice *, std::string>> preserved_values;
+    FeatureProcessPolicy       current_policy = FeatureProcessPolicy::AutoNozzleVariant;
+
+    void rebuild(const DynamicPrintConfig *config_override = nullptr)
+    {
+        items.clear();
+        try {
+            PresetBundle *bundle = wxGetApp().preset_bundle;
+            if (bundle == nullptr)
+                throw std::runtime_error("Preset bundle unavailable");
+            DynamicPrintConfig config = config_override == nullptr ? bundle->full_config() : *config_override;
+            FeatureProcessRequest request = wall_process_request(config, *bundle);
+            current_policy = request.policy;
+
+            FeatureProcessRequest automatic_request = request;
+            automatic_request.policy = FeatureProcessPolicy::AutoNozzleVariant;
+            automatic_request.pinned_preset_name.clear();
+            const FeatureProcessResolution automatic = resolve_feature_process(automatic_request);
+            wxString automatic_label = _L("Automatic");
+            if (automatic.ok)
+                automatic_label = format_wxstr(_L("Automatic: %1%"), resolved_feature_process_name(automatic_request, automatic));
+            else
+                automatic_label = format_wxstr(_L("Automatic (%1%)"),
+                                               feature_process_rejection_text(automatic.rejection, automatic.nozzle_diameter));
+            items.push_back({"", automatic_label});
+            items.push_back({"", _L("Same as object")});
+
+            for (const FeatureProcessCandidate &candidate : enumerate_feature_process_candidates(request)) {
+                wxString label = format_wxstr(_L("%1% — %2% mm, %3% mm nozzle"), from_u8(candidate.preset_name),
+                                              feature_process_number(candidate.preset_layer_height),
+                                              feature_process_number(candidate.preset_nozzle));
+                if (!candidate.compatible)
+                    label = format_wxstr(_L("%1% (%2%)"), label,
+                                         feature_process_rejection_text(candidate.why_not, candidate.preset_nozzle));
+                items.push_back({candidate.preset_name, label});
+            }
+        } catch (...) {
+            items.push_back({"", _L("Automatic (process presets are unavailable)")});
+            items.push_back({"", _L("Same as object")});
+        }
+
+        for (const std::string &name : missing_names) {
+            const auto found = std::find_if(items.begin(), items.end(), [&name](const Item &item) { return item.value == name; });
+            if (found == items.end())
+                items.push_back({name, format_wxstr(_L("%1% (missing)"), from_u8(name))});
+        }
+    }
+
+    int find_value(const std::string &value) const
+    {
+        if (value.empty()) {
+            return current_policy == FeatureProcessPolicy::SameAsObject ? 1 : 0;
+        }
+        const auto found = std::find_if(items.begin(), items.end(), [&value](const Item &item) { return item.value == value; });
+        return found == items.end() ? wxNOT_FOUND : int(std::distance(items.begin(), found));
+    }
+
+    void apply_on(Choice *choice) override
+    {
+        try {
+            if (items.empty())
+                rebuild();
+            auto *combo = dynamic_cast<ComboBox *>(choice->window);
+            if (combo == nullptr)
+                return;
+
+            std::string old_value;
+            const auto preserved = std::find_if(preserved_values.begin(), preserved_values.end(),
+                                                [choice](const auto &entry) { return entry.first == choice; });
+            if (preserved != preserved_values.end()) {
+                old_value = preserved->second;
+            } else {
+                const int old_index = combo->GetSelection();
+                if (old_index >= 0 && size_t(old_index) < items.size())
+                    old_value = items[old_index].value;
+            }
+
+            combo->Clear();
+            for (const Item &item : items)
+                combo->Append(item.label);
+
+            const int new_index = find_value(old_value);
+            combo->SetSelection(new_index == wxNOT_FOUND ? 0 : new_index);
+        } catch (...) {
+            auto *combo = dynamic_cast<ComboBox *>(choice->window);
+            if (combo != nullptr && combo->GetCount() == 0)
+                combo->Append(_L("Automatic (process presets are unavailable)"));
+        }
+    }
+
+    wxString get_value(int index) override
+    {
+        return index >= 0 && size_t(index) < items.size() ? from_u8(items[index].value) : wxString();
+    }
+
+    int index_of(wxString value) override
+    {
+        const std::string stored_name = into_u8(value);
+        int index = find_value(stored_name);
+        if (index != wxNOT_FOUND || stored_name.empty())
+            return index;
+
+        if (std::find(missing_names.begin(), missing_names.end(), stored_name) == missing_names.end())
+            missing_names.push_back(stored_name);
+        items.push_back({stored_name, format_wxstr(_L("%1% (missing)"), value)});
+        for (Choice *choice : m_choices) {
+            if (auto *combo = dynamic_cast<ComboBox *>(choice->window); combo != nullptr)
+                combo->Append(items.back().label);
+        }
+        return int(items.size() - 1);
+    }
+
+    void update_readouts(const DynamicPrintConfig *config_override = nullptr)
+    {
+        wxString label = _L("Resolves to: unavailable");
+        try {
+            PresetBundle *bundle = wxGetApp().preset_bundle;
+            if (bundle != nullptr) {
+                DynamicPrintConfig config = config_override == nullptr ? bundle->full_config() : *config_override;
+                const FeatureProcessRequest request = wall_process_request(config, *bundle);
+                label = feature_process_readout_text(request, resolve_feature_process(request));
+            }
+        } catch (...) {
+        }
+        for (wxStaticText *readout : readouts) {
+            if (readout != nullptr) {
+                readout->SetLabel(label);
+                readout->GetParent()->Layout();
+            }
+        }
+    }
+
+    void update(const DynamicPrintConfig *config_override = nullptr)
+    {
+        preserved_values.clear();
+        for (Choice *choice : m_choices) {
+            auto *combo = dynamic_cast<ComboBox *>(choice->window);
+            const int selection = combo == nullptr ? wxNOT_FOUND : combo->GetSelection();
+            if (selection >= 0 && size_t(selection) < items.size())
+                preserved_values.emplace_back(choice, items[selection].value);
+        }
+        rebuild(config_override);
+        for (const auto &entry : preserved_values) {
+            const std::string &name = entry.second;
+            if (name.empty() || find_value(name) != wxNOT_FOUND)
+                continue;
+            if (std::find(missing_names.begin(), missing_names.end(), name) == missing_names.end())
+                missing_names.push_back(name);
+            items.push_back({name, format_wxstr(_L("%1% (missing)"), from_u8(name))});
+        }
+        DynamicList::update();
+        preserved_values.clear();
+        update_readouts(config_override);
+    }
+
+    void add_readout(wxStaticText *readout)
+    {
+        if (readout == nullptr)
+            return;
+        readouts.push_back(readout);
+        readout->Bind(wxEVT_DESTROY, [this, readout](wxWindowDestroyEvent &event) {
+            readouts.erase(std::remove(readouts.begin(), readouts.end(), readout), readouts.end());
+            event.Skip();
+        });
+        update_readouts();
+    }
+};
+
 // Check if the machine supports Junction Deviation (Marlin firmware with machine_max_junction_deviation > 0)
 static bool has_junction_deviation(const DynamicPrintConfig* printer_config)
 {
@@ -1135,6 +1414,12 @@ static bool has_junction_deviation(const DynamicPrintConfig* printer_config)
 }
 
 static DynamicFilamentList dynamic_filament_list;
+static DynamicProcessPresetList dynamic_process_preset_list;
+
+void register_feature_process_readout(wxStaticText *readout)
+{
+    dynamic_process_preset_list.add_readout(readout);
+}
 
 class AMSCountPopupWindow : public PopupWindow
 {
@@ -2365,6 +2650,7 @@ Sidebar::Sidebar(Plater *parent)
     Choice::register_dynamic_list("top_surface_filament_id", &dynamic_filament_list);
     Choice::register_dynamic_list("bottom_surface_filament_id", &dynamic_filament_list);
     Choice::register_dynamic_list("wipe_tower_filament", &dynamic_filament_list);
+    Choice::register_dynamic_list("wall_process_preset", &dynamic_process_preset_list);
 
     p->scrolled = new wxPanel(this);
     //    p->scrolled->SetScrollbars(0, 100, 1, 2); // ys_DELETE_after_testing. pixelsPerUnitY = 100
@@ -3572,6 +3858,8 @@ void Sidebar::update_presets(Preset::Type preset_type)
 
     // Synchronize config.ini with the current selections.
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
+    if (print_tech == ptFFF && preset_type != Preset::TYPE_FILAMENT)
+        dynamic_process_preset_list.update();
 
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": exit.");
 }
@@ -4037,6 +4325,7 @@ void Sidebar::on_filaments_delete(size_t filament_id)
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
     dynamic_filament_list.update();
+    dynamic_process_preset_list.update();
 }
 
 void Sidebar::add_filament() {
@@ -4415,6 +4704,7 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
             wxGetApp().get_tab(Preset::TYPE_FILAMENT)->select_preset(wxGetApp().preset_bundle->filament_presets[0], false, "", false, true);
             wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
             dynamic_filament_list.update();
+            dynamic_process_preset_list.update();
         }
         m_sync_dlg->set_check_dirty_fialment(false);
         dlg_res = m_sync_dlg->ShowModal();
@@ -4670,6 +4960,7 @@ void Sidebar::enable_nozzle_count_edit(bool enable)
 void Sidebar::update_dynamic_filament_list()
 {
     dynamic_filament_list.update();
+    dynamic_process_preset_list.update();
 }
 
 PlaterPresetComboBox* Sidebar::printer_combox()
@@ -8929,6 +9220,7 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
         full_config = preset_bundle->full_config(false);
 
     update_feature_process_projections(this->model, *preset_bundle, full_config);
+    dynamic_process_preset_list.update(&full_config);
     invalidated = background_process.apply(this->model, full_config);
     if (preset_bundle->get_printer_extruder_count() > 1)
         background_process.fff_print()->set_extruder_filament_info(get_extruder_filament_info());
@@ -17730,6 +18022,7 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
 {
     bool update_scheduled = false;
     bool bed_shape_changed = false;
+    bool feature_process_changed = false;
     //bool print_sequence_changed = false;
     t_config_option_keys diff_keys = p->config->diff(config);
 
@@ -17742,6 +18035,10 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
     }
 
     for (auto opt_key : diff_keys) {
+        if (opt_key == "wall_process_policy" || opt_key == "wall_process_preset" ||
+            opt_key == "wall_layer_height" || opt_key == "outer_wall_filament_id" ||
+            opt_key == "extruder" || opt_key == "filament_map" || opt_key == "nozzle_diameter")
+            feature_process_changed = true;
         if (opt_key == "filament_colour") {
             update_scheduled = true; // update should be scheduled (for update 3DScene) #2738
 
@@ -17824,6 +18121,8 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
 
     if (bed_shape_changed)
         set_bed_shape();
+    if (feature_process_changed)
+        dynamic_process_preset_list.update(&config);
 
     config_change_notification(config, std::string("print_sequence"));
 
@@ -18031,6 +18330,7 @@ void Plater::set_global_filament_map(const std::vector<int>& filament_map)
 {
     auto& project_config = wxGetApp().preset_bundle->project_config;
     project_config.option<ConfigOptionInts>("filament_map")->values = filament_map;
+    dynamic_process_preset_list.update();
 }
 
 void Plater::set_global_filament_volume_map(const std::vector<int>& filament_volume_map)
@@ -19201,6 +19501,7 @@ void Plater::open_filament_map_setting_dialog(wxCommandEvent &evt)
         if (new_map_mode == fmmManual){
             curr_plate->set_filament_maps(new_filament_maps);
             curr_plate->set_filament_volume_maps(new_filament_volume_maps);
+            dynamic_process_preset_list.update();
         }
 
         bool need_invalidate = (old_map_mode != new_map_mode ||

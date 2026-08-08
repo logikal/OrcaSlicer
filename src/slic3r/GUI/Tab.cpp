@@ -3001,6 +3001,27 @@ void TabPrint::build()
         optgroup->append_single_option_line("bottom_surface_filament_id", "multimaterial_settings_filament_for_features#bottom-surface");
         optgroup->append_single_option_line("wipe_tower_filament", "multimaterial_settings_filament_for_features#wipe-tower");
 
+        optgroup = page->new_optgroup(L("Process for Features"), L"param_process_for_features");
+        optgroup->append_single_option_line("wall_process_policy", "multimaterial_settings_process_for_features#walls");
+        Option wall_process_preset = optgroup->get_option("wall_process_preset");
+        // Keep the config option a free-form preset-name string; only its GUI is a dynamic choice.
+        // TabPrintModel reuses this page, so object/part/modifier panels get the same control.
+        wall_process_preset.opt.gui_type = ConfigOptionDef::GUIType::i_enum_open;
+        optgroup->append_single_option_line(wall_process_preset, "multimaterial_settings_process_for_features#walls");
+
+        if (m_type == Preset::TYPE_PRINT) {
+            Line process_resolution_line = { "", "" };
+            process_resolution_line.full_width = 1;
+            process_resolution_line.widget = [](wxWindow *parent) {
+                auto *sizer = new wxBoxSizer(wxHORIZONTAL);
+                auto *readout = new wxStaticText(parent, wxID_ANY, _L("Resolves to: unavailable"));
+                register_feature_process_readout(readout);
+                sizer->Add(readout, 1, wxEXPAND);
+                return sizer;
+            };
+            optgroup->append_line(process_resolution_line);
+        }
+
         optgroup = page->new_optgroup(L("Ooze prevention"), L"param_ooze_prevention");
         optgroup->append_single_option_line("ooze_prevention", "multimaterial_settings_ooze_prevention");
         optgroup->append_single_option_line("standby_temperature_delta", "multimaterial_settings_ooze_prevention#temperature-variation");

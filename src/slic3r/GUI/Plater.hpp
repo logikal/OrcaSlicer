@@ -35,6 +35,7 @@ class wxButton;
 class ScalableButton;
 class wxScrolledWindow;
 class wxString;
+class wxStaticText;
 class ComboBox;
 class Button;
 
@@ -1012,6 +1013,8 @@ private:
 };
 
 std::vector<int> get_min_flush_volumes(const DynamicPrintConfig &full_config, size_t nozzle_id);
+
+void register_feature_process_readout(wxStaticText *readout);
 
 Preset *get_printer_preset(const MachineObject *obj);
 wxArrayString get_all_camera_view_type();
