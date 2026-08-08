@@ -217,6 +217,14 @@ DynamicPrintConfig multifilament_config(unsigned int filaments, std::initializer
 	for (const char *key : { "filament_type", "filament_vendor", "filament_start_gcode" })
 		static_cast<ConfigOptionVectorBase *>(config.option(key, true))->resize(filaments, defaults.option(key));
 
+	// PresetBundle sizes every per-filament variant column when composing a real project;
+	// headless fixtures must do the same, or a materialized filament_self_index maps filaments
+	// onto columns that size-1 default arrays don't have (nullable reads then come back as
+	// zero and kill extrusion flow).
+	for (const std::string &key : filament_options_with_variant)
+		if (auto *opt = dynamic_cast<ConfigOptionVectorBase *>(config.option(key, true)); opt != nullptr)
+			opt->resize(filaments, defaults.option(key));
+
 	// flush_volumes_matrix must be sized filaments*filaments or export rejects it.
 	config.set_deserialize_strict({ { "filament_colour", colours }, { "flush_volumes_matrix", flush } });
 
@@ -234,7 +242,14 @@ DynamicPrintConfig mixed_nozzle_config(std::initializer_list<ConfigBase::SetDese
         { "min_layer_height",                "0.05,0.1" },
         { "max_layer_height",                "0.15,0.3" },
         { "printer_extruder_id",             "1,2" },
+        // NOTE: comma on purpose — as a single concatenated (non-matching) token this keeps the
+        // PRINTER-side variant expansion inert for these fixtures, as it has been for all fff
+        // tests (activating it rewrites retract/machine vectors sized for defaults).
         { "printer_extruder_variant",        "Direct Drive Standard,Direct Drive Standard" },
+        // FILAMENT-side variant columns are materialized like PresetBundle does for a real
+        // project, so per-filament values (temperatures, flow) resolve for every filament.
+        { "filament_extruder_variant",       "Direct Drive Standard;Direct Drive Standard" },
+        { "filament_self_index",             "1,2" },
         { "outer_wall_filament_id",          1 },
         { "inner_wall_filament_id",          1 },
         { "sparse_infill_filament_id",       2 },

@@ -1761,7 +1761,20 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     }
 
     //BBS: check the config again
-    int new_used_filaments = this->extruders(true).size();
+    // Region configs may not exist yet on the first apply for new objects, making per-feature
+    // filament ids (wall/infill/surface overrides) invisible to extruders(); a print whose
+    // multi-filament usage is expressed only through those ids would be misclassified as
+    // single-filament and lose e.g. its prime tower. The default region config was already
+    // refreshed from new_full_config above, so union its feature extruders in.
+    std::vector<unsigned int> new_used_filament_ids = this->extruders(true);
+    {
+        std::vector<unsigned int> feature_extruders;
+        PrintRegion::collect_object_printing_extruders(m_config, m_default_region_config,
+                                                       /*has_brim=*/false, feature_extruders);
+        new_used_filament_ids.insert(new_used_filament_ids.end(), feature_extruders.begin(), feature_extruders.end());
+        sort_remove_duplicates(new_used_filament_ids);
+    }
+    int new_used_filaments = int(new_used_filament_ids.size());
     t_config_option_keys new_changed_keys = new_full_config.normalize_fdm_2(objects().size(), new_used_filaments);
     if (new_changed_keys.size() > 0) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got new_changed_keys, size=%1%")%new_changed_keys.size();

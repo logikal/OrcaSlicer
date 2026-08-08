@@ -10919,6 +10919,9 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
         std::vector<int> variant_index;
 
         variant_index.resize(filament_count, -1);
+        // Filaments resolved through the identity fallback (no id-map match) must also get an
+        // identity id in the remapped id list, or later runtime lookups still collapse to slot 0.
+        std::vector<char> identity_fallback(filament_count, 0);
 
         for (int f_index = 0; f_index < filament_count; f_index++)
         {
@@ -10937,11 +10940,15 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
                 assert(false);
                 //for some updates happens in a invalid state(caused by popup window)
                 //we need to avoid crash
-                variant_index[f_index] = 0;
+                // Degrade to the identity column so a short or missing id map keeps this
+                // filament's own values instead of silently copying filament 1's.
+                variant_index[f_index] = f_index;
+                identity_fallback[f_index] = 1;
                 if (opt_ids) {
                     for (int i = 0; i < opt_ids->values.size(); i++)
                         if (opt_ids->values[i] == (f_index+1)) {
                             variant_index[f_index] = i;
+                            identity_fallback[f_index] = 0;
                             break;
                         }
                 }
@@ -11123,7 +11130,7 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
             std::vector<int> new_values;
             new_values.resize(filament_count);
             for (int f_index = 0; f_index < filament_count; f_index++) {
-                new_values[f_index] = opt_ids->get_at(variant_index[f_index]);
+                new_values[f_index] = identity_fallback[f_index] ? f_index + 1 : opt_ids->get_at(variant_index[f_index]);
             }
             const_cast<ConfigOptionInts*>(opt_ids)->values = new_values;
         }
