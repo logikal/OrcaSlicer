@@ -842,6 +842,11 @@ public:
     std::string get_filament_vendor() const;
     std::string get_filament_type() const;
 };
+
+void apply_project_nozzle_diameters(DynamicPrintConfig &config);
+std::vector<double> effective_nozzle_diameters(const DynamicPrintConfig &full_or_printer_config);
+int logical_index_for_device_extruder(const DynamicPrintConfig &config, int device_ext_id);
+
 extern std::set<std::string> printer_extruder_options;
 extern std::set<std::string> print_options_with_variant;
 extern std::set<std::string> filament_options_with_variant;
@@ -1566,6 +1571,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                support_object_skip_flush))
     ((ConfigOptionEnum<BedTempFormula>, bed_temperature_formula))
     ((ConfigOptionInts,                physical_extruder_map))
+    ((ConfigOptionFloats,              project_nozzle_diameter))
     ((ConfigOptionIntsNullable,        nozzle_flush_dataset))
     ((ConfigOptionFloatsNullable,      filament_flush_volumetric_speed))
     ((ConfigOptionIntsNullable,        filament_flush_temp))

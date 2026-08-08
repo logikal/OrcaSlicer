@@ -1137,6 +1137,13 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     //BBS: add more logs
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: enter")%__LINE__;
+
+    apply_project_nozzle_diameters(new_full_config);
+    // The overlay is project-layer input, not slicing state. Downstream consumers use the
+    // effective nozzle/min/max values; dropping the consumed key also keeps an empty overlay
+    // byte-identical in the exported full-config block.
+    new_full_config.erase("project_nozzle_diameter");
+
     // Normalize the config.
 	new_full_config.option("print_settings_id",            true);
 	new_full_config.option("filament_settings_id",         true);

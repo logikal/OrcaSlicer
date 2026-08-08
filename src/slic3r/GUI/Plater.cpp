@@ -16408,26 +16408,45 @@ Preset *get_printer_preset(const MachineObject *obj)
     if (!obj)
         return nullptr;
 
-    Preset       *printer_preset = nullptr;
-
+    Preset       *model_match    = nullptr;
+    Preset       *diameter_match = nullptr;
     PresetBundle *preset_bundle  = wxGetApp().preset_bundle;
+    const std::string printer_type = obj->get_show_printer_type();
+    const std::string selected_base_name = preset_bundle->printers.get_selected_preset_base().name;
+    const auto &extruders = obj->GetExtderSystem()->GetExtruders();
+
     for (auto printer_it = preset_bundle->printers.begin(); printer_it != preset_bundle->printers.end(); printer_it++) {
         // only use system printer preset
         if (!printer_it->is_system)
             continue;
 
-        ConfigOption       *printer_nozzle_opt  = printer_it->config.option("nozzle_diameter");
-        ConfigOptionFloats *printer_nozzle_vals = nullptr;
-        if (printer_nozzle_opt) printer_nozzle_vals = dynamic_cast<ConfigOptionFloats *>(printer_nozzle_opt);
-        std::string model_id = printer_it->get_current_printer_type(preset_bundle);
+        if (printer_it->get_current_printer_type(preset_bundle) != printer_type)
+            continue;
 
-        std::string printer_type = obj->get_show_printer_type();
-        bool nozzle_diameter_matches_or_unknown = printer_nozzle_vals && obj->GetExtderSystem()->NozzleDiameterMatchesOrUnknown(0, printer_nozzle_vals->get_at(0));
-        if (model_id.compare(printer_type) == 0 && nozzle_diameter_matches_or_unknown) {
-            printer_preset = &(*printer_it);
+        const bool selected_base = printer_it->name == selected_base_name;
+        if (model_match == nullptr || selected_base)
+            model_match = &(*printer_it);
+        DynamicPrintConfig effective_config(printer_it->config);
+        if (const auto *project_diameters = preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+            project_diameters != nullptr && !project_diameters->values.empty()) {
+            effective_config.set_key_value("project_nozzle_diameter", project_diameters->clone());
         }
+
+        const std::vector<double> nozzle_diameters = effective_nozzle_diameters(effective_config);
+        bool all_diameters_match = !nozzle_diameters.empty();
+        for (const DevExtder &extruder : extruders) {
+            const int logical_index = logical_index_for_device_extruder(effective_config, extruder.GetExtId());
+            if (logical_index < 0 || size_t(logical_index) >= nozzle_diameters.size() ||
+                !obj->GetExtderSystem()->NozzleDiameterMatchesOrUnknown(
+                    extruder.GetExtId(), float(nozzle_diameters[logical_index]))) {
+                all_diameters_match = false;
+                break;
+            }
+        }
+        if (all_diameters_match && (diameter_match == nullptr || selected_base))
+            diameter_match = &(*printer_it);
     }
-    return printer_preset;
+    return diameter_match != nullptr ? diameter_match : model_match;
 }
 
 bool Plater::check_printer_initialized(MachineObject *obj, bool only_warning, bool popup_warning)

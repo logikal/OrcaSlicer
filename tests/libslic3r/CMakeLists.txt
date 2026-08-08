@@ -23,6 +23,7 @@ add_executable(${_TEST_NAME}_tests
     test_fill_plane_path.cpp
     test_geometry.cpp
     test_multimaterial_segmentation.cpp
+    test_nozzle_diameter_overlay.cpp
     test_placeholder_parser.cpp
     test_polygon.cpp
     test_mutable_polygon.cpp

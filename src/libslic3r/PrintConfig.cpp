@@ -2913,6 +2913,13 @@ void PrintConfigDef::init_fff_params()
     def->mode = comDevelop;
     def->set_default_value(new ConfigOptionInts{0});
 
+    def = this->add("project_nozzle_diameter", coFloats);
+    def->label = L("Project nozzle diameters");
+    def->tooltip = L("The physically installed nozzle diameter for each extruder. "
+                     "When set, these values override the nozzle diameters from the printer preset for this project.");
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloats{});
+
     def = this->add("filament_map_mode", coEnum);
     // internal use only, don't need translation
     def->label = "filament mapping mode";
@@ -9471,6 +9478,58 @@ std::set<std::string> filament_dev_options = {
 DynamicPrintConfig DynamicPrintConfig::full_print_config()
 {
 	return DynamicPrintConfig((const PrintRegionConfig&)FullPrintConfig::defaults());
+}
+
+std::vector<double> effective_nozzle_diameters(const DynamicPrintConfig &full_or_printer_config)
+{
+    const auto *nozzle_diameters = full_or_printer_config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (nozzle_diameters == nullptr)
+        return {};
+
+    std::vector<double> result = nozzle_diameters->values;
+    const auto *project_diameters = full_or_printer_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+    if (project_diameters == nullptr)
+        return result;
+
+    const size_t count = std::min(result.size(), project_diameters->values.size());
+    std::copy_n(project_diameters->values.begin(), count, result.begin());
+    return result;
+}
+
+void apply_project_nozzle_diameters(DynamicPrintConfig &config)
+{
+    auto *nozzle_diameters = config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto *project_diameters = config.option<ConfigOptionFloats>("project_nozzle_diameter");
+    if (nozzle_diameters == nullptr || project_diameters == nullptr || project_diameters->values.empty())
+        return;
+
+    const size_t count = std::min(nozzle_diameters->values.size(), project_diameters->values.size());
+    for (size_t i = 0; i < count; ++i) {
+        if (nozzle_diameters->values[i] == project_diameters->values[i])
+            continue;
+
+        nozzle_diameters->values[i] = project_diameters->values[i];
+        for (const char *key : {"min_layer_height", "max_layer_height"}) {
+            auto *limits = config.option<ConfigOptionFloats>(key, true);
+            if (limits->values.size() < nozzle_diameters->values.size())
+                limits->resize(nozzle_diameters->values.size(), FullPrintConfig::defaults().option(key));
+            limits->values[i] = 0.;
+        }
+    }
+}
+
+int logical_index_for_device_extruder(const DynamicPrintConfig &config, int device_ext_id)
+{
+    const auto *physical_map = config.option<ConfigOptionInts>("physical_extruder_map");
+    if (physical_map != nullptr) {
+        const auto found = std::find(physical_map->values.begin(), physical_map->values.end(), device_ext_id);
+        if (found != physical_map->values.end())
+            return int(std::distance(physical_map->values.begin(), found));
+    }
+
+    // H2D reports device extruder 0 as MAIN/right, while preset logical index 0 is left
+    // under physical_extruder_map ["1", "0"]. Unmapped or short maps use identity.
+    return device_ext_id;
 }
 
 DynamicPrintConfig::DynamicPrintConfig(const StaticPrintConfig& rhs) : DynamicConfig(rhs, rhs.keys_ref())

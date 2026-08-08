@@ -58,6 +58,9 @@ static std::vector<std::string> s_project_options {
     "nozzle_volume_type",
     "filament_map_mode",
     "filament_map",
+    // Physically installed per-extruder diameters; project-level so device state survives
+    // printer-preset switches without dirtying the selected preset.
+    "project_nozzle_diameter",
     // Per-filament nozzle-volume choice; project-level like filament_map so the per-filament
     // slot resolution survives preset switches.
     "filament_volume_map",
@@ -282,6 +285,7 @@ DynamicPrintConfig PresetBundle::construct_full_config(
     //add_if_some_non_empty(std::move(different_settings), "different_settings_to_system");
     add_if_some_non_empty(std::move(print_compatible_printers), "print_compatible_printers");
 
+    apply_project_nozzle_diameters(out);
     out.option<ConfigOptionEnumGeneric>("printer_technology", true)->value = ptFFF;
     return out;
 }
@@ -4319,6 +4323,7 @@ DynamicPrintConfig PresetBundle::full_fff_config(bool apply_extruder, std::optio
     add_if_some_non_empty(std::move(print_compatible_printers),     "print_compatible_printers");
     out.option<ConfigOptionStrings>("extruder_ams_count", true)->values   = save_extruder_ams_count_to_string(this->extruder_ams_counts);
 
+	apply_project_nozzle_diameters(out);
 	out.option<ConfigOptionEnumGeneric>("printer_technology", true)->value = ptFFF;
     return out;
 }
