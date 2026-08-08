@@ -32,6 +32,7 @@ namespace Slic3r {
 
 class GCode;
 class Layer;
+class LayerRegion;
 class ModelObject;
 class Print;
 class PrintObject;
@@ -548,7 +549,9 @@ private:
     void bridge_over_infill();
     void clip_fill_surfaces();
     void discover_horizontal_shells();
+    void recombine_feature_cadence();
     void combine_infill();
+    static float infill_combination_clearance(const LayerRegion &layerm, InfillPattern infill_pattern);
     void _generate_support_material();
     std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> prepare_adaptive_infill_data(
         const std::vector<std::pair<const Surface*, float>>& surfaces_w_bottom_z) const;

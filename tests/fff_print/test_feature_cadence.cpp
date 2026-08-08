@@ -1,9 +1,17 @@
 #include <catch2/catch_all.hpp>
 
+#include "libslic3r/ExtrusionEntity.hpp"
+#include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
 #include "test_helpers.hpp"
 
+#include <cctype>
 #include <cmath>
+#include <functional>
+#include <map>
+#include <set>
+#include <string>
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
@@ -51,6 +59,81 @@ void process_cube_with_overrides(const DynamicPrintConfig &config,
 {
     const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{object_overrides};
     init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+    print.process();
+}
+
+void visit_paths(const ExtrusionEntity &entity, const std::function<void(const ExtrusionPath &)> &visitor)
+{
+    if (entity.is_collection()) {
+        for (const ExtrusionEntity *child : static_cast<const ExtrusionEntityCollection &>(entity).entities)
+            visit_paths(*child, visitor);
+    } else if (entity.is_loop()) {
+        for (const ExtrusionPath &path : static_cast<const ExtrusionLoop &>(entity).paths)
+            visitor(path);
+    } else if (const auto *multi_path = dynamic_cast<const ExtrusionMultiPath *>(&entity)) {
+        for (const ExtrusionPath &path : multi_path->paths)
+            visitor(path);
+    } else if (const auto *path = dynamic_cast<const ExtrusionPath *>(&entity)) {
+        visitor(*path);
+    }
+}
+
+std::vector<const ExtrusionPath *> paths_with_role(const Layer &layer, ExtrusionRole role)
+{
+    std::vector<const ExtrusionPath *> paths;
+    for (const LayerRegion *region : layer.regions())
+        for (const ExtrusionEntity *entity : region->fills.entities)
+            visit_paths(*entity, [&](const ExtrusionPath &path) {
+                if (path.role() == role)
+                    paths.push_back(&path);
+            });
+    return paths;
+}
+
+std::set<ExtrusionRole> fill_roles(const Layer &layer)
+{
+    std::set<ExtrusionRole> roles;
+    for (const LayerRegion *region : layer.regions())
+        for (const ExtrusionEntity *entity : region->fills.entities)
+            visit_paths(*entity, [&](const ExtrusionPath &path) { roles.insert(path.role()); });
+    return roles;
+}
+
+double total_fill_length(const PrintObject &object)
+{
+    double length = 0.;
+    for (const Layer *layer : object.layers())
+        for (const LayerRegion *region : layer->regions())
+            for (const ExtrusionEntity *entity : region->fills.entities)
+                visit_paths(*entity, [&](const ExtrusionPath &path) { length += path.length(); });
+    return length;
+}
+
+bool is_base_z(double z)
+{
+    return std::abs(z / 0.2 - std::round(z / 0.2)) <= 1e-4;
+}
+
+void process_stacked_regions(const DynamicPrintConfig &config, Print &print, Model &model)
+{
+    ModelObject *object = model.add_object();
+    object->name = "stacked-regions.stl";
+    object->add_volume(make_cube(20., 20., 10.));
+
+    TriangleMesh upper = make_cube(20., 20., 10.);
+    Transform3d transform = Transform3d::Identity();
+    transform.translation().z() = 10.;
+    upper.transform(transform, false);
+    ModelVolume *upper_volume = object->add_volume(std::move(upper));
+    upper_volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(20.));
+
+    object->config.set("wall_layer_height", 0.1);
+    object->add_instance();
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+    print.validate();
+    print.set_status_silent();
     print.process();
 }
 
@@ -157,7 +240,10 @@ TEST_CASE("Default wall cadence leaves the object grid untouched", "[FeatureCade
         CHECK_THAT(default_layers[i]->height, Catch::Matchers::WithinAbs(control_layers[i]->height, EPSILON));
         CHECK_THAT(default_layers[i]->print_z, Catch::Matchers::WithinAbs(control_layers[i]->print_z, EPSILON));
         CHECK_THAT(default_layers[i]->slice_z, Catch::Matchers::WithinAbs(control_layers[i]->slice_z, EPSILON));
+        CHECK(fill_roles(*default_layers[i]) == fill_roles(*control_layers[i]));
     }
+    CHECK_THAT(total_fill_length(*default_print.objects().front()),
+               Catch::Matchers::WithinAbs(total_fill_length(*control_print.objects().front()), EPSILON));
 }
 
 TEST_CASE("Fine grid bounds ignore coarse-cadence tools", "[FeatureCadence]")
@@ -194,4 +280,185 @@ TEST_CASE("Slicing parameters preserve base and grid cadence", "[FeatureCadence]
         print_config, object_config, 20., {0, 1}, Vec3d::Ones());
     CHECK_THAT(unchanged.base_layer_height, Catch::Matchers::WithinAbs(unchanged.layer_height, EPSILON));
     CHECK(unchanged.cadence_ratio == 1);
+}
+
+TEST_CASE("Interior sparse infill recombines to base cadence", "[FeatureCadence]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({{"sparse_infill_density", 15.}});
+    Print print;
+    Model model;
+    process_cube_with_overrides(config, {{"wall_layer_height", 0.1}}, print, model);
+
+    size_t path_count = 0;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        const auto paths = paths_with_role(*layer, erInternalInfill);
+        if (paths.empty())
+            continue;
+        ++path_count;
+        CHECK(is_base_z(layer->print_z));
+        for (const ExtrusionPath *path : paths)
+            CHECK_THAT(path->height, Catch::Matchers::WithinAbs(0.2, EPSILON));
+    }
+    CHECK(path_count > 0);
+}
+
+TEST_CASE("Internal solid infill recombines to base cadence", "[FeatureCadence]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"sparse_infill_density", 100.},
+        {"top_shell_layers", 0},
+        {"bottom_shell_layers", 0},
+    });
+    Print print;
+    Model model;
+    process_cube_with_overrides(config, {{"wall_layer_height", 0.1}}, print, model);
+
+    size_t path_count = 0;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        const auto paths = paths_with_role(*layer, erSolidInfill);
+        for (const ExtrusionPath *path : paths) {
+            ++path_count;
+            CHECK(is_base_z(layer->print_z));
+            CHECK_THAT(path->height, Catch::Matchers::WithinAbs(0.2, EPSILON));
+        }
+    }
+    CHECK(path_count > 0);
+}
+
+TEST_CASE("Top surfaces keep their Z and gain thickness", "[FeatureCadence]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({{"sparse_infill_density", 15.}, {"top_shell_layers", 2}});
+    Print print;
+    Model model;
+    process_cube_with_overrides(config, {{"wall_layer_height", 0.1}}, print, model);
+
+    const ConstLayerPtrsAdaptor layers = print.objects().front()->layers();
+    const Layer *top_layer = layers.back();
+    const auto paths = paths_with_role(*top_layer, erTopSolidInfill);
+    REQUIRE_FALSE(paths.empty());
+    CHECK_THAT(top_layer->print_z, Catch::Matchers::WithinAbs(20., EPSILON));
+    for (const ExtrusionPath *path : paths)
+        CHECK_THAT(path->height, Catch::Matchers::WithinAbs(0.2, EPSILON));
+    REQUIRE(layers.size() >= 2);
+    CHECK(layers[layers.size() - 2]->regions().front()->fill_surfaces.has(stInternalVoid));
+}
+
+TEST_CASE("Bottom surfaces recombine upward preserving the bottom Z", "[FeatureCadence]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"sparse_infill_density", 15.},
+        {"interface_shells", true},
+        {"bottom_shell_layers", 2},
+        {"bottom_shell_thickness", 0.},
+    });
+    Print print;
+    Model model;
+    process_stacked_regions(config, print, model);
+
+    bool found_combined_bottom = false;
+    size_t plain_bottom_surfaces = 0;
+    size_t combined_bottom_surfaces = 0;
+    const ConstLayerPtrsAdaptor layers = print.objects().front()->layers();
+    for (size_t layer_idx = 1; layer_idx < layers.size(); ++layer_idx) {
+        for (const Surface &surface : layers[layer_idx]->regions().front()->fill_surfaces.surfaces)
+            if (surface.surface_type == stBottom) {
+                ++plain_bottom_surfaces;
+                if (std::abs(surface.thickness - 0.2) <= EPSILON)
+                    ++combined_bottom_surfaces;
+            }
+        for (const ExtrusionPath *path : paths_with_role(*layers[layer_idx], erBottomSurface)) {
+            if (std::abs(path->height - 0.2) > EPSILON)
+                continue;
+            found_combined_bottom = true;
+            CHECK(is_base_z(layers[layer_idx]->print_z));
+            CHECK_THAT(layers[layer_idx]->print_z - path->height,
+                       Catch::Matchers::WithinAbs(layers[layer_idx - 1]->bottom_z(), EPSILON));
+        }
+    }
+    CAPTURE(plain_bottom_surfaces, combined_bottom_surfaces);
+    CHECK(found_combined_bottom);
+}
+
+TEST_CASE("Fine-only G-code layers contain walls but no recombinable interior extrusion", "[FeatureCadence]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"sparse_infill_density", 15.},
+        {"top_shell_layers", 2},
+        {"bottom_shell_layers", 1},
+        {"top_shell_thickness", 0.},
+        {"bottom_shell_thickness", 0.},
+        {"ensure_vertical_shell_thickness", "none"},
+        {"enable_prime_tower", false},
+    });
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{{"wall_layer_height", 0.1}}};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+    const std::string output = gcode(print);
+
+    struct LayerExtrusions {
+        bool wall = false;
+        bool interior = false;
+        std::set<int> tools;
+        std::set<std::string> interior_comments;
+    };
+    std::map<int, LayerExtrusions> by_tenth;
+    int current_tool = 0;
+    GCodeReader reader;
+    reader.parse_buffer(output, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string command(line.cmd());
+        if (command.size() >= 2 && command.front() == 'T' && std::isdigit(static_cast<unsigned char>(command[1]))) {
+            current_tool = std::stoi(command.substr(1));
+            return;
+        }
+        if (!line.extruding(self))
+            return;
+        const std::string comment(line.comment());
+        const int z_tenth = int(std::lround(line.new_Z(self) * 10.));
+        // Bridge roles are deliberately excluded from recombination and may remain on a fine layer.
+        const bool recombinable_interior =
+            (comment.find("infill") != std::string::npos || comment.find("surface") != std::string::npos) &&
+            comment.find("bridge") == std::string::npos;
+        if (comment.find("perimeter") != std::string::npos) {
+            by_tenth[z_tenth].wall = true;
+            by_tenth[z_tenth].tools.insert(current_tool);
+        } else if (recombinable_interior) {
+            by_tenth[z_tenth].interior = true;
+            by_tenth[z_tenth].tools.insert(current_tool);
+            by_tenth[z_tenth].interior_comments.insert(comment);
+        }
+    });
+
+    size_t fine_only_layers = 0;
+    for (const auto &[z_tenth, extrusions] : by_tenth) {
+        if (z_tenth <= 2 || z_tenth % 2 == 0)
+            continue;
+        CAPTURE(z_tenth, extrusions.interior_comments);
+        ++fine_only_layers;
+        CHECK(extrusions.wall);
+        CHECK_FALSE(extrusions.interior);
+        CHECK(extrusions.tools == std::set<int>{0});
+    }
+    CHECK(fine_only_layers > 0);
+}
+
+TEST_CASE("A coarse-tool cap leaves unsafe interiors at fine cadence", "[FeatureCadence]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({{"sparse_infill_density", 15.}, {"max_layer_height", "0.15,0.15"}});
+    Print print;
+    Model model;
+    process_cube_with_overrides(config, {{"wall_layer_height", 0.1}}, print, model);
+
+    bool found_fine_interior = false;
+    for (const Layer *layer : print.objects().front()->layers())
+        for (const ExtrusionPath *path : paths_with_role(*layer, erInternalInfill))
+            if (std::abs(path->height - 0.1) <= EPSILON)
+                found_fine_interior = true;
+    CHECK(found_fine_interior);
 }

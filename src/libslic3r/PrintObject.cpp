@@ -681,6 +681,9 @@ void PrintObject::prepare_infill()
     this->bridge_over_infill();
     m_print->throw_if_canceled();
 
+    this->recombine_feature_cadence();
+    m_print->throw_if_canceled();
+
     // combine fill surfaces to honor the "infill every N layers" option
     this->combine_infill();
     m_print->throw_if_canceled();
@@ -4512,6 +4515,9 @@ void PrintObject::combine_infill()
 {
     // Work on each region separately.
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
+        // Feature cadence owns every region on a refined object grid.
+        if (m_slicing_params.cadence_ratio > 1)
+            continue;
         const PrintRegion &region = this->printing_region(region_id);
         //BBS
         const bool enable_combine_infill = region.config().infill_combination.value;
@@ -4595,18 +4601,7 @@ void PrintObject::combine_infill()
             // so let's remove those areas from all layers.
             Polygons intersection_with_clearance;
             intersection_with_clearance.reserve(intersection.size());
-            float clearance_offset =
-                0.5f * layerms.back()->flow(frPerimeter).scaled_width() +
-             // Because fill areas for rectilinear and honeycomb are grown
-             // later to overlap perimeters, we need to counteract that too.
-                ((infill_pattern == ipRectilinear   ||
-                  infill_pattern == ipMonotonic     ||
-                  infill_pattern == ipGrid          ||
-                  infill_pattern == ipLateralLattice     ||
-                  infill_pattern == ipLine          ||
-                  infill_pattern == ipHoneycomb     ||
-                  infill_pattern == ipLateralHoneycomb) ? 1.5f : 0.5f) *
-                    layerms.back()->flow(frSolidInfill).scaled_width();
+            const float clearance_offset = infill_combination_clearance(*layerms.back(), infill_pattern);
             for (ExPolygon &expoly : intersection)
                 polygons_append(intersection_with_clearance, offset(expoly, clearance_offset));
             for (LayerRegion *layerm : layerms) {

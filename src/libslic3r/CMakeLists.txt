@@ -362,6 +362,7 @@ set(lisbslic3r_sources
     Print.cpp
     Print.hpp
     PrintObject.cpp
+    PrintObjectCadence.cpp
     PrintObjectSlice.cpp
     PrintRegion.cpp
     ProjectTask.cpp
