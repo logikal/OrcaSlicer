@@ -651,3 +651,111 @@ TEST_CASE("Bottom recombination preserves separate combined solid metadata", "[F
     CHECK(combined_solid_paths > 0);
     CHECK(fine_solid_segments_over_void == 0);
 }
+
+TEST_CASE("A non-divisor wall cadence reports nearby valid heights", "[FeatureCadence][Validate]")
+{
+    const DynamicPrintConfig config = mixed_nozzle_grid_config();
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{{"wall_layer_height", 0.13}}};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    const StringObjectException error = print.validate();
+    REQUIRE_FALSE(error.string.empty());
+    CHECK(error.string.find("0.13") != std::string::npos);
+    CHECK((error.string.find("0.2") != std::string::npos || error.string.find("0.1") != std::string::npos));
+    CHECK(error.opt_key == "wall_layer_height");
+}
+
+TEST_CASE("Wall cadence rejects an extrusion taller than its wall nozzle", "[FeatureCadence][Validate]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"layer_height", 0.5},
+        {"max_layer_height", "0.3,0.5"},
+    });
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{{"wall_layer_height", 0.25}}};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    const StringObjectException error = print.validate();
+    REQUIRE_FALSE(error.string.empty());
+    CHECK(error.string.find("Outer wall") != std::string::npos);
+    CHECK(error.string.find("0.25") != std::string::npos);
+    CHECK(error.string.find("0.2") != std::string::npos);
+    CHECK(error.opt_key == "wall_layer_height");
+}
+
+TEST_CASE("Fine inner and outer walls must share a nozzle diameter", "[FeatureCadence][Validate]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({{"inner_wall_filament_id", 2}});
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{{"wall_layer_height", 0.1}}};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    const StringObjectException error = print.validate();
+    REQUIRE_FALSE(error.string.empty());
+    CHECK(error.string.find("Inner and outer walls") != std::string::npos);
+    CHECK(error.opt_key == "inner_wall_filament_id");
+}
+
+TEST_CASE("Wall cadence rejects layer-range height overrides", "[FeatureCadence][Validate]")
+{
+    const DynamicPrintConfig config = mixed_nozzle_grid_config();
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{{"wall_layer_height", 0.1}}};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    DynamicPrintConfig range_config;
+    range_config.set_key_value("layer_height", new ConfigOptionFloat(0.15));
+    model.objects.front()->layer_config_ranges[{1., 5.}].assign_config(std::move(range_config));
+    print.apply(model, config);
+
+    const StringObjectException error = print.validate();
+    REQUIRE_FALSE(error.string.empty());
+    CHECK(error.string.find("layer range") != std::string::npos);
+    CHECK(error.string.find("wall cadence") != std::string::npos);
+    CHECK(error.opt_key == "layer_height");
+}
+
+TEST_CASE("A valid dual-tool wall cadence passes validation", "[FeatureCadence][Validate]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"before_layer_change_gcode", "G92 E0"},
+        {"bridge_line_width", 0.},
+        {"skin_infill_line_width", 0.},
+        {"skeleton_infill_line_width", 0.},
+    });
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{{"wall_layer_height", 0.1}}};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    const StringObjectException error = print.validate();
+    CAPTURE(error.string, error.opt_key);
+    CHECK(error.string.empty());
+}
+
+TEST_CASE("Ratio-one validation preserves the original layer-height error", "[FeatureCadence][Validate]")
+{
+    const DynamicPrintConfig config = multifilament_config(1, {
+        {"layer_height", 0.25},
+        {"initial_layer_print_height", 0.2},
+        {"nozzle_diameter", "0.2"},
+        {"min_layer_height", "0.05"},
+        {"max_layer_height", "0.15"},
+        {"skirt_loops", 0},
+    });
+    Print print;
+    Model model;
+    init_print({cube(20.)}, print, model, config);
+
+    const StringObjectException error = print.validate();
+    CHECK(error.string == "Layer height cannot exceed nozzle diameter.");
+    CHECK(error.opt_key == "layer_height");
+}

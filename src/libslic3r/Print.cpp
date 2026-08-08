@@ -6,6 +6,7 @@
 #include "ClipperUtils.hpp"
 #include "Extruder.hpp"
 #include "Flow.hpp"
+#include "FeatureProcessResolver.hpp"
 #include "Geometry/ConvexHull.hpp"
 #include "I18N.hpp"
 #include "ShortestPath.hpp"
@@ -1603,6 +1604,71 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 			}
 			return true;
 		};
+        DynamicPrintConfig dynamic_print_config;
+        dynamic_print_config.set_key_value("nozzle_diameter", m_config.nozzle_diameter.clone());
+        dynamic_print_config.set_key_value("min_layer_height", m_config.min_layer_height.clone());
+        dynamic_print_config.set_key_value("max_layer_height", m_config.max_layer_height.clone());
+        auto validate_feature_height = [this, &dynamic_print_config](
+                                           const PrintObject *object, const std::string &feature_name,
+                                           double height, int filament_id, const char *opt_key) -> StringObjectException {
+            const size_t tool_id = get_extruder_index_from_filament_id(m_config, filament_id);
+            const double nozzle_diameter = m_config.nozzle_diameter.get_at(tool_id);
+            if (height > nozzle_diameter + EPSILON) {
+                return {Slic3r::format(
+                            L("%1% extrusion height %2% mm cannot exceed its tool's %3% mm nozzle diameter."),
+                            feature_name, height, nozzle_diameter),
+                        object, opt_key};
+            }
+
+            const double min_layer_height = Slicing::min_layer_height_from_nozzle(dynamic_print_config, int(tool_id + 1));
+            const double max_layer_height = Slicing::max_layer_height_from_nozzle(dynamic_print_config, int(tool_id + 1));
+            if (height < min_layer_height - EPSILON || height > max_layer_height + EPSILON) {
+                return {Slic3r::format(
+                            L("%1% extrusion height %2% mm is outside the layer-height range of %3% to %4% mm for its %5% mm nozzle tool."),
+                            feature_name, height, min_layer_height, max_layer_height, nozzle_diameter),
+                        object, opt_key};
+            }
+            return {};
+        };
+        auto invalid_wall_divisor = [this, &dynamic_print_config](const PrintObject *object, const PrintRegion &region,
+                                                                  double base_height) -> StringObjectException {
+            const double wall_height = region.config().wall_layer_height.value;
+            if (wall_height <= 0. || wall_height >= base_height - EPSILON ||
+                feature_cadence_ratio(base_height, wall_height) != 0)
+                return {};
+
+            const size_t tool_id = get_extruder_index_from_filament_id(
+                m_config, region.config().outer_wall_filament_id.value);
+            const double min_layer_height = Slicing::min_layer_height_from_nozzle(dynamic_print_config, int(tool_id + 1));
+            const double max_layer_height = Slicing::max_layer_height_from_nozzle(dynamic_print_config, int(tool_id + 1));
+            std::vector<double> valid_heights;
+            for (int ratio = 1; ratio <= 5 && valid_heights.size() < 3; ++ratio) {
+                const double height = base_height / ratio;
+                if (height >= min_layer_height - EPSILON && height <= max_layer_height + EPSILON)
+                    valid_heights.push_back(height);
+            }
+
+            const std::string feature_name = L("Walls");
+            std::string message;
+            if (valid_heights.empty()) {
+                message = Slic3r::format(
+                    L("%1% layer height %2% mm must divide base layer height %3% mm exactly, but no divisor from ratios 1 through 5 is within the wall tool's layer-height range."),
+                    feature_name, wall_height, base_height);
+            } else if (valid_heights.size() == 1) {
+                message = Slic3r::format(
+                    L("%1% layer height %2% mm must divide base layer height %3% mm exactly. Valid nearby height: %4% mm."),
+                    feature_name, wall_height, base_height, valid_heights[0]);
+            } else if (valid_heights.size() == 2) {
+                message = Slic3r::format(
+                    L("%1% layer height %2% mm must divide base layer height %3% mm exactly. Valid nearby heights: %4% mm, %5% mm."),
+                    feature_name, wall_height, base_height, valid_heights[0], valid_heights[1]);
+            } else {
+                message = Slic3r::format(
+                    L("%1% layer height %2% mm must divide base layer height %3% mm exactly. Valid nearby heights: %4% mm, %5% mm, %6% mm."),
+                    feature_name, wall_height, base_height, valid_heights[0], valid_heights[1], valid_heights[2]);
+            }
+            return {std::move(message), object, "wall_layer_height"};
+        };
         for (PrintObject *object : m_objects) {
             if (object->has_support_material()) {
                 // BBS: remove useless logics and L()
@@ -1692,8 +1758,87 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
             // validate layer_height
             double layer_height = object->config().layer_height.value;
-            if (layer_height > min_nozzle_diameter)
-                return {L("Layer height cannot exceed nozzle diameter."), object, "layer_height"};
+            const SlicingParameters &slicing_params = object->slicing_parameters();
+            const double base_layer_height = slicing_params.base_layer_height > 0. ?
+                                                 slicing_params.base_layer_height : layer_height;
+            for (const PrintRegion &region : object->all_regions()) {
+                if (StringObjectException error = invalid_wall_divisor(object, region, base_layer_height);
+                    !error.string.empty())
+                    return error;
+            }
+
+            const bool cadence_active = slicing_params.cadence_ratio > 1;
+            if (!cadence_active) {
+                if (layer_height > min_nozzle_diameter)
+                    return {L("Layer height cannot exceed nozzle diameter."), object, "layer_height"};
+            } else {
+                const ModelObject *model_object = object->model_object();
+                if (!model_object->layer_height_profile.empty()) {
+                    return {Slic3r::format(L("Wall cadence cannot be used with an adaptive or painted layer-height profile. Disable the layer-height profile or wall cadence.")),
+                            object, "layer_height"};
+                }
+                const bool has_layer_height_range = std::any_of(
+                    model_object->layer_config_ranges.begin(), model_object->layer_config_ranges.end(),
+                    [](const auto &range) { return range.second.has("layer_height"); });
+                if (has_layer_height_range) {
+                    return {Slic3r::format(L("Wall cadence cannot be used with a layer range that overrides layer height. Remove the layer-height override or disable wall cadence.")),
+                            object, "layer_height"};
+                }
+                if (object->config().precise_z_height.value) {
+                    return {Slic3r::format(L("Wall cadence cannot be used with precise Z height. Disable precise Z height or wall cadence.")),
+                            object, "precise_z_height"};
+                }
+
+                const int object_filament = [&]() {
+                    const auto *option = model_object->config.get().option<ConfigOptionInt>("extruder");
+                    return option == nullptr ? 0 : option->value;
+                }();
+                const size_t object_tool = get_extruder_index_from_filament_id(m_config, std::max(object_filament, 0));
+                const double object_nozzle = m_config.nozzle_diameter.get_at(object_tool);
+
+                for (const PrintRegion &region : object->all_regions()) {
+                    const PrintRegionConfig &region_config = region.config();
+                    const size_t outer_tool = get_extruder_index_from_filament_id(
+                        m_config, region_config.outer_wall_filament_id.value);
+                    const size_t inner_tool = get_extruder_index_from_filament_id(
+                        m_config, region_config.inner_wall_filament_id.value);
+                    const double outer_nozzle = m_config.nozzle_diameter.get_at(outer_tool);
+                    const double inner_nozzle = m_config.nozzle_diameter.get_at(inner_tool);
+                    if (std::abs(outer_nozzle - inner_nozzle) > EPSILON) {
+                        return {Slic3r::format(L("Inner and outer walls must use tools with the same nozzle diameter when wall cadence is active.")),
+                                object, "inner_wall_filament_id"};
+                    }
+
+                    if (region_config.wall_process_policy.value != FeatureProcessPolicy::SameAsObject &&
+                        region_config.wall_process_projection.value.empty() && region_config.wall_layer_height.value == 0. &&
+                        (std::abs(outer_nozzle - object_nozzle) > EPSILON ||
+                         std::abs(inner_nozzle - object_nozzle) > EPSILON)) {
+                        const double wall_nozzle = std::abs(outer_nozzle - object_nozzle) > EPSILON ? outer_nozzle : inner_nozzle;
+                        return {Slic3r::format(
+                                    L("The wall process could not be resolved for the wall tool's %1% mm nozzle. Select a compatible wall process or disable wall cadence."),
+                                    wall_nozzle),
+                                object, "wall_process_policy"};
+                    }
+
+                    for (StringObjectException error : {
+                             validate_feature_height(object, L("Outer wall"), slicing_params.layer_height,
+                                                     region_config.outer_wall_filament_id.value, "wall_layer_height"),
+                             validate_feature_height(object, L("Inner wall"), slicing_params.layer_height,
+                                                     region_config.inner_wall_filament_id.value, "wall_layer_height"),
+                             validate_feature_height(object, L("Sparse infill"), base_layer_height,
+                                                     region_config.sparse_infill_filament_id.value, "layer_height"),
+                             validate_feature_height(object, L("Internal solid infill"), base_layer_height,
+                                                     region_config.internal_solid_filament_id.value, "layer_height"),
+                             validate_feature_height(object, L("Top surface"), base_layer_height,
+                                                     region_config.top_surface_filament_id.value, "layer_height"),
+                             validate_feature_height(object, L("Bottom surface"), base_layer_height,
+                                                     region_config.bottom_surface_filament_id.value, "layer_height"),
+                         }) {
+                        if (!error.string.empty())
+                            return error;
+                    }
+                }
+            }
 
             // Validate extrusion widths.
             std::string err_msg;
@@ -1705,7 +1850,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             }
             for (const char *opt_key : { "inner_wall_line_width", "outer_wall_line_width", "sparse_infill_line_width", "internal_solid_infill_line_width", "top_surface_line_width","skin_infill_line_width" ,"skeleton_infill_line_width"})
 				for (const PrintRegion &region : object->all_regions())
-                    if (!validate_extrusion_width(region.config(), opt_key, layer_height, err_msg))
+                    if (!validate_extrusion_width(
+                            region.config(), opt_key,
+                            cadence_active && (std::strcmp(opt_key, "inner_wall_line_width") == 0 ||
+                                               std::strcmp(opt_key, "outer_wall_line_width") == 0) ?
+                                slicing_params.layer_height : layer_height,
+                            err_msg))
 		            	return  {err_msg, object, opt_key};
 
             const bool allow_thin_bridge_width = object->config().thick_bridges && object->config().thick_internal_bridges;
