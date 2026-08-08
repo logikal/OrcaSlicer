@@ -257,6 +257,21 @@ static string get_diameter_string(float diameter)
     return s;
 }
 
+static bool has_mixed_reported_nozzle_diameters(const MachineObject &obj)
+{
+    std::optional<float> first_diameter;
+    for (const DevExtder &extruder : obj.GetExtderSystem()->GetExtruders()) {
+        const float diameter = extruder.GetNozzleDiameter();
+        if (diameter == 0.0f)
+            continue;
+        if (!first_diameter)
+            first_diameter = diameter;
+        else if (std::fabs(*first_diameter - diameter) >= 1e-3f)
+            return true;
+    }
+    return false;
+}
+
 template <typename T, typename OptionType>
 static void set_config_values(DynamicPrintConfig *config, const std::string &key, T value)
 {
@@ -769,6 +784,7 @@ struct Sidebar::priv
     // extruder_count >= 2 && support_multi_nozzle. When is_manual, always pops the MultiNozzleSyncDialog;
     // otherwise reuses the app_config-cached option when the machine's nozzle config is unchanged.
     std::optional<NozzleOption> get_nozzle_options(MachineObject* obj, int extruder_count, bool support_multi_nozzle, bool is_manual);
+    bool apply_mixed_nozzle_overlay(const wxString &left_diameter, const wxString &right_diameter);
     bool switch_diameter(bool single);
     void update_sync_status(const MachineObject* obj);
 
@@ -1771,6 +1787,9 @@ bool Sidebar::priv::switch_diameter(bool single)
         auto diameter_left = left_extruder->combo_diameter->GetValue();
         auto diameter_right = right_extruder->combo_diameter->GetValue();
         if (diameter_left != diameter_right) {
+            if (wxGetApp().preset_bundle->is_bbl_vendor())
+                return apply_mixed_nozzle_overlay(diameter_left, diameter_right);
+
             std::string printer_type = wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
             auto left_name  = _L(DevPrinterConfigUtil::get_toolhead_display_name(printer_type, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::SentenceCase));
             auto right_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(printer_type, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::SentenceCase));
@@ -1797,10 +1816,19 @@ bool Sidebar::priv::switch_diameter(bool single)
     // ORCA: Check if the selected diameter matches the current nozzle diameter in the config
     Preset& printer_preset = wxGetApp().preset_bundle->printers.get_edited_preset();
     auto* nozzle_diameter = dynamic_cast<const ConfigOptionFloats*>(printer_preset.config.option("nozzle_diameter"));
+    auto *project_nozzle_diameter = wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+    const bool clear_overlay = wxGetApp().preset_bundle->is_bbl_vendor() && project_nozzle_diameter != nullptr &&
+                               !project_nozzle_diameter->values.empty();
     if (nozzle_diameter && nozzle_diameter->size() > 0) {
         auto current_nozzle_dia = get_diameter_string(nozzle_diameter->values[0]);
         // If the selected diameter is the same as current nozzle, don't switch profiles
         if (current_nozzle_dia == diameter.ToStdString()) {
+            if (clear_overlay) {
+                project_nozzle_diameter->values.clear();
+                plater->update_project_dirty_from_presets();
+                plater->sidebar().update_presets(Preset::TYPE_PRINTER);
+                plater->on_config_change(wxGetApp().preset_bundle->full_config());
+            }
             return true;
         }
     }
@@ -1813,7 +1841,49 @@ bool Sidebar::priv::switch_diameter(bool single)
         return false;
     }
     preset->is_visible = true; // force visible
+    if (clear_overlay) {
+        project_nozzle_diameter->values.clear();
+        plater->update_project_dirty_from_presets();
+    }
     return wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preset->name);
+}
+
+bool Sidebar::priv::apply_mixed_nozzle_overlay(const wxString &left_diameter, const wxString &right_diameter)
+{
+    double left_value = 0.0;
+    double right_value = 0.0;
+    if (!left_diameter.ToDouble(&left_value) || !right_diameter.ToDouble(&right_value))
+        return false;
+
+    PresetBundle *preset_bundle = wxGetApp().preset_bundle;
+    Preset &printer_preset = preset_bundle->printers.get_edited_preset();
+    const auto *base_diameters = printer_preset.config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (base_diameters == nullptr)
+        return false;
+
+    std::vector<double> overlay = base_diameters->values;
+    const int left_index = logical_index_for_device_extruder(printer_preset.config, DEPUTY_EXTRUDER_ID);
+    const int right_index = logical_index_for_device_extruder(printer_preset.config, MAIN_EXTRUDER_ID);
+    if (left_index < 0 || right_index < 0 || size_t(left_index) >= overlay.size() || size_t(right_index) >= overlay.size())
+        return false;
+
+    overlay[left_index] = left_value;
+    overlay[right_index] = right_value;
+    preset_bundle->project_config.set_key_value("project_nozzle_diameter", new ConfigOptionFloats(std::move(overlay)));
+
+    const std::string printer_type = printer_preset.get_printer_type(preset_bundle);
+    const wxString left_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(
+        printer_type, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::SentenceCase));
+    const wxString right_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(
+        printer_type, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::SentenceCase));
+    const wxString message = format_wxstr(_L("Using mixed nozzles: %1% %2% mm / %3% %4% mm"),
+                                          left_name, left_diameter, right_name, right_diameter);
+
+    plater->update_project_dirty_from_presets();
+    plater->sidebar().update_presets(Preset::TYPE_PRINTER);
+    plater->on_config_change(preset_bundle->full_config());
+    plater->get_notification_manager()->push_notification(message.utf8_string());
+    return true;
 }
 
 static bool is_skip_high_flow_printer(const std::string& printer)
@@ -2247,10 +2317,13 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
         if (!this->plater)
             return false;
 
-        this->plater->update_objects_position_when_select_preset([&obj, machine_preset]() {
+        this->plater->update_objects_position_when_select_preset([machine_preset]() {
+            if (auto *project_diameters = GUI::wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter"))
+                project_diameters->values.clear();
             Tab *printer_tab = GUI::wxGetApp().get_tab(Preset::Type::TYPE_PRINTER);
             printer_tab->select_preset(machine_preset->name);
         });
+        this->plater->update_project_dirty_from_presets();
     }
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " go on sync_extruder_list";
     const Preset &cur_preset  = preset_bundle->printers.get_selected_preset();
@@ -2280,9 +2353,14 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
     std::vector<float> nozzle_diameters;
     nozzle_diameters.resize(extruder_nums);
     std::vector<NozzleVolumeType> target_types(extruder_nums, NozzleVolumeType::nvtStandard);
+    const bool reported_nozzles_are_mixed = preset_bundle->is_bbl_vendor() && has_mixed_reported_nozzle_diameters(*obj);
     for (size_t index = 0; index < extruder_nums; ++index) {
         int extruder_id = extruder_map[index];
-        nozzle_diameters[extruder_id] = nozzle_option ? atof(nozzle_option->diameter.c_str()) : obj->GetExtderSystem()->GetNozzleDiameter(index);
+        const int logical_index = reported_nozzles_are_mixed ?
+            logical_index_for_device_extruder(cur_preset.config, int(index)) : extruder_id;
+        assert(logical_index >= 0 && logical_index < extruder_nums);
+        nozzle_diameters[logical_index] = nozzle_option && !reported_nozzles_are_mixed ?
+            atof(nozzle_option->diameter.c_str()) : obj->GetExtderSystem()->GetNozzleDiameter(index);
         NozzleVolumeType target_type = NozzleVolumeType::nvtStandard;
         std::optional<NozzleVolumeType> select_type;
         if (nozzle_option && nozzle_option->extruder_nozzle_stats.count(index)) {
@@ -2301,7 +2379,7 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
                 continue;
             }
             // hack code, only use standard flow for 0.2
-            if (std::fabs(nozzle_diameters[extruder_id] - 0.2) > EPSILON)
+            if (std::fabs(nozzle_diameters[logical_index] - 0.2) > EPSILON)
                 // Map device flow->volume via the table, not `flowtype - 1`.
                 // The arithmetic only aligns for S_FLOW/H_FLOW; U_FLOW(3)-1 would yield nvtHybrid(2), not nvtTPUHighFlow(3).
                 target_type = DevNozzle::ToNozzleVolumeType(obj->GetExtderSystem()->GetNozzleFlowType(extruder_id));
@@ -2343,7 +2421,7 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
 
     if (extruder_nums > 1) {
         int left_index  = left_extruder->combo_diameter->FindString(get_diameter_string(nozzle_diameters[0]));
-        int right_index = left_extruder->combo_diameter->FindString(get_diameter_string(nozzle_diameters[1]));
+        int right_index = right_extruder->combo_diameter->FindString(get_diameter_string(nozzle_diameters[1]));
         assert(left_index != -1 && right_index != -1);
         left_extruder->combo_diameter->SetSelection(left_index);
         right_extruder->combo_diameter->SetSelection(right_index);
@@ -3752,7 +3830,28 @@ void Sidebar::update_presets(Preset::Type preset_type)
         auto diameters = wxGetApp().preset_bundle->printers.diameters_of_selected_printer();
         auto diameter = printer_preset.config.opt_string("printer_variant");
         auto extruder_max_nozzle_count = printer_preset.config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
-        auto update_extruder_variant = [printer_model, extruders_def, extruders, nozzle_volumes_def, nozzle_volumes, extruder_variants,diameter,extruder_max_nozzle_count](ExtruderGroup & extruder, int index) {
+        const std::vector<double> effective_diameters = effective_nozzle_diameters(wxGetApp().preset_bundle->full_config());
+        const auto *project_diameters = wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+        const bool has_nozzle_overlay = project_diameters != nullptr && !project_diameters->values.empty();
+        if (isBBL && is_dual_extruder) {
+            std::set<double> known_diameters;
+            for (const std::string &variant : diameters) {
+                std::vector<std::string> tokens;
+                boost::algorithm::split(tokens, variant, boost::algorithm::is_any_of("+"));
+                for (const std::string &token : tokens) {
+                    size_t consumed = 0;
+                    const double value = string_to_double_decimal_point(token, &consumed);
+                    if (consumed > 0)
+                        known_diameters.insert(value);
+                }
+            }
+            diameters.clear();
+            for (double value : known_diameters)
+                diameters.emplace_back(get_diameter_string(float(value)));
+        }
+        auto update_extruder_variant = [printer_model, extruders_def, extruders, nozzle_volumes_def, nozzle_volumes,
+                                        extruder_variants, diameter, extruder_max_nozzle_count, effective_diameters,
+                                        isBBL, has_nozzle_overlay](ExtruderGroup & extruder, int index) {
             extruder.combo_flow->Clear();
             auto type = extruders_def->enum_labels[extruders->values[index]];
             int select = -1;
@@ -3763,8 +3862,10 @@ void Sidebar::update_presets(Preset::Type preset_type)
                 if (boost::algorithm::contains(extruder_variants->values[index], type + " " + nozzle_volumes_def->enum_labels[i]) ||
                     extruder_max_nozzle_count->get_at(index) > 1 && extruder_max_nozzle_count->get_at(index) != ConfigOptionIntsNullable::nil_value() &&
                     nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == nvtHybrid) {
-                    if (nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == NozzleVolumeType::nvtHighFlow &&(diameter == "0.2" ||
-                        is_skip_high_flow_printer(printer_model)))
+                    const bool suppress_high_flow_for_diameter = isBBL && has_nozzle_overlay && size_t(index) < effective_diameters.size() ?
+                        effective_diameters[index] < 0.25 : diameter == "0.2";
+                    if (nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == NozzleVolumeType::nvtHighFlow &&
+                        (suppress_high_flow_for_diameter || is_skip_high_flow_printer(printer_model)))
                         continue;
                     if (nozzle_volumes->values[index] == i)
                         select = extruder.combo_flow->GetCount();
@@ -3776,11 +3877,14 @@ void Sidebar::update_presets(Preset::Type preset_type)
             extruder.combo_flow->SetSelection(select);
         };
 
-        auto update_extruder_diameter = [&diameters, &diameter, &nozzle_diameter](int extruder_index,ExtruderGroup & extruder) {
+        auto update_extruder_diameter = [&diameters, &nozzle_diameter, &effective_diameters, isBBL,
+                                         is_dual_extruder](int extruder_index, ExtruderGroup &extruder) {
             extruder.combo_diameter->Clear();
             int select = -1;
             // ORCA get the actual nozzle diameter from printer config
-            auto nozzle_dia = get_diameter_string(nozzle_diameter->values[extruder_index]);
+            const double effective_diameter = isBBL && is_dual_extruder && size_t(extruder_index) < effective_diameters.size() ?
+                effective_diameters[extruder_index] : nozzle_diameter->values[extruder_index];
+            auto nozzle_dia = get_diameter_string(float(effective_diameter));
             // ORCA try to add nozzle diameter from config if list is empty. fixes blank nozzle combo box when preset has no alias
             if(diameters[0].empty() && !nozzle_dia.empty()){
                 diameters[0] = nozzle_dia;
@@ -8097,8 +8201,26 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     std::string machine_type = obj->printer_type;
                     if (obj->is_support_upgrade_kit && obj->installed_upgrade_kit) machine_type = "C12";
 
+                    const bool model_mismatch = printer_preset.get_current_printer_type(preset_bundle) != machine_type;
                     bool nozzle_mismatch = !obj->GetExtderSystem()->NozzleDiameterMatchesOrUnknown(0, (float) preset_nozzle_diameter);
-                    if (printer_preset.get_current_printer_type(preset_bundle) != machine_type || nozzle_mismatch) {
+                    const bool device_has_mixed_nozzles = preset_bundle->is_bbl_vendor() && obj->is_multi_extruders() &&
+                                                          has_mixed_reported_nozzle_diameters(*obj);
+                    if (device_has_mixed_nozzles) {
+                        const DynamicPrintConfig effective_config = preset_bundle->full_config();
+                        const std::vector<double> effective_diameters = effective_nozzle_diameters(effective_config);
+                        nozzle_mismatch = false;
+                        for (const DevExtder &extruder : obj->GetExtderSystem()->GetExtruders()) {
+                            const int logical_index = logical_index_for_device_extruder(effective_config, extruder.GetExtId());
+                            if (logical_index < 0 || size_t(logical_index) >= effective_diameters.size() ||
+                                !obj->GetExtderSystem()->NozzleDiameterMatchesOrUnknown(
+                                    extruder.GetExtId(), float(effective_diameters[logical_index])))
+                                nozzle_mismatch = true;
+                        }
+                    }
+
+                    if (!model_mismatch && nozzle_mismatch && device_has_mixed_nozzles) {
+                        GUI::wxGetApp().sidebar().sync_extruder_list();
+                    } else if (model_mismatch || nozzle_mismatch) {
                         Preset *machine_preset = get_printer_preset(obj);
                         if (machine_preset != nullptr) {
                             std::string printer_model = machine_preset->config.option<ConfigOptionString>("printer_model")->value;
@@ -8114,6 +8236,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 sync_printer_info = wxGetApp().app_config->get("sync_after_load_file_show_flag") == "true";
                             }
                             if (sync_printer_info) {
+                                if (model_mismatch) {
+                                    if (auto *project_diameters = preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter"))
+                                        project_diameters->values.clear();
+                                }
                                 Tab *printer_tab = GUI::wxGetApp().get_tab(Preset::Type::TYPE_PRINTER);
                                 printer_tab->select_preset(machine_preset->name);
                                 if (obj->is_multi_extruders()) GUI::wxGetApp().sidebar().sync_extruder_list();
@@ -10808,13 +10934,26 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
                 preset_name = preset->name;
             }
             std::string old_preset_name = wxGetApp().preset_bundle->printers.get_edited_preset().name;
+            const std::string old_printer_model = wxGetApp().preset_bundle->printers.get_edited_preset().config.opt_string("printer_model");
+            bool cleared_nozzle_overlay = false;
 
-            update_objects_position_when_select_preset([this, &preset_type, &preset_name]() {
+            update_objects_position_when_select_preset([this, &preset_type, &preset_name, &old_printer_model, &cleared_nozzle_overlay]() {
                 wxWindowUpdateLocker noUpdates2(sidebar->filament_panel());
                 wxGetApp().get_tab(preset_type)->select_preset(preset_name);
+                const std::string new_printer_model = wxGetApp().preset_bundle->printers.get_edited_preset().config.opt_string("printer_model");
+                if (new_printer_model != old_printer_model) {
+                    if (auto *project_diameters = wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+                        project_diameters != nullptr && !project_diameters->values.empty()) {
+                        project_diameters->values.clear();
+                        cleared_nozzle_overlay = true;
+                    }
+                }
                 // update plater with new config
                 q->on_config_change(wxGetApp().preset_bundle->full_config());
             });
+
+            if (cleared_nozzle_overlay)
+                q->update_project_dirty_from_presets();
 
 
             if (old_preset_name != preset_name && wxGetApp().app_config->get("auto_calculate_flush") == "all") {
