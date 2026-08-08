@@ -132,6 +132,8 @@ set(lisbslic3r_sources
     ExtrusionSimulator.hpp
     FaceDetector.cpp
     FaceDetector.hpp
+    FeatureProcessResolver.cpp
+    FeatureProcessResolver.hpp
     Feature/FuzzySkin/FuzzySkin.cpp
     Feature/FuzzySkin/FuzzySkin.hpp
     Feature/Interlocking/InterlockingGenerator.cpp
