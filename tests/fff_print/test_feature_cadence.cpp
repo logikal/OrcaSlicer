@@ -1,5 +1,6 @@
 #include <catch2/catch_all.hpp>
 
+#include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/GCodeReader.hpp"
@@ -135,6 +136,54 @@ void process_stacked_regions(const DynamicPrintConfig &config, Print &print, Mod
     print.validate();
     print.set_status_silent();
     print.process();
+}
+
+void process_bottom_surface_with_separate_solid_interior(const DynamicPrintConfig &config, Print &print, Model &model)
+{
+    ModelObject *object = model.add_object();
+    object->name = "bottom-and-interior.stl";
+    object->add_volume(make_cube(8., 8., 10.));
+
+    TriangleMesh upper = make_cube(8., 8., 10.);
+    Transform3d upper_transform = Transform3d::Identity();
+    upper_transform.translation().z() = 10.;
+    upper.transform(upper_transform, false);
+    ModelVolume *upper_volume = object->add_volume(std::move(upper));
+    upper_volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(100.));
+
+    TriangleMesh pillar = make_cube(4., 4., 20.);
+    Transform3d pillar_transform = Transform3d::Identity();
+    pillar_transform.translation().x() = 12.;
+    pillar.transform(pillar_transform, false);
+    ModelVolume *pillar_volume = object->add_volume(std::move(pillar));
+    pillar_volume->config.set_key_value("sparse_infill_density", new ConfigOptionPercent(100.));
+
+    object->config.set("wall_layer_height", 0.1);
+    object->add_instance();
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+    print.validate();
+    print.set_status_silent();
+    print.process();
+}
+
+bool is_shell_fill_role(ExtrusionRole role)
+{
+    return role == erSolidInfill || role == erTopSolidInfill || role == erBottomSurface;
+}
+
+std::set<int> shell_layer_z_tenths(const PrintObject &object)
+{
+    std::set<int> result;
+    for (const Layer *layer : object.layers())
+        for (const LayerRegion *region : layer->regions())
+            for (const ExtrusionEntity *entity : region->fills.entities)
+                visit_paths(*entity, [&](const ExtrusionPath &path) {
+                    if (is_shell_fill_role(path.role()))
+                        result.insert(int(std::lround(layer->print_z * 10.)));
+                });
+    return result;
 }
 
 } // namespace
@@ -290,17 +339,23 @@ TEST_CASE("Interior sparse infill recombines to base cadence", "[FeatureCadence]
     Model model;
     process_cube_with_overrides(config, {{"wall_layer_height", 0.1}}, print, model);
 
-    size_t path_count = 0;
+    size_t combined_path_count = 0;
     for (const Layer *layer : print.objects().front()->layers()) {
         const auto paths = paths_with_role(*layer, erInternalInfill);
         if (paths.empty())
             continue;
-        ++path_count;
-        CHECK(is_base_z(layer->print_z));
-        for (const ExtrusionPath *path : paths)
-            CHECK_THAT(path->height, Catch::Matchers::WithinAbs(0.2, EPSILON));
+        for (const ExtrusionPath *path : paths) {
+            CAPTURE(layer->print_z, path->height);
+            if (std::abs(path->height - 0.2) <= EPSILON) {
+                ++combined_path_count;
+                CHECK(is_base_z(layer->print_z));
+            } else {
+                // Shell boundaries may leave clearance slivers at the native fine cadence.
+                CHECK_THAT(path->height, Catch::Matchers::WithinAbs(0.1, EPSILON));
+            }
+        }
     }
-    CHECK(path_count > 0);
+    CHECK(combined_path_count > 0);
 }
 
 TEST_CASE("Internal solid infill recombines to base cadence", "[FeatureCadence]")
@@ -461,4 +516,138 @@ TEST_CASE("A coarse-tool cap leaves unsafe interiors at fine cadence", "[Feature
             if (std::abs(path->height - 0.1) <= EPSILON)
                 found_fine_interior = true;
     CHECK(found_fine_interior);
+}
+
+TEST_CASE("Shell thickness in millimeters survives fine cadence", "[FeatureCadence]")
+{
+    constexpr int top_shell_layers = 3;
+    constexpr int bottom_shell_layers = 2;
+    constexpr double base_height = 0.2;
+    constexpr double cube_height = 20.;
+
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"sparse_infill_density", 15.},
+        {"top_shell_layers", top_shell_layers},
+        {"bottom_shell_layers", bottom_shell_layers},
+        {"top_shell_thickness", 0.},
+        {"bottom_shell_thickness", 0.},
+        {"ensure_vertical_shell_thickness", "none"},
+    });
+    Print print;
+    Model model;
+    process_cube_with_overrides(config, {{"wall_layer_height", 0.1}}, print, model);
+
+    std::map<int, double> shell_area_by_tenth;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        for (const LayerRegion *region : layer->regions())
+            for (const Surface &surface : region->fill_surfaces.surfaces)
+                if (surface.surface_type == stTop || surface.surface_type == stBottom ||
+                    surface.surface_type == stInternalSolid)
+                    shell_area_by_tenth[int(std::lround(layer->print_z * 10.))] += surface.expolygon.area();
+    }
+
+    REQUIRE_FALSE(shell_area_by_tenth.empty());
+    const double full_shell_area = std::max_element(shell_area_by_tenth.begin(), shell_area_by_tenth.end(),
+        [](const auto &lhs, const auto &rhs) { return lhs.second < rhs.second; })->second;
+    double top_shell_bottom = cube_height;
+    double bottom_shell_top = 0.;
+    size_t top_solid_layers = 0;
+    size_t bottom_solid_layers = 0;
+    for (const auto &[z_tenth, area] : shell_area_by_tenth) {
+        const double print_z = z_tenth / 10.;
+        // Horizontal-shell clipping may leave small fine-cadence edge slivers. Count full-area,
+        // base-aligned solid-bearing layers, which define the configured shell thickness.
+        if (!is_base_z(print_z) || area < 0.5 * full_shell_area)
+            continue;
+        if (print_z > cube_height / 2.) {
+            ++top_solid_layers;
+            top_shell_bottom = std::min(top_shell_bottom, print_z - base_height);
+        } else {
+            ++bottom_solid_layers;
+            bottom_shell_top = std::max(bottom_shell_top, print_z);
+        }
+    }
+
+    const double expected_top_span = top_shell_layers * base_height;
+    const double expected_bottom_span = bottom_shell_layers * base_height;
+    CHECK_THAT(cube_height - top_shell_bottom, Catch::Matchers::WithinAbs(expected_top_span, EPSILON));
+    CHECK_THAT(bottom_shell_top, Catch::Matchers::WithinAbs(expected_bottom_span, EPSILON));
+    CHECK(top_solid_layers == size_t(top_shell_layers));
+    CHECK(bottom_solid_layers == size_t(bottom_shell_layers));
+}
+
+TEST_CASE("Ratio one shell layer counts match the control slice", "[FeatureCadence][Regression]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"nozzle_diameter", "0.4,0.4"},
+        {"min_layer_height", "0.1,0.1"},
+        {"max_layer_height", "0.3,0.3"},
+        {"top_shell_layers", 3},
+        {"bottom_shell_layers", 2},
+        {"top_shell_thickness", 0.},
+        {"bottom_shell_thickness", 0.},
+        {"ensure_vertical_shell_thickness", "none"},
+    });
+
+    Print cadence_print;
+    Model cadence_model;
+    process_cube_with_overrides(config, {{"wall_layer_height", 0.2}}, cadence_print, cadence_model);
+    Print control_print;
+    Model control_model;
+    process_cube_with_overrides(config, {}, control_print, control_model);
+
+    REQUIRE(cadence_print.objects().front()->slicing_parameters().cadence_ratio == 1);
+    REQUIRE(control_print.objects().front()->slicing_parameters().cadence_ratio == 1);
+    CHECK(shell_layer_z_tenths(*cadence_print.objects().front()) ==
+          shell_layer_z_tenths(*control_print.objects().front()));
+}
+
+TEST_CASE("Bottom recombination preserves separate combined solid metadata", "[FeatureCadence][Regression]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"sparse_infill_density", 15.},
+        {"interface_shells", true},
+        {"top_shell_layers", 0},
+        {"bottom_shell_layers", 1},
+        {"top_shell_thickness", 0.},
+        {"bottom_shell_thickness", 0.},
+        {"ensure_vertical_shell_thickness", "none"},
+    });
+    Print print;
+    Model model;
+    process_bottom_surface_with_separate_solid_interior(config, print, model);
+
+    const ConstLayerPtrsAdaptor layers = print.objects().front()->layers();
+    const auto lower_it = std::find_if(layers.begin(), layers.end(), [](const Layer *layer) {
+        return std::abs(layer->print_z - 10.1) <= EPSILON;
+    });
+    REQUIRE(lower_it != layers.end());
+    REQUIRE(std::next(lower_it) != layers.end());
+    const Layer &lower = **lower_it;
+    const Layer &upper = **std::next(lower_it);
+    REQUIRE_THAT(upper.print_z, Catch::Matchers::WithinAbs(10.2, EPSILON));
+
+    Polygons voids;
+    for (const LayerRegion *region : lower.regions())
+        polygons_append(voids, to_polygons(region->fill_surfaces.filter_by_type(stInternalVoid)));
+    REQUIRE_FALSE(voids.empty());
+
+    const auto bottom_paths = paths_with_role(upper, erBottomSurface);
+    REQUIRE_FALSE(bottom_paths.empty());
+    for (const ExtrusionPath *path : bottom_paths)
+        CHECK_THAT(path->height, Catch::Matchers::WithinAbs(0.2, EPSILON));
+
+    size_t combined_solid_paths = 0;
+    size_t fine_solid_segments_over_void = 0;
+    for (const ExtrusionPath *path : paths_with_role(upper, erSolidInfill)) {
+        if (std::abs(path->height - 0.2) <= EPSILON)
+            ++combined_solid_paths;
+        if (std::abs(path->height - 0.1) <= EPSILON)
+            fine_solid_segments_over_void += intersection_pl({path->polyline.to_polyline()}, voids).size();
+    }
+    CHECK(combined_solid_paths > 0);
+    CHECK(fine_solid_segments_over_void == 0);
 }

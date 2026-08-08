@@ -86,6 +86,11 @@ using namespace std::literals;
 
 namespace Slic3r {
 
+static int scaled_shell_layers(int shell_layers, int cadence_ratio)
+{
+    return shell_layers > 0 ? shell_layers * cadence_ratio : shell_layers;
+}
+
 // Constructor is called from the main thread, therefore all Model / ModelObject / ModelIntance data are valid.
 PrintObject::PrintObject(Print* print, ModelObject* model_object, const Transform3d& trafo, PrintInstances&& instances) :
     PrintObjectBaseWithState(print, model_object),
@@ -2220,7 +2225,10 @@ void PrintObject::discover_vertical_shells()
         Polygons    holes;
     };
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
-    size_t   num_layers       = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
+    size_t   num_layers       = spiral_mode ?
+        std::min(size_t(scaled_shell_layers(this->printing_region(0).config().bottom_shell_layers,
+                                            m_slicing_params.cadence_ratio)), m_layers.size()) :
+        m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
     bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value;
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;
@@ -2421,7 +2429,8 @@ void PrintObject::discover_vertical_shells()
                         }
                     };
                     static constexpr const bool one_more_layer_below_top_bottom_surfaces = false;
-			        if (int n_top_layers = region_config.top_shell_layers.value; n_top_layers > 0) {
+                    if (int n_top_layers = scaled_shell_layers(region_config.top_shell_layers.value,
+                                                                m_slicing_params.cadence_ratio); n_top_layers > 0) {
                         // Gather top regions projected to this layer.
                         coordf_t print_z = layer->print_z;
                         int i = int(idx_layer) + 1;
@@ -2449,8 +2458,9 @@ void PrintObject::discover_vertical_shells()
                             if (i < int(cache_top_botom_regions.size()) &&
                                 (i <= itop || m_layers[i]->bottom_z() - print_z < region_config.top_shell_thickness - EPSILON))
                                 combine_holes(cache_top_botom_regions[i].holes);
-	                }
-	                if (int n_bottom_layers = region_config.bottom_shell_layers.value; n_bottom_layers > 0) {
+                    }
+                    if (int n_bottom_layers = scaled_shell_layers(region_config.bottom_shell_layers.value,
+                                                                   m_slicing_params.cadence_ratio); n_bottom_layers > 0) {
                         // Gather bottom regions projected to this layer.
                         coordf_t bottom_z = layer->bottom_z();
                         int i = int(idx_layer) - 1;
@@ -2476,7 +2486,7 @@ void PrintObject::discover_vertical_shells()
                             if (i >= 0 &&
                                 (i > ibottom || bottom_z - m_layers[i]->print_z < region_config.bottom_shell_thickness - EPSILON))
                                 combine_holes(cache_top_botom_regions[i].holes);
-	                }
+                    }
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
                     {
         				Slic3r::SVG svg(debug_out_path("discover_vertical_shells-perimeters-before-union-%d.svg", debug_idx), get_extents(shell));
@@ -4311,6 +4321,7 @@ void PrintObject::discover_horizontal_shells()
             LayerRegion             *layerm = layer->regions()[region_id];
             const PrintRegionConfig &region_config = layerm->region().config();
 
+            // Patterns are evaluated against fine-grid layer indices when feature cadence is active.
             if (!region_config.extra_solid_infills.value.empty() &&
                 check_layer_id_pattern(region_config.extra_solid_infills.value, i)) {
                 // Insert a solid internal layer. Mark stInternal surfaces as stInternalSolid.
@@ -4328,7 +4339,12 @@ void PrintObject::discover_horizontal_shells()
             for (size_t idx_surface_type = 0; idx_surface_type < 3; ++ idx_surface_type) {
                 m_print->throw_if_canceled();
                 SurfaceType type = (idx_surface_type == 0) ? stTop : (idx_surface_type == 1) ? stBottom : stBottomBridge;
-                int num_solid_layers = (type == stTop) ? region_config.top_shell_layers.value : region_config.bottom_shell_layers.value;
+                int num_solid_layers = scaled_shell_layers(
+                    (type == stTop) ? region_config.top_shell_layers.value : region_config.bottom_shell_layers.value,
+                    m_slicing_params.cadence_ratio);
+                if (type != stTop && i == 0 && m_slicing_params.cadence_ratio > 1 && num_solid_layers > 0)
+                    // The initial layer is already one full base-cadence group, not one fine-grid layer.
+                    num_solid_layers -= m_slicing_params.cadence_ratio - 1;
                 if (num_solid_layers == 0)
                 	continue;
                 // Find slices of current type for current layer.
