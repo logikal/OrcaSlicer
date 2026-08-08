@@ -21,6 +21,7 @@ class PrintObjectConfig;
 class ModelConfig;
 class ModelObject;
 class DynamicPrintConfig;
+struct FeatureCadencePlan;
 
 // Parameters to guide object slicing and support generation.
 // The slicing parameters account for a raft and whether the 1st object layer is printed with a normal or a bridging flow
@@ -35,7 +36,9 @@ struct SlicingParameters
          const PrintObjectConfig         &object_config,
          coordf_t                         object_height,
          const std::vector<unsigned int> &object_extruders,
-         const Vec3d                     &object_shrinkage_compensation);
+         const Vec3d                     &object_shrinkage_compensation,
+         const FeatureCadencePlan        *cadence_plan = nullptr,
+         const std::vector<unsigned int> &fine_cadence_extruders = {});
 
     // Has any raft layers?
     bool        has_raft() const { return raft_layers() > 0; }
@@ -66,6 +69,9 @@ struct SlicingParameters
 	// The regular layer height, applied for all but the first layer, if not overridden by layer ranges
 	// or by the variable layer thickness table.
     coordf_t    layer_height { 0 };
+    // The object's process layer height before feature cadence refines the shared Z grid.
+    coordf_t    base_layer_height { 0 };
+    int         cadence_ratio { 1 };
     // Minimum / maximum layer height, to be used for the automatic adaptive layer height algorithm,
     // or by an interactive layer height editor.
     coordf_t    min_layer_height { 0 };
@@ -125,6 +131,8 @@ inline bool equal_layering(const SlicingParameters &sp1, const SlicingParameters
             sp1.interface_raft_layer_height         == sp2.interface_raft_layer_height          &&
             sp1.contact_raft_layer_height           == sp2.contact_raft_layer_height            &&
             sp1.layer_height                        == sp2.layer_height                         &&
+            sp1.base_layer_height                   == sp2.base_layer_height                    &&
+            sp1.cadence_ratio                       == sp2.cadence_ratio                        &&
             sp1.min_layer_height                    == sp2.min_layer_height                     &&
             sp1.max_layer_height                    == sp2.max_layer_height                     &&
 //            sp1.max_suport_layer_height             == sp2.max_suport_layer_height              &&

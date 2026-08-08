@@ -321,6 +321,13 @@ private:
     size_t                                      m_ref_cnt{ 0 };
 };
 
+struct FeatureCadencePlan
+{
+    double base_height = 0.;
+    double grid_height = 0.;
+    int    ratio       = 1;
+};
+
 class PrintObject : public PrintObjectBaseWithState<Print, PrintObjectStep, posCount>
 {
 private: // Prevents erroneous use by other classes.
@@ -499,6 +506,7 @@ public:
         const ConfigOptionResolver &old_config, const ConfigOptionResolver &new_config, const std::vector<t_config_option_key> &opt_keys);
     // If ! m_slicing_params.valid, recalculate.
     void                    update_slicing_parameters();
+    FeatureCadencePlan      compute_feature_cadence_plan() const;
 
     static PrintObjectConfig object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object, size_t num_extruders, std::vector<int>& variant_index);
 

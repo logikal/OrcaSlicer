@@ -31,7 +31,9 @@
 #include <cstddef>
 #include <float.h>
 #include <iterator>
+#include <limits>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/concurrent_vector.h>
@@ -3993,6 +3995,43 @@ struct POProfiler
     uint32_t duration2;
 };
 
+static bool update_feature_cadence_plan(FeatureCadencePlan &plan, const PrintRegionConfig &region_config)
+{
+    const double wall_height = region_config.wall_layer_height.value;
+    if (wall_height <= 0. || wall_height >= plan.base_height - EPSILON)
+        return false;
+
+    const int region_ratio = feature_cadence_ratio(plan.base_height, wall_height);
+    if (region_ratio <= 1) {
+        BOOST_LOG_TRIVIAL(debug) << "Ignoring non-divisor wall layer height " << wall_height
+                                 << " for base layer height " << plan.base_height;
+        return false;
+    }
+
+    const long long ratio = static_cast<long long>(plan.ratio / std::gcd(plan.ratio, region_ratio)) * region_ratio;
+    if (ratio > std::numeric_limits<int>::max()) {
+        BOOST_LOG_TRIVIAL(debug) << "Ignoring wall cadence whose combined ratio exceeds the supported integer range";
+        return false;
+    }
+    plan.ratio       = static_cast<int>(ratio);
+    plan.grid_height = plan.base_height / plan.ratio;
+    return true;
+}
+
+static void append_fine_wall_extruders(const PrintConfig &print_config, const PrintRegionConfig &region_config,
+                                       const FeatureCadencePlan &plan, std::vector<unsigned int> &extruders)
+{
+    const double wall_height = region_config.wall_layer_height.value;
+    if (wall_height <= 0. || wall_height >= plan.base_height - EPSILON ||
+        feature_cadence_ratio(plan.base_height, wall_height) <= 1)
+        return;
+
+    extruders.emplace_back(static_cast<unsigned int>(
+        get_extruder_index_from_filament_id(print_config, region_config.outer_wall_filament_id.value)));
+    extruders.emplace_back(static_cast<unsigned int>(
+        get_extruder_index_from_filament_id(print_config, region_config.inner_wall_filament_id.value)));
+}
+
 void PrintObject::generate_support_preview()
 {
     POProfiler profiler;
@@ -4011,9 +4050,27 @@ void PrintObject::update_slicing_parameters()
 {
     // Orca: updated function call for XYZ shrinkage compensation
     if (!m_slicing_params.valid) {
-          m_slicing_params = SlicingParameters::create_from_config(this->print()->config(), m_config, this->model_object()->max_z(),
-                                                                   this->object_extruders(), this->print()->shrinkage_compensation());
-      }
+        const FeatureCadencePlan plan = this->compute_feature_cadence_plan();
+        std::vector<unsigned int> fine_cadence_extruders;
+        if (plan.ratio > 1) {
+            for (const PrintRegion &region : this->all_regions())
+                append_fine_wall_extruders(this->print()->config(), region.config(), plan, fine_cadence_extruders);
+            sort_remove_duplicates(fine_cadence_extruders);
+        }
+        m_slicing_params = SlicingParameters::create_from_config(
+            this->print()->config(), m_config, this->model_object()->max_z(), this->object_extruders(),
+            this->print()->shrinkage_compensation(), &plan, fine_cadence_extruders);
+    }
+}
+
+FeatureCadencePlan PrintObject::compute_feature_cadence_plan() const
+{
+    FeatureCadencePlan plan;
+    plan.base_height = m_config.layer_height.value;
+    plan.grid_height = plan.base_height;
+    for (const PrintRegion &region : this->all_regions())
+        update_feature_cadence_plan(plan, region.config());
+    return plan;
 }
 
 // Orca: XYZ shrinkage compensation has introduced the const Vec3d &object_shrinkage_compensation parameter to the function below
@@ -4030,13 +4087,21 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 	object_config = object_config_from_model_object(object_config, model_object, filament_extruders, variant_index);
 
 	std::vector<unsigned int> object_extruders;
+	std::vector<unsigned int> fine_cadence_extruders;
+	FeatureCadencePlan cadence_plan;
+	cadence_plan.base_height = object_config.layer_height.value;
+	cadence_plan.grid_height = cadence_plan.base_height;
 	for (const ModelVolume* model_volume : model_object.volumes)
 		if (model_volume->is_model_part()) {
+			const PrintRegionConfig region_config = region_config_from_model_volume(
+				default_region_config, nullptr, *model_volume, filament_extruders, variant_index, print_config);
 			PrintRegion::collect_object_printing_extruders(
 				print_config,
-				region_config_from_model_volume(default_region_config, nullptr, *model_volume, filament_extruders, variant_index, print_config),
+				region_config,
                 object_config.brim_type != btNoBrim && object_config.brim_width > 0.,
 				object_extruders);
+			update_feature_cadence_plan(cadence_plan, region_config);
+			append_fine_wall_extruders(print_config, region_config, cadence_plan, fine_cadence_extruders);
 			for (const std::pair<const t_layer_height_range, ModelConfig> &range_and_config : model_object.layer_config_ranges)
 				if (range_and_config.second.has("outer_wall_filament_id") ||
 					range_and_config.second.has("inner_wall_filament_id") ||
@@ -4051,11 +4116,13 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 						object_extruders);
 		}
     sort_remove_duplicates(object_extruders);
+    sort_remove_duplicates(fine_cadence_extruders);
     //FIXME add painting extruders
 
     if (object_max_z <= 0.f)
         object_max_z = (float)model_object.raw_bounding_box().size().z();
-    return SlicingParameters::create_from_config(print_config, object_config, object_max_z, object_extruders, object_shrinkage_compensation);
+    return SlicingParameters::create_from_config(print_config, object_config, object_max_z, object_extruders,
+                                                 object_shrinkage_compensation, &cadence_plan, fine_cadence_extruders);
 }
 
 // returns 0-based indices of extruders used to print the object (without brim, support and other helper extrusions)

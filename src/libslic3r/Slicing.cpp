@@ -4,6 +4,7 @@
 #include "Slicing.hpp"
 #include "SlicingAdaptive.hpp"
 #include "PrintConfig.hpp"
+#include "Print.hpp"
 #include "Model.hpp"
 
 // #define SLIC3R_DEBUG
@@ -64,7 +65,9 @@ SlicingParameters SlicingParameters::create_from_config(
     const PrintObjectConfig         &object_config,
     coordf_t                         object_height,
     const std::vector<unsigned int> &object_extruders,
-    const Vec3d                     &object_shrinkage_compensation)
+    const Vec3d                     &object_shrinkage_compensation,
+    const FeatureCadencePlan        *cadence_plan,
+    const std::vector<unsigned int> &fine_cadence_extruders)
 {
     coordf_t initial_layer_print_height                      = (print_config.initial_layer_print_height.value <= 0) ? 
         object_config.layer_height.value : print_config.initial_layer_print_height.value;
@@ -105,7 +108,15 @@ SlicingParameters SlicingParameters::create_from_config(
 
     SlicingParameters params;
 
-    params.layer_height               = object_config.layer_height.value;
+    if (cadence_plan != nullptr && cadence_plan->ratio > 1) {
+        params.layer_height      = cadence_plan->grid_height;
+        params.base_layer_height = cadence_plan->base_height;
+        params.cadence_ratio     = cadence_plan->ratio;
+    } else {
+        params.layer_height      = object_config.layer_height.value;
+        params.base_layer_height = params.layer_height;
+        params.cadence_ratio     = 1;
+    }
     params.first_print_layer_height   = initial_layer_print_height;
     params.first_object_layer_height  = initial_layer_print_height;
     params.object_print_z_min         = 0.0;
@@ -132,11 +143,13 @@ SlicingParameters SlicingParameters::create_from_config(
         params.max_suport_layer_height = params.max_layer_height;
     }
 
-    if (object_extruders.empty()) {
+    const std::vector<unsigned int> &bounded_extruders =
+        params.cadence_ratio > 1 && !fine_cadence_extruders.empty() ? fine_cadence_extruders : object_extruders;
+    if (bounded_extruders.empty()) {
         params.min_layer_height = std::max(params.min_layer_height, min_layer_height_from_nozzle(print_config, 0));
         params.max_layer_height = std::min(params.max_layer_height, max_layer_height_from_nozzle(print_config, 0));
     } else {
-        for (unsigned int extruder_id : object_extruders) {
+        for (unsigned int extruder_id : bounded_extruders) {
             params.min_layer_height = std::max(params.min_layer_height, min_layer_height_from_nozzle(print_config, extruder_id));
             params.max_layer_height = std::min(params.max_layer_height, max_layer_height_from_nozzle(print_config, extruder_id));
         }
@@ -156,8 +169,8 @@ SlicingParameters SlicingParameters::create_from_config(
         params.gap_raft_object = raft_z_gap;
         if (!print_config.independent_support_layer_height) {
             params.gap_raft_object =
-                std::round(params.gap_raft_object / object_config.layer_height + EPSILON)
-                * object_config.layer_height;
+                std::round(params.gap_raft_object / params.layer_height + EPSILON)
+                * params.layer_height;
         }
     }
 
@@ -169,8 +182,8 @@ SlicingParameters SlicingParameters::create_from_config(
 
         if (!print_config.independent_support_layer_height) {
             params.gap_object_support =
-                std::round(params.gap_object_support / object_config.layer_height + EPSILON)
-                * object_config.layer_height;
+                std::round(params.gap_object_support / params.layer_height + EPSILON)
+                * params.layer_height;
         }
     }
 
@@ -182,8 +195,8 @@ SlicingParameters SlicingParameters::create_from_config(
 
         if (!print_config.independent_support_layer_height) {
             params.gap_support_object =
-                std::round(params.gap_support_object / object_config.layer_height + EPSILON)
-                * object_config.layer_height;
+                std::round(params.gap_support_object / params.layer_height + EPSILON)
+                * params.layer_height;
         }
     }
 
