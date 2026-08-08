@@ -507,6 +507,12 @@ enum FilamentMapMode {
     fmmDefault
 };
 
+enum class FeatureProcessPolicy {
+    AutoNozzleVariant = 0,
+    Pinned,
+    SameAsObject,
+};
+
 // All auto modes are ordered before fmmManual (see the enum ordering note above).
 inline bool is_auto_filament_map_mode(FilamentMapMode mode) {
     return mode < fmmManual;
@@ -672,6 +678,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PerimeterGeneratorType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ToolChangeOrderingType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PowerLossRecoveryMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SurfaceFillOrder)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FeatureProcessPolicy)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 
@@ -1116,10 +1123,18 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,               support_bottom_z_distance))
     ((ConfigOptionInt,                 enforce_support_layers))
     ((ConfigOptionInt,                 support_filament))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, support_process_policy))
+    ((ConfigOptionString,              support_process_preset))
+    ((ConfigOptionFloat,               support_process_layer_height))
+    ((ConfigOptionString,              support_process_projection))
     ((ConfigOptionFloatOrPercent,      support_line_width))
     ((ConfigOptionBool,                support_interface_not_for_body))
     ((ConfigOptionBool,                support_interface_loop_pattern))
     ((ConfigOptionInt,                 support_interface_filament))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, support_interface_process_policy))
+    ((ConfigOptionString,              support_interface_process_preset))
+    ((ConfigOptionFloat,               support_interface_process_layer_height))
+    ((ConfigOptionString,              support_interface_process_projection))
     ((ConfigOptionInt,                 support_interface_top_layers))
     ((ConfigOptionInt,                 support_interface_bottom_layers))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.
@@ -1333,6 +1348,26 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt, internal_solid_filament_id))
     ((ConfigOptionInt, top_surface_filament_id))
     ((ConfigOptionInt, bottom_surface_filament_id))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, wall_process_policy))
+    ((ConfigOptionString, wall_process_preset))
+    ((ConfigOptionFloat, wall_layer_height))
+    ((ConfigOptionString, wall_process_projection))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, sparse_infill_process_policy))
+    ((ConfigOptionString, sparse_infill_process_preset))
+    ((ConfigOptionFloat, sparse_infill_process_layer_height))
+    ((ConfigOptionString, sparse_infill_process_projection))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, internal_solid_process_policy))
+    ((ConfigOptionString, internal_solid_process_preset))
+    ((ConfigOptionFloat, internal_solid_process_layer_height))
+    ((ConfigOptionString, internal_solid_process_projection))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, top_surface_process_policy))
+    ((ConfigOptionString, top_surface_process_preset))
+    ((ConfigOptionFloat, top_surface_process_layer_height))
+    ((ConfigOptionString, top_surface_process_projection))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, bottom_surface_process_policy))
+    ((ConfigOptionString, bottom_surface_process_preset))
+    ((ConfigOptionFloat, bottom_surface_process_layer_height))
+    ((ConfigOptionString, bottom_surface_process_projection))
     ((ConfigOptionFloatOrPercent, internal_solid_infill_line_width))
     ((ConfigOptionFloatsNullable, internal_solid_infill_speed))
     // Detect thin walls.

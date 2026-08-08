@@ -645,6 +645,13 @@ static const t_config_enum_values s_keys_map_FilamentMapMode = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FilamentMapMode)
 
+static const t_config_enum_values s_keys_map_FeatureProcessPolicy = {
+    { "auto_nozzle_variant", int(FeatureProcessPolicy::AutoNozzleVariant) },
+    { "pinned",              int(FeatureProcessPolicy::Pinned) },
+    { "same_as_object",      int(FeatureProcessPolicy::SameAsObject) },
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FeatureProcessPolicy)
+
 // PrimeVolumeMode. Serialized string keys must stay stable; they round-trip through .3mf.
 static const t_config_enum_values s_keys_map_PrimeVolumeMode = {
     { "Default", pvmDefault },
@@ -1116,6 +1123,50 @@ void PrintConfigDef::init_common_params()
 void PrintConfigDef::init_fff_params()
 {
     ConfigOptionDef* def;
+
+    auto add_feature_process_options = [this](
+        const char *process_prefix,
+        const char *layer_height_key,
+        const char *policy_label,
+        const char *preset_label,
+        const char *layer_height_label) {
+        ConfigOptionDef *feature_def = this->add(std::string(process_prefix) + "_policy", coEnum);
+        feature_def->label = policy_label;
+        feature_def->category = L("Extruders");
+        feature_def->tooltip = L("Selects the process settings for this feature. Automatic selects a nozzle-compatible variant for the feature's tool, Pinned uses the named preset, and Same as object keeps the object's process settings. Automatic is the nozzle-safe default.");
+        feature_def->enum_keys_map = &ConfigOptionEnum<FeatureProcessPolicy>::get_enum_values();
+        feature_def->enum_values.push_back("auto_nozzle_variant");
+        feature_def->enum_values.push_back("pinned");
+        feature_def->enum_values.push_back("same_as_object");
+        feature_def->enum_labels.push_back(L("Automatic nozzle-matched variant"));
+        feature_def->enum_labels.push_back(L("Pinned preset"));
+        feature_def->enum_labels.push_back(L("Same as object"));
+        feature_def->mode = comAdvanced;
+        feature_def->set_default_value(new ConfigOptionEnum<FeatureProcessPolicy>(FeatureProcessPolicy::AutoNozzleVariant));
+
+        feature_def = this->add(std::string(process_prefix) + "_preset", coString);
+        feature_def->label = preset_label;
+        feature_def->category = L("Extruders");
+        feature_def->tooltip = L("Process preset name used when the feature process policy is Pinned preset.");
+        feature_def->mode = comAdvanced;
+        feature_def->set_default_value(new ConfigOptionString());
+
+        feature_def = this->add(layer_height_key, coFloat);
+        feature_def->label = layer_height_label;
+        feature_def->category = L("Extruders");
+        feature_def->tooltip = L("Requested layer height for this feature. Zero follows the resolved process or object layer height.");
+        feature_def->sidetext = L("mm");
+        feature_def->min = 0.;
+        feature_def->mode = comDevelop;
+        feature_def->set_default_value(new ConfigOptionFloat(0.));
+
+        feature_def = this->add(std::string(process_prefix) + "_projection", coString);
+        feature_def->label = "Feature process projection";
+        feature_def->category = L("Extruders");
+        feature_def->tooltip = "Internal derived cache of resolved feature process settings. Recomputed from the selected policy and preset.";
+        feature_def->mode = comDevelop;
+        feature_def->set_default_value(new ConfigOptionString());
+    };
 
     // Maximum extruder temperature, bumped to 1500 to support printing of glass.
     const int max_temp = 1500;
@@ -4589,6 +4640,10 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
+    add_feature_process_options(
+        "sparse_infill_process", "sparse_infill_process_layer_height",
+        L("Sparse infill process policy"), L("Sparse infill process preset"), L("Sparse infill layer height"));
+
     def = this->add("sparse_infill_line_width", coFloatOrPercent);
     def->label = L("Sparse infill");
     def->category = L("Quality");
@@ -5507,6 +5562,10 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
+    add_feature_process_options(
+        "wall_process", "wall_layer_height",
+        L("Wall process policy"), L("Wall process preset"), L("Wall layer height"));
+
     def = this->add("inner_wall_line_width", coFloatOrPercent);
     def->label = L("Inner wall");
     def->category = L("Quality");
@@ -6377,6 +6436,16 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
+    add_feature_process_options(
+        "internal_solid_process", "internal_solid_process_layer_height",
+        L("Internal solid infill process policy"), L("Internal solid infill process preset"), L("Internal solid infill layer height"));
+    add_feature_process_options(
+        "top_surface_process", "top_surface_process_layer_height",
+        L("Top surface process policy"), L("Top surface process preset"), L("Top surface layer height"));
+    add_feature_process_options(
+        "bottom_surface_process", "bottom_surface_process_layer_height",
+        L("Bottom surface process policy"), L("Bottom surface process preset"), L("Bottom surface layer height"));
+
     def = this->add("internal_solid_infill_line_width", coFloatOrPercent);
     def->label = L("Internal solid infill");
     def->category = L("Quality");
@@ -6788,6 +6857,10 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
 
+    add_feature_process_options(
+        "support_process", "support_process_layer_height",
+        L("Support process policy"), L("Support process preset"), L("Support layer height"));
+
     def = this->add("support_interface_not_for_body",coBool);
     def->label    = L("Avoid interface filament for base");
     def->category = L("Support");
@@ -6823,6 +6896,10 @@ void PrintConfigDef::init_fff_params()
     // BBS
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
+
+    add_feature_process_options(
+        "support_interface_process", "support_interface_process_layer_height",
+        L("Support interface process policy"), L("Support interface process preset"), L("Support interface layer height"));
 
     auto support_interface_top_layers = def = this->add("support_interface_top_layers", coInt);
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;

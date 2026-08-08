@@ -1240,6 +1240,20 @@ bool PrintObject::invalidate_state_by_config_options(
             steps.emplace_back(posPerimeters);
         } else if (
                opt_key == "layer_height"
+            || opt_key == "wall_layer_height"
+            || opt_key == "wall_process_projection"
+            || opt_key == "sparse_infill_process_layer_height"
+            || opt_key == "sparse_infill_process_projection"
+            || opt_key == "internal_solid_process_layer_height"
+            || opt_key == "internal_solid_process_projection"
+            || opt_key == "top_surface_process_layer_height"
+            || opt_key == "top_surface_process_projection"
+            || opt_key == "bottom_surface_process_layer_height"
+            || opt_key == "bottom_surface_process_projection"
+            || opt_key == "support_process_layer_height"
+            || opt_key == "support_process_projection"
+            || opt_key == "support_interface_process_layer_height"
+            || opt_key == "support_interface_process_projection"
             || opt_key == "mmu_segmented_region_max_width"
             || opt_key == "mmu_segmented_region_interlocking_depth"
             || opt_key == "raft_layers"
@@ -1257,6 +1271,22 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "interlocking_boundary_avoidance"
             || opt_key == "interlocking_beam_width") {
             steps.emplace_back(posSlice);
+		} else if (
+               opt_key == "wall_process_policy"
+            || opt_key == "wall_process_preset"
+            || opt_key == "sparse_infill_process_policy"
+            || opt_key == "sparse_infill_process_preset"
+            || opt_key == "internal_solid_process_policy"
+            || opt_key == "internal_solid_process_preset"
+            || opt_key == "top_surface_process_policy"
+            || opt_key == "top_surface_process_preset"
+            || opt_key == "bottom_surface_process_policy"
+            || opt_key == "bottom_surface_process_preset"
+            || opt_key == "support_process_policy"
+            || opt_key == "support_process_preset"
+            || opt_key == "support_interface_process_policy"
+            || opt_key == "support_interface_process_preset") {
+            // Policy metadata affects slicing only after the resolver refreshes the derived projection/height keys.
 		} else if (
                opt_key == "elefant_foot_compensation"
             || opt_key == "elefant_foot_compensation_layers"
