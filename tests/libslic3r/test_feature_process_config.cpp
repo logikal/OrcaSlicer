@@ -1,5 +1,6 @@
 #include <catch2/catch_all.hpp>
 
+#include "libslic3r/Model.hpp"
 #include "libslic3r/Preset.hpp"
 #include "libslic3r/PrintConfig.hpp"
 
@@ -80,4 +81,38 @@ TEST_CASE("Feature process config keys round trip and remain print options", "[F
         CHECK(token_round_trip.option<ConfigOptionEnum<FeatureProcessPolicy>>("wall_process_policy")->value == policy_value);
         CHECK(token_round_trip.option_throw("wall_process_policy")->serialize() == policy_token);
     }
+}
+
+TEST_CASE("Pinned wall process intent round trips through sparse model config", "[FeatureProcessConfig]")
+{
+    constexpr const char *missing_preset = "Missing 0.10mm process @TestPrinter 0.2 nozzle";
+    constexpr const char *projection =
+        "outer_wall_line_width=0.24;inner_wall_line_width=0.24;outer_wall_speed=42";
+
+    Model source_model;
+    ModelObject *source = source_model.add_object("cube", "", make_cube(20., 20., 20.));
+    source->config.set_key_value(
+        "wall_process_policy",
+        new ConfigOptionEnum<FeatureProcessPolicy>(FeatureProcessPolicy::Pinned));
+    source->config.set("wall_process_preset", std::string(missing_preset));
+    source->config.set("wall_layer_height", 0.1);
+    source->config.set("wall_process_projection", std::string(projection));
+
+    Model restored_model;
+    ModelObject *restored = restored_model.add_object("cube", "", make_cube(20., 20., 20.));
+    ConfigSubstitutionContext substitutions{ForwardCompatibilitySubstitutionRule::Disable};
+    for (const std::string &key : source->config.get().keys())
+        restored->config.set_deserialize(
+            key, source->config.get().opt_serialize(key), substitutions);
+
+    const std::array<const char *, 4> keys{
+        "wall_process_policy", "wall_process_preset", "wall_layer_height", "wall_process_projection"};
+    for (const char *key : keys) {
+        INFO(key);
+        REQUIRE(restored->config.has(key));
+        CHECK(restored->config.get().opt_serialize(key) == source->config.get().opt_serialize(key));
+    }
+    CHECK(restored->config.get().opt_serialize("wall_process_policy") == "pinned");
+    CHECK(restored->config.get().opt_serialize("wall_process_preset") == missing_preset);
+    CHECK(restored->config.get().opt_serialize("wall_process_projection") == projection);
 }

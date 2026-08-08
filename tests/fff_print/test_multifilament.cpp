@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -268,6 +269,34 @@ TEST_CASE("Each feature prints with its assigned filament", "[MultiFilament]")
         CHECK(tools_for_role(gcode, "brim")      == wall_tool);
         CHECK(tools_for_role(gcode, "skirt")     == wall_tool);
     }
+}
+
+TEST_CASE("Feature filament routing survives mixed-nozzle wall cadence", "[MultiFilament][FeatureCadence]")
+{
+    const DynamicPrintConfig config = mixed_nozzle_config({
+        { "sparse_infill_density",          15. },
+        { "top_shell_layers",               2 },
+        { "bottom_shell_layers",            2 },
+        { "top_shell_thickness",            0. },
+        { "bottom_shell_thickness",         0. },
+        { "ensure_vertical_shell_thickness", "none" },
+        { "enable_prime_tower",             false },
+    });
+    const std::string output = slice_with_object_overrides(
+        { cube(20.) }, config,
+        {{{ "wall_layer_height", 0.1 },
+          { "wall_process_projection", "outer_wall_line_width=0.24;inner_wall_line_width=0.24" }}});
+
+    std::map<ExtrusionRole, std::set<int>> tools_by_role;
+    for (const GCodeExtrusion &extrusion : gcode_extrusions(output))
+        tools_by_role[extrusion.role].insert(extrusion.tool);
+
+    CHECK(tools_by_role[erPerimeter] == std::set<int>{0});
+    CHECK(tools_by_role[erExternalPerimeter] == std::set<int>{0});
+    CHECK(tools_by_role[erInternalInfill] == std::set<int>{1});
+    CHECK(tools_by_role[erSolidInfill] == std::set<int>{1});
+    CHECK(tools_by_role[erTopSolidInfill] == std::set<int>{1});
+    CHECK(tools_by_role[erBottomSurface] == std::set<int>{1});
 }
 
 TEST_CASE("Wall flow width follows the filament to extruder map", "[MultiFilament][Regression]")

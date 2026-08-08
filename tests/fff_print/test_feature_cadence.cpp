@@ -11,7 +11,9 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <optional>
 #include <set>
+#include <sstream>
 #include <string>
 
 using namespace Slic3r;
@@ -33,25 +35,7 @@ DynamicPrintConfig projection_test_config()
 
 DynamicPrintConfig mixed_nozzle_grid_config()
 {
-    DynamicPrintConfig config = multifilament_config(2, {
-        {"layer_height", 0.2},
-        {"initial_layer_print_height", 0.2},
-        {"nozzle_diameter", "0.2,0.4"},
-        {"min_layer_height", "0.05,0.1"},
-        {"max_layer_height", "0.15,0.3"},
-        {"printer_extruder_id", "1,2"},
-        {"printer_extruder_variant", "Direct Drive Standard,Direct Drive Standard"},
-        {"outer_wall_filament_id", 1},
-        {"inner_wall_filament_id", 1},
-        {"sparse_infill_filament_id", 2},
-        {"internal_solid_filament_id", 2},
-        {"top_surface_filament_id", 2},
-        {"bottom_surface_filament_id", 2},
-        {"skirt_loops", 0},
-    });
-    config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value = fmmManual;
-    config.option<ConfigOptionInts>("filament_map", true)->values = {1, 2};
-    return config;
+    return mixed_nozzle_config();
 }
 
 void process_cube_with_overrides(const DynamicPrintConfig &config,
@@ -113,6 +97,104 @@ double total_fill_length(const PrintObject &object)
 bool is_base_z(double z)
 {
     return std::abs(z / 0.2 - std::round(z / 0.2)) <= 1e-4;
+}
+
+bool is_wall_role(ExtrusionRole role)
+{
+    return role == erPerimeter || role == erExternalPerimeter;
+}
+
+bool is_interior_role(ExtrusionRole role)
+{
+    return role == erInternalInfill || role == erSolidInfill ||
+           role == erTopSolidInfill || role == erBottomSurface;
+}
+
+std::optional<int> integer_parameter(const std::string &line, char parameter)
+{
+    std::istringstream stream(line);
+    for (std::string token; stream >> token;)
+        if (token.size() >= 2 && token.front() == parameter &&
+            (std::isdigit(static_cast<unsigned char>(token[1])) || token[1] == '-'))
+            return std::stoi(token.substr(1));
+    return std::nullopt;
+}
+
+std::map<int, std::set<int>> nonzero_temperatures_by_tool(const std::string &gcode)
+{
+    std::map<int, std::set<int>> temperatures;
+    int current_tool = 0;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &, const GCodeReader::GCodeLine &line) {
+        const std::string command(line.cmd());
+        if (command.size() >= 2 && command.front() == 'T' &&
+            std::isdigit(static_cast<unsigned char>(command[1]))) {
+            current_tool = std::stoi(command.substr(1));
+            return;
+        }
+        if (command != "M104" && command != "M109")
+            return;
+        const std::optional<int> temperature = integer_parameter(line.raw(), 'S');
+        if (!temperature || *temperature == 0)
+            return;
+        const int tool = integer_parameter(line.raw(), 'T').value_or(current_tool);
+        temperatures[tool].insert(*temperature);
+    });
+    return temperatures;
+}
+
+void check_dual_tool_cube_gcode(const std::string &output, bool check_temperatures)
+{
+    const std::vector<GCodeExtrusion> extrusions = gcode_extrusions(output);
+    REQUIRE_FALSE(extrusions.empty());
+
+    std::set<int> wall_z_tenths;
+    std::set<ExtrusionRole> interior_roles;
+    double max_extrusion_z = 0.;
+    for (const GCodeExtrusion &extrusion : extrusions) {
+        max_extrusion_z = std::max(max_extrusion_z, extrusion.z);
+        if (is_wall_role(extrusion.role)) {
+            const int z_tenth = int(std::lround(extrusion.z * 10.));
+            wall_z_tenths.insert(z_tenth);
+            if (z_tenth > 2) {
+                CAPTURE(extrusion.role, extrusion.tool, extrusion.z, extrusion.height);
+                CHECK(extrusion.tool == 0);
+                CHECK_THAT(extrusion.height, Catch::Matchers::WithinAbs(0.1, 1e-4));
+            }
+        } else if (is_interior_role(extrusion.role)) {
+            CAPTURE(extrusion.role, extrusion.tool, extrusion.z, extrusion.height);
+            interior_roles.insert(extrusion.role);
+            CHECK(extrusion.tool == 1);
+            CHECK_THAT(extrusion.height, Catch::Matchers::WithinAbs(0.2, 1e-4));
+            CHECK(is_base_z(extrusion.z));
+        }
+    }
+
+    for (int z_tenth = 3; z_tenth <= 200; ++z_tenth) {
+        CAPTURE(z_tenth);
+        CHECK(wall_z_tenths.count(z_tenth) == 1);
+    }
+    CHECK(interior_roles == std::set<ExtrusionRole>{
+        erInternalInfill, erSolidInfill, erTopSolidInfill, erBottomSurface});
+    CHECK_THAT(max_extrusion_z, Catch::Matchers::WithinAbs(20., 0.1));
+
+    size_t in_object_tool_changes = 0;
+    for (const GCodeToolChange &change : gcode_tool_changes(output)) {
+        if (change.z <= 0.2 + 1e-4)
+            continue;
+        ++in_object_tool_changes;
+        CAPTURE(change.tool, change.z);
+        CHECK(is_base_z(change.z));
+    }
+    CHECK(in_object_tool_changes > 0);
+
+    if (check_temperatures) {
+        const std::map<int, std::set<int>> temperatures = nonzero_temperatures_by_tool(output);
+        REQUIRE(temperatures.count(0) == 1);
+        REQUIRE(temperatures.count(1) == 1);
+        CHECK(temperatures.at(0) == std::set<int>{210});
+        CHECK(temperatures.at(1) == std::set<int>{250});
+    }
 }
 
 void process_stacked_regions(const DynamicPrintConfig &config, Print &print, Model &model)
@@ -500,6 +582,148 @@ TEST_CASE("Fine-only G-code layers contain walls but no recombinable interior ex
         CHECK(extrusions.tools == std::set<int>{0});
     }
     CHECK(fine_only_layers > 0);
+}
+
+// Not working: with base/grid heights 0.20/0.10 and walls on T0/interiors on T1,
+// top-surface paths at Z19.6 and Z19.8 are emitted at HEIGHT 0.10; each combined
+// layer ends on T1 and the next fine-only layer changes to T0; T1 temperature
+// commands use 210 C instead of filament 2's configured 250 C.
+TEST_CASE("A mixed-nozzle cube preserves feature cadence through G-code",
+          "[FeatureCadence][GCode][NotWorking][.]")
+{
+    const bool cooling_slowdown = GENERATE(false, true);
+    DYNAMIC_SECTION("cooling slowdown " << (cooling_slowdown ? "enabled" : "disabled")) {
+        DynamicPrintConfig config = mixed_nozzle_config({
+            {"sparse_infill_density", 15.},
+            {"top_shell_layers", 2},
+            {"bottom_shell_layers", 2},
+            {"top_shell_thickness", 0.},
+            {"bottom_shell_thickness", 0.},
+            {"ensure_vertical_shell_thickness", "none"},
+            {"enable_prime_tower", false},
+            {"nozzle_temperature_initial_layer", "210,250"},
+            {"nozzle_temperature", "210,250"},
+        });
+        if (cooling_slowdown)
+            config.set_deserialize_strict({{"slow_down_layer_time", "8,8"}});
+
+        Print print;
+        Model model;
+        const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{
+            {"wall_layer_height", 0.1},
+            {"wall_process_projection", "outer_wall_line_width=0.24;inner_wall_line_width=0.24"},
+        }};
+        init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+        check_dual_tool_cube_gcode(gcode(print), !cooling_slowdown);
+    }
+}
+
+// Not working: the one-object mixed-feature config uses both filament ids, but
+// Print::apply normalizes enable_prime_tower from true to false before slicing.
+TEST_CASE("Prime tower follows mixed feature cadence without adding fine-layer tool changes",
+          "[FeatureCadence][GCode][NotWorking][.]")
+{
+    DynamicPrintConfig config = mixed_nozzle_config({
+        {"sparse_infill_density", 15.},
+        {"top_shell_layers", 2},
+        {"bottom_shell_layers", 2},
+        {"top_shell_thickness", 0.},
+        {"bottom_shell_thickness", 0.},
+        {"ensure_vertical_shell_thickness", "none"},
+        {"enable_prime_tower", true},
+        {"prime_tower_width", 35.},
+        {"wipe_tower_x", "50"},
+        {"wipe_tower_y", "50"},
+    });
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{
+        {"wall_layer_height", 0.1},
+        {"wall_process_projection", "outer_wall_line_width=0.24;inner_wall_line_width=0.24"},
+    }};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+    REQUIRE(print.config().enable_prime_tower.value);
+
+    const std::string output = gcode(print);
+    const std::vector<GCodeExtrusion> extrusions = gcode_extrusions(output);
+    CHECK(std::any_of(extrusions.begin(), extrusions.end(), [](const GCodeExtrusion &extrusion) {
+        return extrusion.role == erWipeTower;
+    }));
+
+    size_t in_object_tool_changes = 0;
+    for (const GCodeToolChange &change : gcode_tool_changes(output)) {
+        if (change.z <= 0.2 + 1e-4)
+            continue;
+        ++in_object_tool_changes;
+        CAPTURE(change.tool, change.z);
+        CHECK(is_base_z(change.z));
+    }
+    CHECK(in_object_tool_changes > 0);
+
+    size_t fine_object_layers = 0;
+    std::map<int, std::set<int>> object_tools_by_z;
+    for (const GCodeExtrusion &extrusion : extrusions)
+        if (extrusion.role != erWipeTower)
+            object_tools_by_z[int(std::lround(extrusion.z * 10.))].insert(extrusion.tool);
+    for (const auto &[z_tenth, tools] : object_tools_by_z) {
+        if (z_tenth <= 2 || z_tenth % 2 == 0)
+            continue;
+        ++fine_object_layers;
+        CHECK(tools == std::set<int>{0});
+    }
+    CHECK(fine_object_layers > 0);
+}
+
+TEST_CASE("A wall-disabled modifier remains sparse and does not disturb object cadence", "[FeatureCadence][Modifier]")
+{
+    DynamicPrintConfig config = mixed_nozzle_config({
+        {"sparse_infill_density", 15.},
+        {"top_shell_layers", 2},
+        {"bottom_shell_layers", 2},
+        {"ensure_vertical_shell_thickness", "none"},
+    });
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = "modifier-cube.stl";
+    object->add_volume(make_cube(20., 20., 20.));
+    ModelVolume *modifier = object->add_volume(
+        make_cube(10., 20., 20.), ModelVolumeType::PARAMETER_MODIFIER);
+    modifier->config.set("wall_loops", 0);
+    object->config.set("wall_layer_height", 0.1);
+    object->add_instance();
+    object->ensure_on_bed();
+
+    Print print;
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+    const StringObjectException validation = print.validate();
+    CAPTURE(validation.string, validation.opt_key);
+    REQUIRE(validation.string.empty());
+    print.set_status_silent();
+    REQUIRE_NOTHROW(print.process());
+
+    bool found_disabled_region = false;
+    bool found_fine_object_wall = false;
+    for (const Layer *layer : print.objects().front()->layers()) {
+        for (const LayerRegion *region : layer->regions()) {
+            const PrintRegionConfig &region_config = region->region().config();
+            if (region_config.wall_loops.value == 0) {
+                found_disabled_region = true;
+                CHECK(region_config.wall_process_projection.value.empty());
+                CHECK(region->perimeters.entities.empty());
+                continue;
+            }
+            for (const ExtrusionEntity *entity : region->perimeters.entities)
+                visit_paths(*entity, [&](const ExtrusionPath &path) {
+                    if (layer->print_z > 0.2 + EPSILON && is_wall_role(path.role())) {
+                        found_fine_object_wall = true;
+                        CHECK_THAT(path.height, Catch::Matchers::WithinAbs(0.1, EPSILON));
+                    }
+                });
+        }
+    }
+    CHECK(found_disabled_region);
+    CHECK(found_fine_object_wall);
 }
 
 TEST_CASE("A coarse-tool cap leaves unsafe interiors at fine cadence", "[FeatureCadence]")
