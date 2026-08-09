@@ -1386,6 +1386,10 @@ int CLI::run(int argc, char **argv)
         const char *display = boost::nowide::getenv("DISPLAY");
         const char *wayland_display = boost::nowide::getenv("WAYLAND_DISPLAY");
         if (! ((display && *display) || (wayland_display && *wayland_display))) {
+            if (m_config.opt_bool("gui_smoke")) {
+                boost::nowide::cerr << "SMOKE NO DISPLAY: neither DISPLAY nor WAYLAND_DISPLAY is set" << std::endl;
+                return 4;
+            }
             boost::nowide::cerr << "Neither DISPLAY nor WAYLAND_DISPLAY set, GUI mode not available." << std::endl << std::endl;
             this->print_help(false);
             // Indicate an error.
@@ -1397,6 +1401,8 @@ int CLI::run(int argc, char **argv)
         params.argv = argv;
         params.load_configs = load_configs;
         params.extra_config = std::move(m_extra_config);
+        params.gui_smoke = m_config.opt_bool("gui_smoke");
+        params.gui_smoke_steps = m_config.opt_string("gui_smoke_steps");
 
         std::vector<std::string>    gcode_files;
         std::vector<std::string>    non_gcode_files;
@@ -7308,7 +7314,17 @@ bool CLI::setup(int argc, char **argv)
         for (const t_optiondef_map::value_type &optdef : *options)
             m_config.option(optdef.first, true);
 
-    set_data_dir(m_config.opt_string("datadir"));
+    std::string datadir = m_config.opt_string("datadir");
+    if (m_config.opt_bool("gui_smoke") && datadir.empty()) {
+        const boost::filesystem::path smoke_datadir = boost::filesystem::temp_directory_path() /
+                                                       boost::filesystem::unique_path("orcaslicer-gui-smoke-%%%%%%%%");
+        boost::filesystem::create_directories(smoke_datadir);
+        datadir = smoke_datadir.string();
+        m_config.set_key_value("datadir", new ConfigOptionString(datadir));
+    }
+    set_data_dir(datadir);
+    if (m_config.opt_bool("gui_smoke"))
+        boost::nowide::cout << "SMOKE DATADIR: " << data_dir() << std::endl;
 
     //FIXME Validating at this stage most likely does not make sense, as the config is not fully initialized yet.
     if (!validity.empty()) {

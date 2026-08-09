@@ -12288,6 +12288,16 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->label = L("Data directory");
     def->tooltip = L("Load and store settings at the given directory. This is useful for maintaining different profiles or including configurations from a network storage.");
 
+    def = this->add("gui_smoke", coBool);
+    def->label = "GUI smoke test";
+    def->tooltip = "Run the scripted GUI smoke test and exit.";
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("gui_smoke_steps", coString);
+    def->label = "GUI smoke test steps";
+    def->tooltip = "Comma-separated scripted GUI smoke test steps to run.";
+    def->set_default_value(new ConfigOptionString());
+
 
     def = this->add("outputdir", coString);
     def->label = L("Output directory");

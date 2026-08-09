@@ -2425,7 +2425,7 @@ void Tab::on_presets_changed()
 
         // Trigger per-vendor preset update check
         const Preset& printer_preset = m_preset_bundle->printers.get_edited_preset();
-        if (printer_preset.vendor) {
+        if (printer_preset.vendor && !wxGetApp().is_gui_smoke()) {
             wxGetApp().get_preset_updater()->check_vendor_update(printer_preset.vendor->id);
         }
     }

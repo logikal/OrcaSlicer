@@ -214,6 +214,7 @@ public:
     void set_extruder_nozzle_count(int extruder_id, int nozzle_count);
     void enable_nozzle_count_edit(bool enable);
     void update_dynamic_filament_list();
+    bool apply_nozzle_diameters_for_smoke(const wxString &left_diameter, const wxString &right_diameter);
 
     PlaterPresetComboBox *  printer_combox();
     ObjectList*             obj_list();

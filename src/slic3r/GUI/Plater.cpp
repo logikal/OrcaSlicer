@@ -1312,6 +1312,16 @@ struct DynamicProcessPresetList : DynamicList
             if (combo == nullptr)
                 return;
 
+            // wxOSX may emit wxEVT_COMBOBOX from Clear()/SetSelection(). This refresh is
+            // reached from another field's change handler, so allowing those synthetic
+            // events to propagate recursively re-enters on_config_change() until the app
+            // terminates. Preserve the existing suppression state across the whole rebuild.
+            const bool was_suppressed = choice->m_disable_change_event;
+            choice->m_disable_change_event = true;
+            ScopeGuard restore_change_events([choice, was_suppressed] {
+                choice->m_disable_change_event = was_suppressed;
+            });
+
             std::string old_value;
             const auto preserved = std::find_if(preserved_values.begin(), preserved_values.end(),
                                                 [choice](const auto &entry) { return entry.first == choice; });
@@ -1883,6 +1893,21 @@ bool Sidebar::priv::apply_mixed_nozzle_overlay(const wxString &left_diameter, co
     plater->sidebar().update_presets(Preset::TYPE_PRINTER);
     plater->on_config_change(preset_bundle->full_config());
     plater->get_notification_manager()->push_notification(message.utf8_string());
+    return true;
+}
+
+bool Sidebar::apply_nozzle_diameters_for_smoke(const wxString &left_diameter, const wxString &right_diameter)
+{
+    if (left_diameter != right_diameter)
+        return p->apply_mixed_nozzle_overlay(left_diameter, right_diameter);
+
+    auto *project_diameters = wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+    if (project_diameters == nullptr)
+        return false;
+    project_diameters->values.clear();
+    wxGetApp().plater()->update_project_dirty_from_presets();
+    update_presets(Preset::TYPE_PRINTER);
+    wxGetApp().plater()->on_config_change(wxGetApp().preset_bundle->full_config());
     return true;
 }
 

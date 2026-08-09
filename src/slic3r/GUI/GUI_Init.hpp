@@ -32,6 +32,8 @@ struct GUI_InitParams
     //BBS: remove start_as_gcodeviewer logic
 	//bool	                    start_as_gcodeviewer;
 	bool                        input_gcode { false };
+    bool                        gui_smoke { false };
+    std::string                 gui_smoke_steps;
 };
 
 int GUI_Run(GUI_InitParams &params);

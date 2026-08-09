@@ -3,6 +3,7 @@
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
 #include "GUI_App.hpp"
+#include "GuiSmokeTest.hpp"
 #include "GUI_Init.hpp"
 #include "GUI_ObjectList.hpp"
 #include "slic3r/GUI/UserManager.hpp"
@@ -787,6 +788,8 @@ void GUI_App::post_init()
     assert(initialized());
     if (! this->initialized())
         throw Slic3r::RuntimeError("Calling post_init() while not yet initialized");
+    if (is_gui_smoke() && m_gui_smoke_test)
+        m_gui_smoke_test->log_phase("post_init entered");
 
 #if wxUSE_WEBVIEW_EDGE
     // Ensure the Microsoft WebView2 runtime is installed before any WebView is
@@ -951,7 +954,7 @@ void GUI_App::post_init()
     hms_query = new HMSQuery();
 
     m_show_gcode_window = app_config->get_bool("show_gcode_window");
-    if (m_networking_need_update) {
+    if (!is_gui_smoke() && m_networking_need_update) {
         show_network_plugin_download_dialog(false);
     }
 
@@ -973,7 +976,7 @@ void GUI_App::post_init()
     // to popup a modal dialog on start without screwing combo boxes.
     // This is ugly but I honestly found no better way to do it.
     // Neither wxShowEvent nor wxWindowCreateEvent work reliably.
-    if (this->preset_updater) { // G-Code Viewer does not initialize preset_updater.
+    if (this->preset_updater && !is_gui_smoke()) { // G-Code Viewer does not initialize preset_updater.
         CallAfter([this] {
             bool cw_showed = this->config_wizard_startup();
 
@@ -992,6 +995,8 @@ void GUI_App::post_init()
               request_user_handle(0, cloud_provider);
             }
         });
+    } else if (is_gui_smoke() && m_gui_smoke_test) {
+        m_gui_smoke_test->log_phase("wizard decision: suppressed for isolated smoke datadir");
     }
 
     // Orca: notify users upgrading from a pre-2.4.0 version that profile syncing
@@ -1021,7 +1026,7 @@ void GUI_App::post_init()
         });
     }
 
-    if(!m_networking_need_update && m_agent) {
+    if(!is_gui_smoke() && !m_networking_need_update && m_agent) {
         m_agent->set_on_ssdp_msg_fn(
             [this](std::string json_str) {
                 if (is_closing()) {
@@ -1079,6 +1084,14 @@ void GUI_App::post_init()
            }
         }
     }
+    if (is_gui_smoke() && m_gui_smoke_test) {
+        m_gui_smoke_test->log_phase("post_init complete");
+        // A real timer is deliberately armed here rather than relying on CallAfter:
+        // busy startup work can starve deferred callbacks, while the timer starts
+        // the first step only after control returns to the event loop.
+        m_gui_smoke_test->start_step_pump();
+    }
+
     BOOST_LOG_TRIVIAL(info) << "finished post_init";
 //BBS: remove the single instance currently
 #ifdef _WIN32
@@ -1117,6 +1130,43 @@ GUI_App::GUI_App()
     // It now runs in post_init(), before the first WebView (the setup wizard) is created.
 
     reset_to_active();
+}
+
+bool GUI_App::is_gui_smoke() const
+{
+    return init_params != nullptr && init_params->gui_smoke;
+}
+
+void GUI_App::prepare_gui_smoke_mode()
+{
+    if (!is_gui_smoke())
+        return;
+
+    // Everything below is stored only in the smoke run's isolated data directory.
+    // Make the minimum useful dual-tool profile visible and suppress every first-run,
+    // network, update, login, hint, and confirmation surface the scripted run could hit.
+    m_app_conf_exists = true;
+    app_config->set_bool("single_instance", false);
+    app_config->set_bool("show_splash_screen", false);
+    app_config->set_bool("show_hints", false);
+    app_config->set_bool("sync_user_preset", false);
+    app_config->set_bool("sync_system_preset", false);
+    app_config->set_bool("stealth_mode", true);
+    app_config->set_bool("update_network_plugin", false);
+    app_config->set_bool("do_not_show_object_process_tips", true);
+    app_config->set_bool("do_not_show_modifer_tips", true);
+    app_config->set("version", SoftFever_VERSION);
+    app_config->set("presets", "printer", "Bambu Lab H2D 0.4 nozzle");
+    app_config->set_variant("BambuResearch", "Bambu Lab H2D", "0.2", true);
+    app_config->set_variant("BambuResearch", "Bambu Lab H2D", "0.4", true);
+}
+
+void GUI_App::handle_gui_smoke_unhandled_exception()
+{
+    if (m_gui_smoke_test)
+        m_gui_smoke_test->handle_unhandled_exception();
+    else
+        GuiSmokeTest::handle_early_unhandled_exception(*this);
 }
 
 void GUI_App::shutdown()
@@ -2686,9 +2736,20 @@ void GUI_App::init_single_instance_checker(const std::string &name, const std::s
 bool GUI_App::OnInit()
 {
     try {
+        if (is_gui_smoke()) {
+            m_gui_smoke_test = std::make_unique<GuiSmokeTest>(*this, init_params->gui_smoke_steps);
+            // Arm this before any startup work. It must also cover a modal or a
+            // post_init/idle hang, not merely hangs after the first smoke step.
+            if (!m_gui_smoke_test->arm_watchdog())
+                return false;
+        }
         return on_init_inner();
     } catch (const std::exception& e) {
         BOOST_LOG_TRIVIAL(fatal) << "OnInit Got Fatal error: " << e.what();
+        if (is_gui_smoke()) {
+            handle_gui_smoke_unhandled_exception();
+            return false;
+        }
         generic_exception_handle();
         return false;
     }
@@ -3275,14 +3336,29 @@ bool GUI_App::on_init_inner()
         }
     } */
 
-    copy_network_if_available();
+    if (!is_gui_smoke())
+        copy_network_if_available();
 
     if (scrn) {
         scrn->SetText(_L("Loading Plugins") + dots, 20);
         wxYield();
     }
 
-    on_init_network();
+    if (!is_gui_smoke())
+        on_init_network();
+    else {
+        // on_init_network() normally creates these even when networking is
+        // disabled. MainFrame/StatusPanel require that offline state, so smoke
+        // mode must skip the network plug-in without skipping the managers.
+        if (m_gui_smoke_test)
+            m_gui_smoke_test->log_phase("creating offline device and user managers");
+        if (!m_device_manager)
+            m_device_manager = new Slic3r::DeviceManager();
+        if (!m_user_manager)
+            m_user_manager = new Slic3r::UserManager();
+        if (m_gui_smoke_test)
+            m_gui_smoke_test->log_phase("offline device and user managers ready");
+    }
 
     // Initialize plugins after network then register on_load callbacks so once the plugin loads finish, it gets registered automatically.
     // initialize() also installs the libslic3r hooks (capability resolver,
@@ -3381,7 +3457,11 @@ bool GUI_App::on_init_inner()
         wxYield();
     }
     BOOST_LOG_TRIVIAL(info) << "create the main window";
+    if (is_gui_smoke() && m_gui_smoke_test)
+        m_gui_smoke_test->log_phase("MainFrame creation begin");
     mainframe = new MainFrame();
+    if (is_gui_smoke() && m_gui_smoke_test)
+        m_gui_smoke_test->log_phase("MainFrame creation complete");
     // hide settings tabs after first Layout
     if (is_editor()) {
         mainframe->select_tab(size_t(0));
@@ -9054,8 +9134,21 @@ wxString GUI_App::filter_string(wxString str)
 
 bool GUI_App::OnExceptionInMainLoop()
 {
+    if (is_gui_smoke()) {
+        handle_gui_smoke_unhandled_exception();
+        return true;
+    }
     generic_exception_handle();
     return false;
+}
+
+void GUI_App::OnUnhandledException()
+{
+    if (is_gui_smoke()) {
+        handle_gui_smoke_unhandled_exception();
+        return;
+    }
+    wxApp::OnUnhandledException();
 }
 
 #ifdef __APPLE__
