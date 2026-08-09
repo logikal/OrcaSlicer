@@ -11841,7 +11841,10 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
         for (size_t i = 0; i < sizeof(widths) / sizeof(widths[i]); ++ i) {
             std::string key(widths[i]);
             double abs_width = cfg.get_abs_value(key, max_nozzle_diameter);
-            double allowed_max = (key == "bridge_line_width") ? min_nozzle_diameter : MAX_LINE_WIDTH_MULTIPLIER * max_nozzle_diameter;
+            // Config-level pre-filter only: with mixed nozzle diameters the per-role bridge
+            // width check in Print::validate() is authoritative; bounding by the MIN nozzle
+            // here would reject widths that are valid on the coarser tool.
+            double allowed_max = (key == "bridge_line_width") ? max_nozzle_diameter : MAX_LINE_WIDTH_MULTIPLIER * max_nozzle_diameter;
             if (abs_width > allowed_max) {
                 if (key == "bridge_line_width")
                     error_message.emplace(key, L("Bridge line width must not exceed nozzle diameter: ") + std::to_string(abs_width));

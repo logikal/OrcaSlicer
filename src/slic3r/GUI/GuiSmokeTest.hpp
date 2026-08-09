@@ -52,6 +52,7 @@ private:
     Progress feature_filament_each();
     Progress wall_policy_cycle();
     Progress mixed_diameter_overlay();
+    Progress reset_uniform_diameters();
     Progress add_cube_and_object_settings();
     Progress slice_cube();
     Progress switch_printer_and_back();
@@ -68,7 +69,6 @@ private:
     std::string m_alternate_printer;
     size_t m_feature_stage { 0 };
     size_t m_policy_stage { 0 };
-    size_t m_overlay_stage { 0 };
     size_t m_switch_stage { 0 };
     bool m_slice_started { false };
     bool m_slice_was_running { false };
@@ -76,6 +76,8 @@ private:
     bool m_watchdog_armed { false };
     bool m_pump_started { false };
     bool m_pump_start_logged { false };
+    int m_last_started_index { -1 };
+    int m_last_state_dump { -1 };
     bool m_step_skipped { false };
     bool m_required_step_skipped { false };
     std::chrono::steady_clock::time_point m_slice_start;

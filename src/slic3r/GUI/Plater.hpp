@@ -590,6 +590,11 @@ public:
     void set_global_filament_map_mode(FilamentMapMode mode);
     void set_global_filament_map(const std::vector<int>& filament_map);
     void set_global_filament_volume_map(const std::vector<int>& filament_volume_map);
+    bool pin_feature_filament_map_if_needed(const std::string &opt_key);
+    // Heals stale/loaded projects: pins the map and refreshes projections whenever an active
+    // feature process depends on it. Self-extinguishing (no-op once the mode is manual and
+    // nothing changed). Safe to call from update_background_process.
+    bool pin_feature_filament_map_for_active_features();
     std::vector<int> get_global_filament_map() const;
     std::vector<int> get_global_filament_volume_map() const;
     FilamentMapMode get_global_filament_map_mode() const;
@@ -966,6 +971,8 @@ private:
     struct priv;
     std::unique_ptr<priv> p;
     std::string           m_3mf_path;
+    // Last "wall filament shares the object nozzle" hint state; prevents notification spam.
+    std::string           m_last_wall_same_nozzle_hint;
     // Set true during PopupMenu() tracking to suppress immediate error message boxes.
     // The error messages are collected to m_tracking_popup_menu_error_message instead and these error messages
     // are shown after the pop-up dialog closes.

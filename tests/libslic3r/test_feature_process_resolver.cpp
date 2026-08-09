@@ -142,6 +142,27 @@ TEST_CASE("Automatic feature process uses the object process when nozzles match"
     CHECK(result.display_label.find("same as object") != std::string::npos);
 }
 
+TEST_CASE("Default object filament resolves through either mixed-nozzle map", "[FeatureProcessResolver][Regression]")
+{
+    const bool fine_nozzle_is_first = GENERATE(false, true);
+    ResolverFixture fixture;
+    fixture.printer_config.option<ConfigOptionFloats>("nozzle_diameter", true)->values =
+        fine_nozzle_is_first ? std::vector<double>{0.2, 0.4} : std::vector<double>{0.4, 0.2};
+    fixture.printer_config.option<ConfigOptionInts>("filament_map", true)->values =
+        fine_nozzle_is_first ? std::vector<int>{2, 1} : std::vector<int>{1, 2};
+    fixture.object_config.option<ConfigOptionInt>("extruder", true)->value = 0;
+
+    DYNAMIC_SECTION("fine nozzle on tool " << (fine_nozzle_is_first ? 0 : 1)) {
+        const FeatureProcessResolution result = resolve_feature_process(fixture.request());
+
+        REQUIRE(result.ok);
+        CHECK(result.resolved_preset == ResolverFixture::standard_02);
+        CHECK(result.tool_id == (fine_nozzle_is_first ? 0 : 1));
+        CHECK_THAT(result.nozzle_diameter, Catch::Matchers::WithinAbs(0.2, 1e-9));
+        CHECK(result.display_label.find("same as object") == std::string::npos);
+    }
+}
+
 TEST_CASE("Pinned feature process projects only the wall whitelist", "[FeatureProcessResolver]")
 {
     ResolverFixture fixture;
@@ -297,4 +318,34 @@ TEST_CASE("Feature process projection updater refreshes model scopes without cha
     REQUIRE(policy != nullptr);
     CHECK(policy->value == FeatureProcessPolicy::Pinned);
     CHECK(object->config.opt_serialize("wall_process_preset") == "Missing process");
+}
+
+TEST_CASE("Projection updater distinguishes default and feature tools through either mixed-nozzle map",
+          "[FeatureProcessResolver][Regression]")
+{
+    const bool fine_nozzle_is_first = GENERATE(false, true);
+    ResolverFixture fixture;
+    fixture.printer_config.option<ConfigOptionFloats>("nozzle_diameter", true)->values =
+        fine_nozzle_is_first ? std::vector<double>{0.2, 0.4} : std::vector<double>{0.4, 0.2};
+    DynamicPrintConfig full_config = DynamicPrintConfig::full_print_config();
+    full_config.apply(fixture.printer_config);
+    full_config.option<ConfigOptionInts>("filament_map", true)->values =
+        fine_nozzle_is_first ? std::vector<int>{2, 1} : std::vector<int>{1, 2};
+    full_config.option<ConfigOptionFloat>("layer_height", true)->value = 0.2;
+    full_config.option<ConfigOptionInt>("extruder", true)->value = 0;
+    full_config.option<ConfigOptionString>("print_settings_id", true)->value = ResolverFixture::standard_04;
+    full_config.option<ConfigOptionInt>("wall_loops", true)->value = 2;
+    full_config.option<ConfigOptionInt>("outer_wall_filament_id", true)->value = 2;
+
+    Model model;
+    ModelObject *object = model.add_object("cube", "", make_cube(20., 20., 20.));
+    object->add_instance();
+
+    DYNAMIC_SECTION("fine nozzle on tool " << (fine_nozzle_is_first ? 0 : 1)) {
+        REQUIRE(update_feature_process_projections(model, fixture.bundle, full_config));
+        const auto *projection = dynamic_cast<const ConfigOptionString *>(object->config.option("wall_process_projection"));
+        REQUIRE(projection != nullptr);
+        CHECK_FALSE(projection->value.empty());
+        CHECK_THAT(object->config.opt_float("wall_layer_height"), Catch::Matchers::WithinAbs(0.1, 1e-9));
+    }
 }

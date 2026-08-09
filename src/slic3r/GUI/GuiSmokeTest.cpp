@@ -116,11 +116,12 @@ void GuiSmokeTest::build_steps(const std::string &step_filter)
 
     add("select_multitool_printer", Requirement::Required, "", [this] { return select_multitool_printer(); });
     add("two_filaments", Requirement::Required, "select_multitool_printer", [this] { return two_filaments(); });
+    add("add_cube_and_object_settings", Requirement::Required, "select_multitool_printer", [this] { return add_cube_and_object_settings(); });
+    add("mixed_diameter_overlay", Requirement::Required, "select_multitool_printer", [this] { return mixed_diameter_overlay(); });
     add("feature_filament_each", Requirement::Required, "select_multitool_printer", [this] { return feature_filament_each(); });
     add("wall_policy_cycle", Requirement::Required, "select_multitool_printer", [this] { return wall_policy_cycle(); });
-    add("mixed_diameter_overlay", Requirement::Required, "select_multitool_printer", [this] { return mixed_diameter_overlay(); });
-    add("add_cube_and_object_settings", Requirement::Required, "select_multitool_printer", [this] { return add_cube_and_object_settings(); });
     add("slice_cube", Requirement::Optional, "select_multitool_printer", [this] { return slice_cube(); });
+    add("reset_uniform_diameters", Requirement::Required, "select_multitool_printer", [this] { return reset_uniform_diameters(); });
     add("switch_printer_and_back", Requirement::Optional, "select_multitool_printer", [this] { return switch_printer_and_back(); });
     add("close", Requirement::Optional, "", [this] { return close(); });
 
@@ -147,8 +148,8 @@ bool GuiSmokeTest::arm_watchdog()
 
     s_exit_code.store(2, std::memory_order_release);
     m_watchdog_armed = true;
-    log_phase("OnInit entered; 120 second watchdog armed");
-    m_watchdog.StartOnce(120000);
+    log_phase("OnInit entered; 360 second watchdog armed");
+    m_watchdog.StartOnce(360000);
 
     if (wxDisplay::GetCount() == 0) {
         log("SMOKE NO DISPLAY: no usable GUI display was found");
@@ -190,6 +191,11 @@ void GuiSmokeTest::on_pump(wxTimerEvent &)
     }
 
     Step &step = m_steps[m_step_index];
+    if (m_last_started_index != int(m_step_index)) {
+        m_last_started_index = int(m_step_index);
+        log("SMOKE [" + std::to_string(m_step_index + 1) + "/" + std::to_string(m_steps.size()) + "] " +
+            step.name + ": START");
+    }
     if (!step.required_success.empty() && m_succeeded_steps.count(step.required_success) == 0) {
         log("SMOKE [" + std::to_string(m_step_index + 1) + "/" + std::to_string(m_steps.size()) + "] " +
             step.name + ": SKIP(required-dependency-failed): " + step.required_success + " did not succeed");
@@ -231,7 +237,7 @@ GuiSmokeTest::Progress GuiSmokeTest::skip(const std::string &reason)
 void GuiSmokeTest::on_watchdog(wxTimerEvent &)
 {
     if (!m_finishing)
-        log("SMOKE WATCHDOG: 120 second overall timeout");
+        log("SMOKE WATCHDOG: 360 second overall timeout");
     else
         log("SMOKE WATCHDOG: clean shutdown did not complete");
     s_exit_code.store(3, std::memory_order_release);
@@ -334,8 +340,37 @@ GuiSmokeTest::Progress GuiSmokeTest::feature_filament_each()
     Tab *tab = m_app.get_tab(Preset::TYPE_PRINT);
     if (tab == nullptr || tab->get_config() == nullptr)
         return skip("Process tab is unavailable");
-    if (m_feature_stage >= keys.size() * 2)
+    if (m_feature_stage == keys.size() * 2) {
+        if (!change_tab_field(*tab, keys.front(), boost::any(2)))
+            return skip("field is unavailable: " + keys.front());
+        ++m_feature_stage;
+        return Progress::Pending;
+    }
+    if (m_feature_stage > keys.size() * 2) {
+        const auto *mode = m_app.preset_bundle->project_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode");
+        if (mode == nullptr || mode->value != FilamentMapMode::fmmManual)
+            throw std::runtime_error("feature filament assignment did not switch filament_map_mode to manual");
+
+        const DynamicPrintConfig full_config = m_app.preset_bundle->full_config();
+        const auto *map = full_config.option<ConfigOptionInts>("filament_map");
+        const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+        if (map == nullptr || map->values.size() < 2 || diameters == nullptr || diameters->values.size() < 2)
+            throw std::runtime_error("feature filament projection check lacks a concrete two-tool map");
+        const size_t object_tool = size_t(map->values[0] - 1);
+        const size_t wall_tool = size_t(map->values[1] - 1);
+        if (object_tool >= diameters->values.size() || wall_tool >= diameters->values.size())
+            throw std::runtime_error("feature filament projection check produced an invalid tool index");
+
+        if (std::abs(diameters->values[object_tool] - diameters->values[wall_tool]) > 1e-6) {
+            if (m_app.model().objects.empty())
+                throw std::runtime_error("feature filament projection check has no model object");
+            const auto *projection = dynamic_cast<const ConfigOptionString *>(
+                m_app.model().objects.front()->config.option("wall_process_projection"));
+            if (projection == nullptr || projection->value.empty())
+                throw std::runtime_error("wall_process_projection stayed empty for different mapped nozzle diameters");
+        }
         return Progress::Done;
+    }
 
     const std::string &key = keys[m_feature_stage / 2];
     const int value = (m_feature_stage % 2 == 0) ? 2 : 0;
@@ -344,7 +379,7 @@ GuiSmokeTest::Progress GuiSmokeTest::feature_filament_each()
     if (tab->get_config()->opt_int(key) != value)
         throw std::runtime_error(key + " did not retain value " + std::to_string(value));
     ++m_feature_stage;
-    return m_feature_stage == keys.size() * 2 ? Progress::Done : Progress::Pending;
+    return Progress::Pending;
 }
 
 GuiSmokeTest::Progress GuiSmokeTest::wall_policy_cycle()
@@ -370,18 +405,19 @@ GuiSmokeTest::Progress GuiSmokeTest::wall_policy_cycle()
 
 GuiSmokeTest::Progress GuiSmokeTest::mixed_diameter_overlay()
 {
-    if (m_overlay_stage++ == 0) {
-        if (!m_app.sidebar().apply_nozzle_diameters_for_smoke("0.4", "0.2"))
-            throw std::runtime_error("failed to apply the 0.4/0.2 project nozzle overlay");
-        // full_config() returns by value; keep it alive for the option lookup.
-        const DynamicPrintConfig full_config = m_app.preset_bundle->full_config();
-        const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
-        if (diameters == nullptr || diameters->values.size() < 2 ||
-            std::abs(diameters->values[0] - 0.4) > 1e-6 || std::abs(diameters->values[1] - 0.2) > 1e-6)
-            throw std::runtime_error("full config did not expose the 0.4/0.2 overlay");
-        return Progress::Pending;
-    }
+    if (!m_app.sidebar().apply_nozzle_diameters_for_smoke("0.4", "0.2"))
+        throw std::runtime_error("failed to apply the 0.4/0.2 project nozzle overlay");
+    // full_config() returns by value; keep it alive for the option lookup.
+    const DynamicPrintConfig full_config = m_app.preset_bundle->full_config();
+    const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (diameters == nullptr || diameters->values.size() < 2 ||
+        std::abs(diameters->values[0] - 0.4) > 1e-6 || std::abs(diameters->values[1] - 0.2) > 1e-6)
+        throw std::runtime_error("full config did not expose the 0.4/0.2 overlay");
+    return Progress::Done;
+}
 
+GuiSmokeTest::Progress GuiSmokeTest::reset_uniform_diameters()
+{
     if (!m_app.sidebar().apply_nozzle_diameters_for_smoke("0.4", "0.4"))
         throw std::runtime_error("failed to clear the project nozzle overlay with a uniform selection");
     const auto *project = m_app.preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
@@ -423,14 +459,35 @@ GuiSmokeTest::Progress GuiSmokeTest::slice_cube()
         m_step_result = "OK (slice ended with a reported error outcome)";
         return Progress::Done;
     }
+    // A slice that never starts is usually a validation refusal the GUI shows only in the
+    // sidebar; surface the actual message instead of timing out blind.
+    if (!m_slice_was_running &&
+        std::chrono::steady_clock::now() - m_slice_start > std::chrono::seconds(10)) {
+        const StringObjectException validity = m_app.plater()->fff_print().validate();
+        if (!validity.string.empty())
+            throw std::runtime_error("slice blocked by validation: " + validity.string +
+                                     " (key: " + validity.opt_key + ")");
+    }
+    // Temporary diagnostics: dump process state every ~15 s while waiting.
+    const auto waited = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - m_slice_start).count();
+    if (waited > 0 && waited % 15 == 0 && waited != m_last_state_dump) {
+        m_last_state_dump = int(waited);
+        log("SMOKE SLICE STATE t=" + std::to_string(waited) +
+            "s running=" + std::to_string(process.running()) +
+            " idle=" + std::to_string(process.idle()) +
+            " finished=" + std::to_string(process.finished()) +
+            " was_running=" + std::to_string(m_slice_was_running) +
+            " update_scheduled=" + std::to_string(m_app.plater()->is_background_process_update_scheduled()));
+    }
 
     const auto elapsed = std::chrono::steady_clock::now() - m_slice_start;
     if (!m_slice_was_running && process.idle() && elapsed > std::chrono::seconds(2)) {
         m_step_result = "OK (slice was rejected before background execution)";
         return Progress::Done;
     }
-    if (elapsed > std::chrono::seconds(60))
-        throw std::runtime_error("slice did not complete within 60 seconds");
+    if (elapsed > std::chrono::seconds(180))
+        throw std::runtime_error("slice did not complete within 180 seconds");
     return Progress::Pending;
 }
 

@@ -2256,6 +2256,14 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         }
     }
 
+    static const std::unordered_set<std::string> feature_filament_keys{
+        "outer_wall_filament_id", "inner_wall_filament_id", "sparse_infill_filament_id",
+        "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id",
+        "support_filament", "support_interface_filament",
+    };
+    if (feature_filament_keys.count(opt_key) != 0 && m_config->opt_int(opt_key) > 0)
+        wxGetApp().plater()->pin_feature_filament_map_if_needed(opt_key);
+
     if (m_postpone_update_ui) {
         // It means that not all values are rolled to the system/last saved values jet.
         // And call of the update() can causes a redundant check of the config values,

@@ -707,6 +707,84 @@ TEST_CASE("A mixed-nozzle cube preserves feature cadence through G-code",
     }
 }
 
+TEST_CASE("Mixed-nozzle feature cadence requires a manual map and holds after pinning",
+          "[FeatureCadence][GCode][Validate][Regression]")
+{
+    const bool fine_nozzle_is_first = GENERATE(false, true);
+    DynamicPrintConfig config = mixed_nozzle_config({
+        {"sparse_infill_density", 15.},
+        {"top_shell_layers", 2},
+        {"bottom_shell_layers", 2},
+        {"top_shell_thickness", 0.},
+        {"bottom_shell_thickness", 0.},
+        {"ensure_vertical_shell_thickness", "none"},
+        {"enable_prime_tower", false},
+    });
+    config.option<ConfigOptionFloats>("nozzle_diameter", true)->values =
+        fine_nozzle_is_first ? std::vector<double>{0.2, 0.4} : std::vector<double>{0.4, 0.2};
+    config.option<ConfigOptionFloats>("min_layer_height", true)->values =
+        fine_nozzle_is_first ? std::vector<double>{0.05, 0.1} : std::vector<double>{0.1, 0.05};
+    config.option<ConfigOptionFloats>("max_layer_height", true)->values =
+        fine_nozzle_is_first ? std::vector<double>{0.15, 0.3} : std::vector<double>{0.3, 0.15};
+    config.option<ConfigOptionInts>("filament_map", true)->values =
+        fine_nozzle_is_first ? std::vector<int>{1, 2} : std::vector<int>{2, 1};
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{
+        {"wall_layer_height", 0.1},
+        {"wall_process_projection", "outer_wall_line_width=0.24;inner_wall_line_width=0.24"},
+    }};
+
+    DYNAMIC_SECTION("fine nozzle on tool " << (fine_nozzle_is_first ? 0 : 1)) {
+        SECTION("raw automatic map is rejected") {
+            config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value = fmmAutoForFlush;
+            Print print;
+            Model model;
+            init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+            const StringObjectException error = print.validate();
+            REQUIRE_FALSE(error.string.empty());
+            CHECK(error.string.find("manual filament-to-nozzle mapping") != std::string::npos);
+            CHECK(error.opt_key == "filament_map_mode");
+        }
+
+        SECTION("manual map preserves fine walls and base-cadence interiors") {
+            Print print;
+            Model model;
+            init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+            const StringObjectException error = print.validate();
+            CAPTURE(error.string, error.opt_key);
+            REQUIRE(error.string.empty());
+            check_dual_tool_cube_gcode(gcode(print), false);
+        }
+    }
+}
+
+TEST_CASE("Uniform nozzles keep automatic feature mappings valid", "[FeatureCadence][Validate][Regression]")
+{
+    const bool reversed_map = GENERATE(false, true);
+    DynamicPrintConfig config = mixed_nozzle_config({
+        {"nozzle_diameter", "0.4,0.4"},
+        {"min_layer_height", "0.1,0.1"},
+        {"max_layer_height", "0.3,0.3"},
+    });
+    config.option<ConfigOptionInts>("filament_map", true)->values =
+        reversed_map ? std::vector<int>{2, 1} : std::vector<int>{1, 2};
+    config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value = fmmAutoForFlush;
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{
+        {"wall_layer_height", 0.2},
+        {"wall_process_projection", "outer_wall_line_width=0.4;inner_wall_line_width=0.4"},
+    }};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    DYNAMIC_SECTION("filament map " << (reversed_map ? "2,1" : "1,2")) {
+        const StringObjectException error = print.validate();
+        CAPTURE(error.string, error.opt_key);
+        CHECK(error.string.empty());
+    }
+}
+
 TEST_CASE("Prime tower follows mixed feature cadence without adding fine-layer tool changes",
           "[FeatureCadence][GCode]")
 {

@@ -189,7 +189,9 @@ int effective_filament(const DynamicPrintConfig &config, const char *key)
     if (feature != nullptr && feature->value > 0)
         return feature->value;
     const auto *object = config.option<ConfigOptionInt>("extruder");
-    return object == nullptr ? 0 : object->value;
+    // In model configs, zero means the object's default filament, which is filament 1.
+    // Resolve that filament through filament_map instead of assuming logical tool zero.
+    return object == nullptr || object->value <= 0 ? 1 : object->value;
 }
 
 bool feature_tool_differs_from_object(const DynamicPrintConfig &config, int feature_filament)
@@ -372,7 +374,7 @@ double process_target_nozzle(const FeatureProcessRequest &request, const GCodeCo
                              const DynamicPrintConfig &printer_config)
 {
     const int          object_filament = option_int_or_default(request.effective_object_config, "extruder");
-    const unsigned int filament = object_filament > 0 ? unsigned(object_filament) : 0;
+    const unsigned int filament = object_filament > 0 ? unsigned(object_filament) : 1;
     const size_t       tool_id = get_extruder_index_from_filament_id(gcode_config, filament);
     return printer_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(tool_id);
 }

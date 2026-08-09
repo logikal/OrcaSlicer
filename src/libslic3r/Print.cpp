@@ -1590,20 +1590,27 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 return {L("One or more object were assigned an extruder that the printer does not have.")};
 #endif
 
-        auto validate_extrusion_width = [min_nozzle_diameter, max_nozzle_diameter](const ConfigBase &config, const char *opt_key, double layer_height, std::string &err_msg) -> bool {
-            double extrusion_width_min = config.get_abs_value(opt_key, min_nozzle_diameter);
-            double extrusion_width_max = config.get_abs_value(opt_key, max_nozzle_diameter);
+        // Percent widths must resolve against the nozzle that actually prints the role; with
+        // mixed diameters the global min/max pair rejects perfectly valid per-role widths.
+        auto validate_extrusion_width_for_nozzle = [](const ConfigBase &config, const char *opt_key, double layer_height,
+                                                      double nozzle_min, double nozzle_max, std::string &err_msg) -> bool {
+            double extrusion_width_min = config.get_abs_value(opt_key, nozzle_min);
+            double extrusion_width_max = config.get_abs_value(opt_key, nozzle_max);
             if (extrusion_width_min == 0) {
                 // Default "auto-generated" extrusion width is always valid.
             } else if (extrusion_width_min <= layer_height) {
                     err_msg = L("Line width too small");
                     return false;
-                } else if (extrusion_width_max > max_nozzle_diameter * MAX_LINE_WIDTH_MULTIPLIER) {
+                } else if (extrusion_width_max > nozzle_max * MAX_LINE_WIDTH_MULTIPLIER) {
                 err_msg = L("Line width too large");
 				return false;
 			}
 			return true;
 		};
+        auto validate_extrusion_width = [&validate_extrusion_width_for_nozzle, min_nozzle_diameter, max_nozzle_diameter](
+                                            const ConfigBase &config, const char *opt_key, double layer_height, std::string &err_msg) -> bool {
+            return validate_extrusion_width_for_nozzle(config, opt_key, layer_height, min_nozzle_diameter, max_nozzle_diameter, err_msg);
+        };
         DynamicPrintConfig dynamic_print_config;
         dynamic_print_config.set_key_value("nozzle_diameter", m_config.nozzle_diameter.clone());
         dynamic_print_config.set_key_value("min_layer_height", m_config.min_layer_height.clone());
@@ -1767,6 +1774,43 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     return error;
             }
 
+            const bool mixed_nozzle_diameters = max_nozzle_diameter - min_nozzle_diameter > EPSILON;
+            if (mixed_nozzle_diameters && is_auto_filament_map_mode(m_config.filament_map_mode.value)) {
+                const auto process_is_active = [](FeatureProcessPolicy policy, const std::string &preset, double height) {
+                    return policy != FeatureProcessPolicy::AutoNozzleVariant || !preset.empty() || height > 0.;
+                };
+                bool feature_process_depends_on_map =
+                    object->config().support_filament.value > 0 ||
+                    object->config().support_interface_filament.value > 0 ||
+                    process_is_active(object->config().support_process_policy.value,
+                                      object->config().support_process_preset.value,
+                                      object->config().support_process_layer_height.value) ||
+                    process_is_active(object->config().support_interface_process_policy.value,
+                                      object->config().support_interface_process_preset.value,
+                                      object->config().support_interface_process_layer_height.value);
+                for (const PrintRegion &region : object->all_regions()) {
+                    const PrintRegionConfig &cfg = region.config();
+                    feature_process_depends_on_map = feature_process_depends_on_map ||
+                        cfg.outer_wall_filament_id.value > 0 || cfg.inner_wall_filament_id.value > 0 ||
+                        cfg.sparse_infill_filament_id.value > 0 || cfg.internal_solid_filament_id.value > 0 ||
+                        cfg.top_surface_filament_id.value > 0 || cfg.bottom_surface_filament_id.value > 0 ||
+                        process_is_active(cfg.wall_process_policy.value, cfg.wall_process_preset.value,
+                                          cfg.wall_layer_height.value) ||
+                        process_is_active(cfg.sparse_infill_process_policy.value, cfg.sparse_infill_process_preset.value,
+                                          cfg.sparse_infill_process_layer_height.value) ||
+                        process_is_active(cfg.internal_solid_process_policy.value, cfg.internal_solid_process_preset.value,
+                                          cfg.internal_solid_process_layer_height.value) ||
+                        process_is_active(cfg.top_surface_process_policy.value, cfg.top_surface_process_preset.value,
+                                          cfg.top_surface_process_layer_height.value) ||
+                        process_is_active(cfg.bottom_surface_process_policy.value, cfg.bottom_surface_process_preset.value,
+                                          cfg.bottom_surface_process_layer_height.value);
+                }
+                if (feature_process_depends_on_map) {
+                    return {L("Feature-specific processes with mixed nozzle diameters require manual filament-to-nozzle mapping."),
+                            object, "filament_map_mode"};
+                }
+            }
+
             const bool cadence_active = slicing_params.cadence_ratio > 1;
             if (!cadence_active) {
                 if (layer_height > min_nozzle_diameter)
@@ -1793,7 +1837,8 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     const auto *option = model_object->config.get().option<ConfigOptionInt>("extruder");
                     return option == nullptr ? 0 : option->value;
                 }();
-                const size_t object_tool = get_extruder_index_from_filament_id(m_config, std::max(object_filament, 0));
+                const size_t object_tool = get_extruder_index_from_filament_id(
+                    m_config, object_filament > 0 ? unsigned(object_filament) : 1u);
                 const double object_nozzle = m_config.nozzle_diameter.get_at(object_tool);
 
                 for (const PrintRegion &region : object->all_regions()) {
@@ -1848,15 +1893,27 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 if (!validate_extrusion_width(object->config(), "support_line_width", layer_height, err_msg))
                     return {err_msg, object, "support_line_width"};
             }
+            // Per-role width validation: each key checks against the height it prints at and
+            // the nozzle of the tool that prints it.
             for (const char *opt_key : { "inner_wall_line_width", "outer_wall_line_width", "sparse_infill_line_width", "internal_solid_infill_line_width", "top_surface_line_width","skin_infill_line_width" ,"skeleton_infill_line_width"})
-				for (const PrintRegion &region : object->all_regions())
-                    if (!validate_extrusion_width(
-                            region.config(), opt_key,
-                            cadence_active && (std::strcmp(opt_key, "inner_wall_line_width") == 0 ||
-                                               std::strcmp(opt_key, "outer_wall_line_width") == 0) ?
-                                slicing_params.layer_height : layer_height,
-                            err_msg))
+				for (const PrintRegion &region : object->all_regions()) {
+                    const PrintRegionConfig &rc = region.config();
+                    const bool is_wall_key = std::strcmp(opt_key, "inner_wall_line_width") == 0 ||
+                                             std::strcmp(opt_key, "outer_wall_line_width") == 0;
+                    int filament_id = 0;
+                    if (std::strcmp(opt_key, "inner_wall_line_width") == 0)            filament_id = rc.inner_wall_filament_id.value;
+                    else if (std::strcmp(opt_key, "outer_wall_line_width") == 0)       filament_id = rc.outer_wall_filament_id.value;
+                    else if (std::strcmp(opt_key, "internal_solid_infill_line_width") == 0) filament_id = rc.internal_solid_filament_id.value;
+                    else if (std::strcmp(opt_key, "top_surface_line_width") == 0)      filament_id = rc.top_surface_filament_id.value;
+                    else                                                               filament_id = rc.sparse_infill_filament_id.value;
+                    const double role_nozzle = m_config.nozzle_diameter.get_at(
+                        get_extruder_index_from_filament_id(m_config, filament_id));
+                    if (!validate_extrusion_width_for_nozzle(
+                            rc, opt_key,
+                            cadence_active && is_wall_key ? slicing_params.layer_height : layer_height,
+                            role_nozzle, role_nozzle, err_msg))
 		            	return  {err_msg, object, opt_key};
+                }
 
             const bool allow_thin_bridge_width = object->config().thick_bridges && object->config().thick_internal_bridges;
             for (const PrintRegion &region : object->all_regions()) {
@@ -1870,7 +1927,10 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                         err_msg = L("Bridge line width must not exceed nozzle diameter");
                         return { err_msg, object, "bridge_line_width" };
                     }
-                    if (!allow_thin_bridge_width && bridge_width <= layer_height) {
+                    // Bridges are excluded from cadence recombination, so on a refined grid
+                    // they print at the fine layer height — validate against that.
+                    const double bridge_layer_height = cadence_active ? slicing_params.layer_height : layer_height;
+                    if (!allow_thin_bridge_width && bridge_width <= bridge_layer_height) {
                         err_msg = L("Line width too small");
                         return { err_msg, object, "bridge_line_width" };
                     }
