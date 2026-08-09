@@ -2,6 +2,7 @@
 #include "OrcaCloudServiceAgent.hpp"
 #include "libslic3r/Technologies.hpp"
 #include "libslic3r/Platform.hpp"
+#include "libslic3r/Utils.hpp"
 #include "GUI_App.hpp"
 #include "GuiSmokeTest.hpp"
 #include "GUI_Init.hpp"
@@ -1155,10 +1156,17 @@ void GUI_App::prepare_gui_smoke_mode()
     app_config->set_bool("update_network_plugin", false);
     app_config->set_bool("do_not_show_object_process_tips", true);
     app_config->set_bool("do_not_show_modifer_tips", true);
+    app_config->set("user_mode", "advanced");
     app_config->set("version", SoftFever_VERSION);
     app_config->set("presets", "printer", "Bambu Lab H2D 0.4 nozzle");
-    app_config->set_variant("BambuResearch", "Bambu Lab H2D", "0.2", true);
-    app_config->set_variant("BambuResearch", "Bambu Lab H2D", "0.4", true);
+    app_config->set_variant("BBL", "Bambu Lab H2D", "0.2", true);
+    app_config->set_variant("BBL", "Bambu Lab H2D", "0.4", true);
+
+    // The first-run wizard normally installs enabled vendor bundles into the
+    // datadir. Smoke mode suppresses that wizard, so provision the same bundle
+    // directly before PresetBundle loads system presets and computes visibility.
+    if (!Slic3r::install_vendor_bundles_from_resources({"BBL"}))
+        throw Slic3r::RuntimeError("GUI smoke failed to install the BBL preset bundle");
 }
 
 void GUI_App::handle_gui_smoke_unhandled_exception()

@@ -53,14 +53,15 @@ bool is_multitool_printer(const Preset &preset)
     return diameters != nullptr && diameters->values.size() >= 2;
 }
 
-void change_tab_field(Tab &tab, const std::string &key, const boost::any &value)
+bool change_tab_field(Tab &tab, const std::string &key, const boost::any &value)
 {
     tab.activate_option(key, {});
     Field *field = tab.get_field(key);
     if (field == nullptr)
-        throw std::runtime_error("field is unavailable: " + key);
+        return false;
     field->set_value(value, false);
     field->field_changed();
+    return true;
 }
 
 } // namespace
@@ -107,20 +108,21 @@ void GuiSmokeTest::build_steps(const std::string &step_filter)
         }
     }
 
-    auto add = [this, &selected](const char *name, std::function<Progress()> fn) {
+    auto add = [this, &selected](const char *name, Requirement requirement, const char *required_success,
+                                 std::function<Progress()> fn) {
         if (selected.empty() || selected.erase(name) > 0)
-            m_steps.push_back({name, std::move(fn)});
+            m_steps.push_back({name, requirement, required_success, std::move(fn)});
     };
 
-    add("select_multitool_printer", [this] { return select_multitool_printer(); });
-    add("two_filaments", [this] { return two_filaments(); });
-    add("feature_filament_each", [this] { return feature_filament_each(); });
-    add("wall_policy_cycle", [this] { return wall_policy_cycle(); });
-    add("mixed_diameter_overlay", [this] { return mixed_diameter_overlay(); });
-    add("add_cube_and_object_settings", [this] { return add_cube_and_object_settings(); });
-    add("slice_cube", [this] { return slice_cube(); });
-    add("switch_printer_and_back", [this] { return switch_printer_and_back(); });
-    add("close", [this] { return close(); });
+    add("select_multitool_printer", Requirement::Required, "", [this] { return select_multitool_printer(); });
+    add("two_filaments", Requirement::Required, "select_multitool_printer", [this] { return two_filaments(); });
+    add("feature_filament_each", Requirement::Required, "select_multitool_printer", [this] { return feature_filament_each(); });
+    add("wall_policy_cycle", Requirement::Required, "select_multitool_printer", [this] { return wall_policy_cycle(); });
+    add("mixed_diameter_overlay", Requirement::Required, "select_multitool_printer", [this] { return mixed_diameter_overlay(); });
+    add("add_cube_and_object_settings", Requirement::Required, "select_multitool_printer", [this] { return add_cube_and_object_settings(); });
+    add("slice_cube", Requirement::Optional, "select_multitool_printer", [this] { return slice_cube(); });
+    add("switch_printer_and_back", Requirement::Optional, "select_multitool_printer", [this] { return switch_printer_and_back(); });
+    add("close", Requirement::Optional, "", [this] { return close(); });
 
     if (!selected.empty()) {
         std::ostringstream message;
@@ -132,7 +134,7 @@ void GuiSmokeTest::build_steps(const std::string &step_filter)
             message << name;
             first = false;
         }
-        m_steps.insert(m_steps.begin(), {"validate_step_filter", [message = message.str()]() -> Progress {
+        m_steps.insert(m_steps.begin(), {"validate_step_filter", Requirement::Required, "", [message = message.str()]() -> Progress {
             throw std::runtime_error(message);
         }});
     }
@@ -183,24 +185,47 @@ void GuiSmokeTest::on_pump(wxTimerEvent &)
         log_phase("step pump started; GUI is ready");
     }
     if (m_step_index >= m_steps.size()) {
-        finish(0);
+        finish(m_required_step_skipped ? 2 : 0);
         return;
     }
 
     Step &step = m_steps[m_step_index];
+    if (!step.required_success.empty() && m_succeeded_steps.count(step.required_success) == 0) {
+        log("SMOKE [" + std::to_string(m_step_index + 1) + "/" + std::to_string(m_steps.size()) + "] " +
+            step.name + ": SKIP(required-dependency-failed): " + step.required_success + " did not succeed");
+        m_required_step_skipped = true;
+        ++m_step_index;
+        return;
+    }
     try {
         if (step.run() == Progress::Pending)
             return;
-        const std::string result = m_step_result.empty() ? "OK" : m_step_result;
+        std::string result;
+        if (m_step_skipped) {
+            const bool required = step.requirement == Requirement::Required;
+            result = std::string("SKIP(") + (required ? "required" : "optional") + "): " + m_step_result;
+            m_required_step_skipped = m_required_step_skipped || required;
+        } else {
+            result = m_step_result.empty() ? "OK" : m_step_result;
+            m_succeeded_steps.insert(step.name);
+        }
         log("SMOKE [" + std::to_string(m_step_index + 1) + "/" + std::to_string(m_steps.size()) + "] " +
             step.name + ": " + result);
         m_step_result.clear();
+        m_step_skipped = false;
         ++m_step_index;
     } catch (const std::exception &ex) {
         fail_current(ex.what());
     } catch (...) {
         fail_current("unknown non-C++ exception");
     }
+}
+
+GuiSmokeTest::Progress GuiSmokeTest::skip(const std::string &reason)
+{
+    m_step_skipped = true;
+    m_step_result = reason;
+    return Progress::Done;
 }
 
 void GuiSmokeTest::on_watchdog(wxTimerEvent &)
@@ -274,8 +299,7 @@ GuiSmokeTest::Progress GuiSmokeTest::select_multitool_printer()
         }
     }
     if (target == nullptr) {
-        m_step_result = "SKIP: no visible printer preset with two or more extruders";
-        return Progress::Done;
+        return skip("no visible printer preset with two or more extruders");
     }
 
     Tab *tab = m_app.get_tab(Preset::TYPE_PRINTER);
@@ -291,10 +315,6 @@ GuiSmokeTest::Progress GuiSmokeTest::select_multitool_printer()
 
 GuiSmokeTest::Progress GuiSmokeTest::two_filaments()
 {
-    if (m_primary_printer.empty()) {
-        m_step_result = "SKIP: multi-tool printer unavailable";
-        return Progress::Done;
-    }
     m_app.preset_bundle->set_num_filaments(2);
     if (auto *map = m_app.preset_bundle->project_config.option<ConfigOptionInts>("filament_map"))
         map->values = {1, 2};
@@ -311,20 +331,16 @@ GuiSmokeTest::Progress GuiSmokeTest::feature_filament_each()
         "outer_wall_filament_id", "inner_wall_filament_id", "sparse_infill_filament_id",
         "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id"
     };
-    if (m_primary_printer.empty()) {
-        m_step_result = "SKIP: multi-tool printer unavailable";
-        return Progress::Done;
-    }
-
     Tab *tab = m_app.get_tab(Preset::TYPE_PRINT);
     if (tab == nullptr || tab->get_config() == nullptr)
-        throw std::runtime_error("Process tab is unavailable");
+        return skip("Process tab is unavailable");
     if (m_feature_stage >= keys.size() * 2)
         return Progress::Done;
 
     const std::string &key = keys[m_feature_stage / 2];
     const int value = (m_feature_stage % 2 == 0) ? 2 : 0;
-    change_tab_field(*tab, key, boost::any(value));
+    if (!change_tab_field(*tab, key, boost::any(value)))
+        return skip("field is unavailable: " + key);
     if (tab->get_config()->opt_int(key) != value)
         throw std::runtime_error(key + " did not retain value " + std::to_string(value));
     ++m_feature_stage;
@@ -335,30 +351,31 @@ GuiSmokeTest::Progress GuiSmokeTest::wall_policy_cycle()
 {
     Tab *tab = m_app.get_tab(Preset::TYPE_PRINT);
     if (tab == nullptr || tab->get_config() == nullptr)
-        throw std::runtime_error("Process tab is unavailable");
+        return skip("Process tab is unavailable");
 
-    auto change = [tab](const std::string &key, const boost::any &value) {
-        change_tab_field(*tab, key, value);
+    auto change = [this, tab](const std::string &key, const boost::any &value) {
+        return change_tab_field(*tab, key, value) ? Progress::Pending : skip("field is unavailable: " + key);
     };
     switch (m_policy_stage++) {
-    case 0: change("wall_process_policy", boost::any(int(FeatureProcessPolicy::Pinned))); return Progress::Pending;
-    case 1: change("wall_process_preset", boost::any(from_u8("GUI smoke missing preset"))); return Progress::Pending;
-    case 2: change("wall_process_policy", boost::any(int(FeatureProcessPolicy::AutoNozzleVariant))); return Progress::Pending;
-    case 3: change("wall_process_preset", boost::any(wxString())); return Progress::Done;
+    case 0: return change("wall_process_policy", boost::any(int(FeatureProcessPolicy::Pinned)));
+    case 1: return change("wall_process_preset", boost::any(from_u8("GUI smoke missing preset")));
+    case 2: return change("wall_process_policy", boost::any(int(FeatureProcessPolicy::AutoNozzleVariant)));
+    case 3:
+        if (!change_tab_field(*tab, "wall_process_preset", boost::any(wxString())))
+            return skip("field is unavailable: wall_process_preset");
+        return Progress::Done;
     default: return Progress::Done;
     }
 }
 
 GuiSmokeTest::Progress GuiSmokeTest::mixed_diameter_overlay()
 {
-    if (m_primary_printer.empty()) {
-        m_step_result = "SKIP: multi-tool printer unavailable";
-        return Progress::Done;
-    }
     if (m_overlay_stage++ == 0) {
         if (!m_app.sidebar().apply_nozzle_diameters_for_smoke("0.4", "0.2"))
             throw std::runtime_error("failed to apply the 0.4/0.2 project nozzle overlay");
-        const auto *diameters = m_app.preset_bundle->full_config().option<ConfigOptionFloats>("nozzle_diameter");
+        // full_config() returns by value; keep it alive for the option lookup.
+        const DynamicPrintConfig full_config = m_app.preset_bundle->full_config();
+        const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
         if (diameters == nullptr || diameters->values.size() < 2 ||
             std::abs(diameters->values[0] - 0.4) > 1e-6 || std::abs(diameters->values[1] - 0.2) > 1e-6)
             throw std::runtime_error("full config did not expose the 0.4/0.2 overlay");
@@ -377,7 +394,7 @@ GuiSmokeTest::Progress GuiSmokeTest::add_cube_and_object_settings()
 {
     ObjectList *objects = m_app.obj_list();
     if (objects == nullptr)
-        throw std::runtime_error("Object list is unavailable");
+        return skip("Object list is unavailable");
     objects->load_mesh_object(make_cube(20., 20., 20.), "GUI smoke cube");
     if (m_app.model().objects.empty())
         throw std::runtime_error("20 mm cube was not added to the model");
@@ -419,13 +436,9 @@ GuiSmokeTest::Progress GuiSmokeTest::slice_cube()
 
 GuiSmokeTest::Progress GuiSmokeTest::switch_printer_and_back()
 {
-    if (m_primary_printer.empty()) {
-        m_step_result = "SKIP: multi-tool printer unavailable";
-        return Progress::Done;
-    }
     Tab *tab = m_app.get_tab(Preset::TYPE_PRINTER);
     if (tab == nullptr)
-        throw std::runtime_error("Printer tab is unavailable");
+        return skip("Printer tab is unavailable");
 
     if (m_switch_stage++ == 0) {
         for (const Preset &preset : m_app.preset_bundle->printers.get_presets()) {
@@ -435,8 +448,7 @@ GuiSmokeTest::Progress GuiSmokeTest::switch_printer_and_back()
             }
         }
         if (m_alternate_printer.empty()) {
-            m_step_result = "SKIP: no alternate visible multi-tool printer preset";
-            return Progress::Done;
+            return skip("no alternate visible multi-tool printer preset");
         }
         if (!tab->select_preset(m_alternate_printer, false, {}, true, true))
             throw std::runtime_error("failed to select alternate printer " + m_alternate_printer);

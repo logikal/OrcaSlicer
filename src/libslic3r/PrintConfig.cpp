@@ -12298,6 +12298,17 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def->tooltip = "Comma-separated scripted GUI smoke test steps to run.";
     def->set_default_value(new ConfigOptionString());
 
+#ifdef __APPLE__
+    // Cocoa consumes this per-launch argument to suppress saved-state recovery.
+    // Register it here only so Orca's CLI parser passes the native option through;
+    // it is intentionally never copied into AppConfig or persistent defaults.
+    def = this->add("apple_persistence_ignore_state", coString);
+    def->cli = "ApplePersistenceIgnoreState";
+    def->label = "Ignore macOS saved application state";
+    def->tooltip = "Pass-through for the macOS per-launch saved-state override.";
+    def->set_default_value(new ConfigOptionString());
+#endif
+
 
     def = this->add("outputdir", coString);
     def->label = L("Output directory");

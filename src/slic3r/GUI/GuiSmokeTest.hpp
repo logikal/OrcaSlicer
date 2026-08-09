@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -29,9 +30,12 @@ public:
 
 private:
     enum class Progress { Pending, Done };
+    enum class Requirement { Required, Optional };
 
     struct Step {
         std::string name;
+        Requirement requirement;
+        std::string required_success;
         std::function<Progress()> run;
     };
 
@@ -41,6 +45,7 @@ private:
     void finish(int code);
     void fail_current(const std::string &message);
     void log(const std::string &line) const;
+    Progress skip(const std::string &reason);
 
     Progress select_multitool_printer();
     Progress two_filaments();
@@ -58,6 +63,7 @@ private:
     std::vector<Step> m_steps;
     size_t m_step_index { 0 };
     std::string m_step_result;
+    std::set<std::string> m_succeeded_steps;
     std::string m_primary_printer;
     std::string m_alternate_printer;
     size_t m_feature_stage { 0 };
@@ -70,6 +76,8 @@ private:
     bool m_watchdog_armed { false };
     bool m_pump_started { false };
     bool m_pump_start_logged { false };
+    bool m_step_skipped { false };
+    bool m_required_step_skipped { false };
     std::chrono::steady_clock::time_point m_slice_start;
 
     static std::atomic<int> s_exit_code;

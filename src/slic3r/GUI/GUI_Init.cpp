@@ -28,8 +28,19 @@ const std::vector<std::pair<int, int>> OpenGLVersions::core    = { {3,2}, {3,3},
 
 int GUI_Run(GUI_InitParams &params)
 {
-    if (params.gui_smoke)
+    if (params.gui_smoke) {
         boost::nowide::cout << "SMOKE GUI INIT: starting wxWidgets" << std::endl;
+#if __APPLE__
+        bool ignores_saved_state = false;
+        for (int i = 1; i + 1 < params.argc; ++i)
+            if (std::string(params.argv[i]) == "-ApplePersistenceIgnoreState" && std::string(params.argv[i + 1]) == "YES") {
+                ignores_saved_state = true;
+                break;
+            }
+        if (!ignores_saved_state)
+            boost::nowide::cout << "SMOKE INIT: WARNING: -ApplePersistenceIgnoreState YES was not supplied; macOS saved-state restoration may run before OnInit" << std::endl;
+#endif
+    }
 #if __APPLE__
     // On OSX, we use boost::process::spawn() to launch new instances of PrusaSlicer from another PrusaSlicer.
     // boost::process::spawn() sets SIGCHLD to SIGIGN for the child process, thus if a child PrusaSlicer spawns another

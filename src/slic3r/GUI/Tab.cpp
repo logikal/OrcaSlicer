@@ -3001,7 +3001,8 @@ void TabPrint::build()
         optgroup->append_single_option_line("bottom_surface_filament_id", "multimaterial_settings_filament_for_features#bottom-surface");
         optgroup->append_single_option_line("wipe_tower_filament", "multimaterial_settings_filament_for_features#wipe-tower");
 
-        optgroup = page->new_optgroup(L("Process for Features"), L"param_process_for_features");
+        // Reuses the sibling group's icon; no dedicated param_process_for_features.svg exists.
+        optgroup = page->new_optgroup(L("Process for Features"), L"param_filament_for_features");
         optgroup->append_single_option_line("wall_process_policy", "multimaterial_settings_process_for_features#walls");
         Option wall_process_preset = optgroup->get_option("wall_process_preset");
         // Keep the config option a free-form preset-name string; only its GUI is a dynamic choice.
