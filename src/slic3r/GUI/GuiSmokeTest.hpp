@@ -50,6 +50,7 @@ private:
     Progress select_multitool_printer();
     Progress two_filaments();
     Progress feature_filament_each();
+    Progress detail_nozzle_control();
     Progress wall_policy_cycle();
     Progress mixed_diameter_overlay();
     Progress reset_uniform_diameters();
@@ -68,6 +69,7 @@ private:
     std::string m_primary_printer;
     std::string m_alternate_printer;
     size_t m_feature_stage { 0 };
+    size_t m_detail_nozzle_stage { 0 };
     size_t m_policy_stage { 0 };
     size_t m_switch_stage { 0 };
     bool m_slice_started { false };
@@ -78,6 +80,7 @@ private:
     bool m_pump_start_logged { false };
     int m_last_started_index { -1 };
     int m_last_state_dump { -1 };
+    bool m_detail_control_activated { false };
     bool m_step_skipped { false };
     bool m_required_step_skipped { false };
     std::chrono::steady_clock::time_point m_slice_start;

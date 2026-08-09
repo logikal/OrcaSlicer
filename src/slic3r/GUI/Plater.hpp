@@ -2,6 +2,7 @@
 #define slic3r_Plater_hpp_
 
 #include <memory>
+#include <set>
 #include <vector>
 #include <boost/filesystem/path.hpp>
 
@@ -971,8 +972,8 @@ private:
     struct priv;
     std::unique_ptr<priv> p;
     std::string           m_3mf_path;
-    // Last "wall filament shares the object nozzle" hint state; prevents notification spam.
-    std::string           m_last_wall_same_nozzle_hint;
+    // One-shot wall intent hints, keyed by hint type and the physical binding that caused it.
+    std::set<std::string> m_wall_intent_hint_states;
     // Set true during PopupMenu() tracking to suppress immediate error message boxes.
     // The error messages are collected to m_tracking_popup_menu_error_message instead and these error messages
     // are shown after the pop-up dialog closes.
@@ -1023,6 +1024,9 @@ private:
 std::vector<int> get_min_flush_volumes(const DynamicPrintConfig &full_config, size_t nozzle_id);
 
 void register_feature_process_readout(wxStaticText *readout);
+// Smoke-harness accessor: the most recently created "Print fine details with" combo.
+ComboBox *detail_nozzle_control_for_smoke();
+void register_detail_nozzle_control(ComboBox *combo, wxSizer *row);
 
 Preset *get_printer_preset(const MachineObject *obj);
 wxArrayString get_all_camera_view_type();

@@ -8,6 +8,7 @@
 #include "ParamsPanel.hpp"
 #include "Plater.hpp"
 #include "Tab.hpp"
+#include "Widgets/ComboBox.hpp"
 
 #include "libslic3r/Model.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -18,6 +19,7 @@
 
 #include <wx/display.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <exception>
@@ -119,6 +121,7 @@ void GuiSmokeTest::build_steps(const std::string &step_filter)
     add("add_cube_and_object_settings", Requirement::Required, "select_multitool_printer", [this] { return add_cube_and_object_settings(); });
     add("mixed_diameter_overlay", Requirement::Required, "select_multitool_printer", [this] { return mixed_diameter_overlay(); });
     add("feature_filament_each", Requirement::Required, "select_multitool_printer", [this] { return feature_filament_each(); });
+    add("detail_nozzle_control", Requirement::Required, "feature_filament_each", [this] { return detail_nozzle_control(); });
     add("wall_policy_cycle", Requirement::Required, "select_multitool_printer", [this] { return wall_policy_cycle(); });
     add("slice_cube", Requirement::Optional, "select_multitool_printer", [this] { return slice_cube(); });
     add("reset_uniform_diameters", Requirement::Required, "select_multitool_printer", [this] { return reset_uniform_diameters(); });
@@ -380,6 +383,74 @@ GuiSmokeTest::Progress GuiSmokeTest::feature_filament_each()
         throw std::runtime_error(key + " did not retain value " + std::to_string(value));
     ++m_feature_stage;
     return Progress::Pending;
+}
+
+GuiSmokeTest::Progress GuiSmokeTest::detail_nozzle_control()
+{
+    static const std::vector<std::string> feature_keys {
+        "outer_wall_filament_id", "inner_wall_filament_id", "sparse_infill_filament_id",
+        "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id"
+    };
+    Tab *tab = m_app.get_tab(Preset::TYPE_PRINT);
+    if (tab == nullptr || tab->get_config() == nullptr)
+        return skip("Process tab is unavailable");
+
+    if (m_detail_nozzle_stage < feature_keys.size()) {
+        const std::string &key = feature_keys[m_detail_nozzle_stage++];
+        if (!change_tab_field(*tab, key, boost::any(0)))
+            return skip("field is unavailable: " + key);
+        return Progress::Pending;
+    }
+
+    const DynamicPrintConfig full_config = m_app.preset_bundle->full_config();
+    const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto *map = full_config.option<ConfigOptionInts>("filament_map");
+    if (diameters == nullptr || diameters->values.size() < 2 || map == nullptr || map->values.empty())
+        throw std::runtime_error("detail nozzle control lacks a concrete mixed-nozzle map");
+    const size_t fine_tool = size_t(std::distance(
+        diameters->values.begin(), std::min_element(diameters->values.begin(), diameters->values.end())));
+
+    if (m_detail_nozzle_stage == feature_keys.size()) {
+        ComboBox *combo = detail_nozzle_control_for_smoke();
+        if (combo == nullptr && !m_detail_control_activated) {
+            // Page rebuilds destroy the widget; re-activate the Multimaterial page and give
+            // the UI a pump tick to recreate it.
+            m_detail_control_activated = true;
+            tab->activate_option("outer_wall_filament_id", wxString());
+            return Progress::Pending;
+        }
+        if (combo == nullptr)
+            throw std::runtime_error("Print fine details with control was not instantiated");
+        if (!combo->IsShown() || combo->GetCount() != diameters->values.size() + 1)
+            throw std::runtime_error("Print fine details with control did not expose every mixed nozzle");
+        combo->SelectAndNotify(int(fine_tool + 1));
+        ++m_detail_nozzle_stage;
+        return Progress::Pending;
+    }
+
+    const auto expected = std::find(map->values.begin(), map->values.end(), int(fine_tool + 1));
+    if (expected == map->values.end())
+        throw std::runtime_error("no filament is mapped to the fine nozzle in the smoke configuration");
+    const int expected_filament = int(std::distance(map->values.begin(), expected) + 1);
+    const int outer = tab->get_config()->opt_int("outer_wall_filament_id");
+    const int inner = tab->get_config()->opt_int("inner_wall_filament_id");
+    if (outer != expected_filament)
+        throw std::runtime_error("fine nozzle control did not select its mapped filament for outer walls");
+    if (inner != expected_filament)
+        throw std::runtime_error("inner walls did not follow the fine nozzle control");
+    if (m_app.model().objects.empty())
+        throw std::runtime_error("detail nozzle projection check has no model object");
+    const auto *projection = dynamic_cast<const ConfigOptionString *>(
+        m_app.model().objects.front()->config.option("wall_process_projection"));
+    if (projection == nullptr || projection->value.empty())
+        throw std::runtime_error("fine nozzle control left wall_process_projection empty");
+
+    const size_t object_tool = map->values.front() > 0 ? size_t(map->values.front() - 1) : 0;
+    const size_t wall_tool = outer > 0 && size_t(outer) <= map->values.size() ? size_t(map->values[outer - 1] - 1) : 0;
+    if (object_tool >= diameters->values.size() || wall_tool >= diameters->values.size() ||
+        !(diameters->values[wall_tool] + 1e-6 < diameters->values[object_tool]))
+        throw std::runtime_error("fine nozzle control did not bind walls to a strictly finer nozzle than the object");
+    return Progress::Done;
 }
 
 GuiSmokeTest::Progress GuiSmokeTest::wall_policy_cycle()

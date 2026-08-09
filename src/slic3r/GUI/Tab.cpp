@@ -3009,6 +3009,23 @@ void TabPrint::build()
         optgroup->append_single_option_line("bottom_surface_filament_id", "multimaterial_settings_filament_for_features#bottom-surface");
         optgroup->append_single_option_line("wipe_tower_filament", "multimaterial_settings_filament_for_features#wipe-tower");
 
+        if (m_type == Preset::TYPE_PRINT) {
+            Line detail_nozzle_line = { "", "" };
+            detail_nozzle_line.full_width = 1;
+            detail_nozzle_line.widget = [](wxWindow *parent) {
+                auto *sizer = new wxBoxSizer(wxHORIZONTAL);
+                auto *label = new wxStaticText(parent, wxID_ANY, _L("Print fine details with") + ":");
+                auto *combo = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                           wxSize(30 * wxGetApp().em_unit(), -1), 0, nullptr, wxCB_READONLY);
+                combo->SetName("detail_nozzle_control");
+                sizer->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+                sizer->Add(combo, 0, wxALIGN_CENTER_VERTICAL);
+                register_detail_nozzle_control(combo, sizer);
+                return sizer;
+            };
+            optgroup->append_line(detail_nozzle_line);
+        }
+
         // Reuses the sibling group's icon; no dedicated param_process_for_features.svg exists.
         optgroup = page->new_optgroup(L("Process for Features"), L"param_filament_for_features");
         optgroup->append_single_option_line("wall_process_policy", "multimaterial_settings_process_for_features#walls");
