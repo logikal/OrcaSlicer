@@ -810,8 +810,12 @@ void PerimeterGenerator::split_top_surfaces(const ExPolygons &orig_polygons, ExP
     // increase by half peri the inner space to fill the frontier between last and stored.
     top_fills = union_ex(top_fills, top_polygons);
     //set the clip to the external wall but go back inside by infill_extrusion_width/2 to be sure the extrusion won't go outside even with a 100% overlap.
-    double infill_spacing_unscaled = this->config->sparse_infill_line_width.get_abs_value(nozzle_diameter);
-    if (infill_spacing_unscaled == 0) infill_spacing_unscaled = Flow::auto_extrusion_width(frInfill, nozzle_diameter);
+    const unsigned int infill_filament_id = this->config->sparse_infill_filament_id.value;
+    const size_t infill_tool_id = get_extruder_index_from_filament_id(*this->print_config, infill_filament_id);
+    const size_t infill_config_index = get_print_config_index_from_filament_id(*this->print_config, infill_filament_id);
+    const double infill_nozzle_diameter = this->print_config->nozzle_diameter.get_at(infill_tool_id);
+    double infill_spacing_unscaled = this->config->sparse_infill_line_width.get_at(infill_config_index).get_abs_value(infill_nozzle_diameter);
+    if (infill_spacing_unscaled == 0) infill_spacing_unscaled = Flow::auto_extrusion_width(frInfill, infill_nozzle_diameter);
     fill_clip = offset_ex(orig_polygons, double(ext_perimeter_spacing / 2.) - scale_(infill_spacing_unscaled / 2.));
     // ExPolygons oldLast = last;
 

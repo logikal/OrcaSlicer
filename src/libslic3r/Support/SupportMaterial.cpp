@@ -2150,7 +2150,11 @@ SupportGeneratorLayersPtr PrintObjectSupportMaterial::top_contact_layers(
 
     // check if the sharp tails should be extended higher
     bool detect_first_sharp_tail_only = false;
-    const coordf_t extrusion_width = m_object_config->line_width.get_abs_value(object.print()->config().nozzle_diameter.get_at(object.config().support_interface_filament-1));
+    const unsigned int filament_id = std::max(1, object.config().support_interface_filament.value);
+    const size_t config_index = object.print()->get_print_config_index(filament_id);
+    // The generic width follows the support-interface tool used for sharp-tail detection.
+    const coordf_t extrusion_width = m_object_config->line_width.get_at(config_index).get_abs_value(
+        object.print()->config().nozzle_diameter.get_at(get_extruder_index_from_filament_id(object.print()->config(), filament_id)));
     const coordf_t extrusion_width_scaled = scale_(extrusion_width);
     if (is_auto(m_object_config->support_type.value) && g_config_support_sharp_tails && !detect_first_sharp_tail_only) {
         for (size_t layer_nr = layer_id_start; layer_nr < num_layers; layer_nr++) {

@@ -688,8 +688,9 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     bool have_perimeters = config->opt_int("wall_loops") > 0;
     for (auto el : { "extra_perimeters_on_overhangs", "ensure_vertical_shell_thickness", "detect_thin_wall", "detect_overhang_wall",
-        "seam_position", "staggered_inner_seams", "wall_sequence", "outer_wall_line_width" })
+        "seam_position", "staggered_inner_seams", "wall_sequence" })
         toggle_field(el, have_perimeters);
+    toggle_field("outer_wall_line_width", have_perimeters, variant_index);
     for (auto el : { "inner_wall_speed", "outer_wall_speed", "small_perimeter_speed", "small_perimeter_threshold" })
         toggle_field(el, have_perimeters, variant_index);
 
@@ -736,8 +737,10 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     toggle_line("infill_shift_step", is_cross_zag || is_locked_zig);
     
-    for (auto el : { "skeleton_infill_density", "skin_infill_density", "infill_lock_depth", "skin_infill_depth","skin_infill_line_width", "skeleton_infill_line_width" })
+    for (auto el : { "skeleton_infill_density", "skin_infill_density", "infill_lock_depth", "skin_infill_depth" })
         toggle_line(el, is_locked_zig);
+    for (auto el : { "skin_infill_line_width", "skeleton_infill_line_width" })
+        toggle_line(el, is_locked_zig, variant_index);
 
     bool is_zig_zag = config->option<ConfigOptionEnum<InfillPattern>>("sparse_infill_pattern")->value == InfillPattern::ipZigZag;
 
@@ -790,11 +793,12 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("top_surface_fill_order", has_top_shell && is_centered_fill(config->opt_enum<InfillPattern>("top_surface_pattern")));
     toggle_line("bottom_surface_fill_order", has_bottom_shell && is_centered_fill(config->opt_enum<InfillPattern>("bottom_surface_pattern")));
 
-    for (auto el : { "infill_direction", "sparse_infill_line_width", "gap_fill_target","filter_out_gap_fill","infill_wall_overlap",
+    for (auto el : { "infill_direction", "gap_fill_target","filter_out_gap_fill","infill_wall_overlap",
         "bridge_angle", "internal_bridge_angle", "relative_bridge_angle",
         "solid_infill_direction", "solid_infill_rotate_template", "internal_solid_infill_pattern", "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id",
         })
         toggle_field(el, have_infill || has_solid_infill);
+    toggle_field("sparse_infill_line_width", have_infill || has_solid_infill, variant_index);
     for (auto el : { "sparse_infill_speed", "bridge_speed", "internal_bridge_speed"})
         toggle_field(el, have_infill || has_solid_infill, variant_index);
 
@@ -804,7 +808,7 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     // Gap fill is newly allowed in between perimeter lines even for empty infill (see GH #1476).
     toggle_field("gap_infill_speed", have_perimeters, variant_index);
     
-    toggle_field("top_surface_line_width", has_top_shell);
+    toggle_field("top_surface_line_width", has_top_shell, variant_index);
     toggle_field("top_surface_speed", has_top_shell, variant_index);
 
     bool have_default_acceleration = config->opt_float_nullable("default_acceleration", variant_index) > 0;
@@ -930,12 +934,12 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
 
     // Orca:
     for (auto el : {"small_support_perimeter_speed", "small_support_perimeter_threshold"})
-        toggle_field(el, config->opt_bool("enable_support"));
+        toggle_field(el, config->opt_bool("enable_support"), variant_index);
 
     // BBS
     //toggle_field("support_material_synchronize_layers", have_support_soluble);
 
-    toggle_field("inner_wall_line_width", have_perimeters || have_skirt || have_brim);
+    toggle_field("inner_wall_line_width", have_perimeters || have_skirt || have_brim, variant_index);
     toggle_field("support_filament", have_support_material || have_skirt);
 
     toggle_line("raft_contact_distance", have_raft && !have_support_soluble);

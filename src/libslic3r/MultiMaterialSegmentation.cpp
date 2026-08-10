@@ -1180,10 +1180,14 @@ static bool is_volume_sinking(const indexed_triangle_set &its, const Transform3d
 double resolve_outer_wall_line_width(const PrintRegionConfig &region_config, const PrintObjectConfig &object_config, const PrintConfig &print_config)
 {
     // A filament id of 0 underflows, and get_at() then falls back to the first nozzle.
-    const double               nozzle_diameter = print_config.nozzle_diameter.get_at(get_extruder_index_from_filament_id(print_config, region_config.outer_wall_filament_id));
-    ConfigOptionFloatOrPercent width           = region_config.outer_wall_line_width;
-    if (width.value == 0)
-        width = object_config.line_width;
+    const unsigned int filament_id = region_config.outer_wall_filament_id.value;
+    const size_t tool_id = get_extruder_index_from_filament_id(print_config, filament_id);
+    const size_t config_index = get_print_config_index_from_filament_id(print_config, filament_id);
+    const double nozzle_diameter = print_config.nozzle_diameter.get_at(tool_id);
+    const FloatOrPercent *selected_width = &region_config.outer_wall_line_width.get_at(config_index);
+    if (selected_width->value == 0)
+        selected_width = &object_config.line_width.get_at(config_index);
+    ConfigOptionFloatOrPercent width(selected_width->value, selected_width->percent);
     if (!width.percent && width.value <= 0.)
         return Flow::auto_extrusion_width(frExternalPerimeter, float(nozzle_diameter));
     return width.get_abs_value(nozzle_diameter);

@@ -179,9 +179,12 @@ struct SupportParameters {
             assert(slicing_params.raft_layers() == 0);
         }
 
-	    const auto     nozzle_diameter = print_config.nozzle_diameter.get_at(object_config.support_interface_filament - 1);
-        const coordf_t extrusion_width = object_config.line_width.get_abs_value(nozzle_diameter);
-        support_extrusion_width        = object_config.support_line_width.get_abs_value(nozzle_diameter);
+	    const unsigned int filament_id = std::max(1, object_config.support_interface_filament.value);
+        const size_t config_index = object.print()->get_print_config_index(filament_id);
+	    const auto nozzle_diameter = print_config.nozzle_diameter.get_at(get_extruder_index_from_filament_id(print_config, filament_id));
+        // The generic width follows the support-interface tool used here.
+        const coordf_t extrusion_width = object_config.line_width.get_at(config_index).get_abs_value(nozzle_diameter);
+        support_extrusion_width        = object_config.support_line_width.get_at(config_index).get_abs_value(nozzle_diameter);
         support_extrusion_width        = support_extrusion_width > 0 ? support_extrusion_width : extrusion_width;
 
         independent_layer_height = print_config.independent_support_layer_height;

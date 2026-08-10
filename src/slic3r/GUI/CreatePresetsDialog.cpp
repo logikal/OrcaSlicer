@@ -2316,51 +2316,51 @@ void CreatePrinterPresetDialog::generate_process_presets_data(std::vector<Preset
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no initial_layer_print_height";
 
-        auto line_width = dynamic_cast<ConfigOptionFloat *>(const_cast<Preset *>(preset)->config.option("line_width", true));
+        auto line_width = dynamic_cast<ConfigOptionFloatsOrPercentsNullable *>(const_cast<Preset *>(preset)->config.option("line_width", true));
         if (line_width)
-            line_width->value = nozzle_dia;
+            line_width->get_at(0) = {nozzle_dia, false};
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no line_width";
 
-        auto initial_layer_line_width = dynamic_cast<ConfigOptionFloat *>(const_cast<Preset *>(preset)->config.option("initial_layer_line_width", true));
+        auto initial_layer_line_width = dynamic_cast<ConfigOptionFloatsOrPercentsNullable *>(const_cast<Preset *>(preset)->config.option("initial_layer_line_width", true));
         if (initial_layer_line_width)
-            initial_layer_line_width->value = nozzle_dia;
+            initial_layer_line_width->get_at(0) = {nozzle_dia, false};
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no initial_layer_line_width";
 
-        auto outer_wall_line_width = dynamic_cast<ConfigOptionFloat *>(const_cast<Preset *>(preset)->config.option("outer_wall_line_width", true));
+        auto outer_wall_line_width = dynamic_cast<ConfigOptionFloatsOrPercentsNullable *>(const_cast<Preset *>(preset)->config.option("outer_wall_line_width", true));
         if (outer_wall_line_width)
-            outer_wall_line_width->value = nozzle_dia;
+            outer_wall_line_width->get_at(0) = {nozzle_dia, false};
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no outer_wall_line_width";
 
-        auto inner_wall_line_width = dynamic_cast<ConfigOptionFloat *>(const_cast<Preset *>(preset)->config.option("inner_wall_line_width", true));
+        auto inner_wall_line_width = dynamic_cast<ConfigOptionFloatsOrPercentsNullable *>(const_cast<Preset *>(preset)->config.option("inner_wall_line_width", true));
         if (inner_wall_line_width)
-            inner_wall_line_width->value = nozzle_dia;
+            inner_wall_line_width->get_at(0) = {nozzle_dia, false};
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no inner_wall_line_width";
 
-        auto top_surface_line_width = dynamic_cast<ConfigOptionFloat *>(const_cast<Preset *>(preset)->config.option("top_surface_line_width", true));
+        auto top_surface_line_width = dynamic_cast<ConfigOptionFloatsOrPercentsNullable *>(const_cast<Preset *>(preset)->config.option("top_surface_line_width", true));
         if (top_surface_line_width)
-            top_surface_line_width->value = nozzle_dia;
+            top_surface_line_width->get_at(0) = {nozzle_dia, false};
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no top_surface_line_width";
 
-        auto sparse_infill_line_width = dynamic_cast<ConfigOptionFloat *>(const_cast<Preset *>(preset)->config.option("sparse_infill_line_width", true));
+        auto sparse_infill_line_width = dynamic_cast<ConfigOptionFloatsOrPercentsNullable *>(const_cast<Preset *>(preset)->config.option("sparse_infill_line_width", true));
         if (sparse_infill_line_width)
-            sparse_infill_line_width->value = nozzle_dia;
+            sparse_infill_line_width->get_at(0) = {nozzle_dia, false};
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no sparse_infill_line_width";
 
-        auto internal_solid_infill_line_width = dynamic_cast<ConfigOptionFloat *>(const_cast<Preset *>(preset)->config.option("internal_solid_infill_line_width", true));
+        auto internal_solid_infill_line_width = dynamic_cast<ConfigOptionFloatsOrPercentsNullable *>(const_cast<Preset *>(preset)->config.option("internal_solid_infill_line_width", true));
         if (internal_solid_infill_line_width)
-            internal_solid_infill_line_width->value = nozzle_dia;
+            internal_solid_infill_line_width->get_at(0) = {nozzle_dia, false};
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no internal_solid_infill_line_width";
 
-        auto support_line_width = dynamic_cast<ConfigOptionFloat *>(const_cast<Preset *>(preset)->config.option("support_line_width", true));
+        auto support_line_width = dynamic_cast<ConfigOptionFloatsOrPercentsNullable *>(const_cast<Preset *>(preset)->config.option("support_line_width", true));
         if (support_line_width)
-            support_line_width->value = nozzle_dia;
+            support_line_width->get_at(0) = {nozzle_dia, false};
         else
             BOOST_LOG_TRIVIAL(info) << "process template has no support_line_width";
 

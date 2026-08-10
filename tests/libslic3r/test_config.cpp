@@ -129,33 +129,33 @@ SCENARIO("Config accessor functions perform as expected.", "[Config]") {
         WHEN("A float or percent is set as a percent through the string interface.") {
             config.set_deserialize_strict("initial_layer_line_width", "100%");
             THEN("Value and percent flag are 100/true") {
-                auto tmp = config.opt<ConfigOptionFloatOrPercent>("initial_layer_line_width");
-                REQUIRE(tmp->percent == true);
-                REQUIRE(tmp->value == 100);
+                auto tmp = config.opt<ConfigOptionFloatsOrPercentsNullable>("initial_layer_line_width");
+                REQUIRE(tmp->get_at(0).percent == true);
+                REQUIRE(tmp->get_at(0).value == 100);
             }
         }
         WHEN("A float or percent is set as a float through the string interface.") {
             config.set_deserialize_strict("initial_layer_line_width", "100");
             THEN("Value and percent flag are 100/false") {
-                auto tmp = config.opt<ConfigOptionFloatOrPercent>("initial_layer_line_width");
-                REQUIRE(tmp->percent == false);
-                REQUIRE(tmp->value == 100);
+                auto tmp = config.opt<ConfigOptionFloatsOrPercentsNullable>("initial_layer_line_width");
+                REQUIRE(tmp->get_at(0).percent == false);
+                REQUIRE(tmp->get_at(0).value == 100);
             }
         }
         WHEN("A float or percent is set as a float through the int interface.") {
             config.set("initial_layer_line_width", 100);
             THEN("Value and percent flag are 100/false") {
-                auto tmp = config.opt<ConfigOptionFloatOrPercent>("initial_layer_line_width");
-                REQUIRE(tmp->percent == false);
-                REQUIRE(tmp->value == 100);
+                auto tmp = config.opt<ConfigOptionFloatsOrPercentsNullable>("initial_layer_line_width");
+                REQUIRE(tmp->get_at(0).percent == false);
+                REQUIRE(tmp->get_at(0).value == 100);
             }
         }
         WHEN("A float or percent is set as a float through the double interface.") {
             config.set("initial_layer_line_width", 100.5);
             THEN("Value and percent flag are 100.5/false") {
-                auto tmp = config.opt<ConfigOptionFloatOrPercent>("initial_layer_line_width");
-                REQUIRE(tmp->percent == false);
-                REQUIRE(tmp->value == 100.5);
+                auto tmp = config.opt<ConfigOptionFloatsOrPercentsNullable>("initial_layer_line_width");
+                REQUIRE(tmp->get_at(0).percent == false);
+                REQUIRE(tmp->get_at(0).value == 100.5);
             }
         }
         WHEN("A numeric vector is set from serialized string") {

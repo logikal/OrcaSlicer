@@ -1608,25 +1608,22 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
         // Percent widths must resolve against the nozzle that actually prints the role; with
         // mixed diameters the global min/max pair rejects perfectly valid per-role widths.
-        auto validate_extrusion_width_for_nozzle = [](const ConfigBase &config, const char *opt_key, double layer_height,
-                                                      double nozzle_min, double nozzle_max, std::string &err_msg) -> bool {
-            double extrusion_width_min = config.get_abs_value(opt_key, nozzle_min);
-            double extrusion_width_max = config.get_abs_value(opt_key, nozzle_max);
-            if (extrusion_width_min == 0) {
+        auto validate_extrusion_width_for_nozzle = [](const ConfigBase &config, const char *opt_key, size_t config_index,
+                                                      double layer_height, double nozzle_diameter, std::string &err_msg) -> bool {
+            const auto *widths = config.option<ConfigOptionFloatsOrPercentsNullable>(opt_key);
+            assert(widths != nullptr);
+            const double extrusion_width = widths->get_at(config_index).get_abs_value(nozzle_diameter);
+            if (extrusion_width == 0) {
                 // Default "auto-generated" extrusion width is always valid.
-            } else if (extrusion_width_min <= layer_height) {
+            } else if (extrusion_width <= layer_height) {
                     err_msg = L("Line width too small");
                     return false;
-                } else if (extrusion_width_max > nozzle_max * MAX_LINE_WIDTH_MULTIPLIER) {
+                } else if (extrusion_width > nozzle_diameter * MAX_LINE_WIDTH_MULTIPLIER) {
                 err_msg = L("Line width too large");
 				return false;
 			}
 			return true;
 		};
-        auto validate_extrusion_width = [&validate_extrusion_width_for_nozzle, min_nozzle_diameter, max_nozzle_diameter](
-                                            const ConfigBase &config, const char *opt_key, double layer_height, std::string &err_msg) -> bool {
-            return validate_extrusion_width_for_nozzle(config, opt_key, layer_height, min_nozzle_diameter, max_nozzle_diameter, err_msg);
-        };
         DynamicPrintConfig dynamic_print_config;
         dynamic_print_config.set_key_value("nozzle_diameter", m_config.nozzle_diameter.clone());
         dynamic_print_config.set_key_value("min_layer_height", m_config.min_layer_height.clone());
@@ -1983,6 +1980,11 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     heights.push_back(slicing_params.layer_height);
                 else {
                     for (const CadenceZone &zone : object->cadence_zones()) {
+                        // The synthetic zone below the first layer boundary prints at the global
+                        // initial layer height and is validated by the dedicated first-layer
+                        // checks; unioning its base height would falsely fail fine-tool walls.
+                        if (zone.hi <= initial_layer_print_height + EPSILON)
+                            continue;
                         if (!object->region_intersects_cadence_zone(region, zone))
                             continue;
                         if (zone.mixed)
@@ -2124,10 +2126,27 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
             // Validate extrusion widths.
             std::string err_msg;
-            if (!validate_extrusion_width(object->config(), "line_width", layer_height, err_msg))
+            const auto *object_extruder = object->model_object()->config.get().option<ConfigOptionInt>("extruder");
+            const unsigned int object_filament_id = object_extruder == nullptr || object_extruder->value <= 0 ?
+                1u : unsigned(object_extruder->value);
+            const size_t object_config_index = this->get_print_config_index(object_filament_id);
+            const double object_nozzle = m_config.nozzle_diameter.get_at(
+                get_extruder_index_from_filament_id(m_config, object_filament_id));
+            // The generic width follows the object's base filament.
+            if (!validate_extrusion_width_for_nozzle(
+                    object->config(), "line_width", object_config_index, layer_height, object_nozzle, err_msg))
             	return {err_msg, object, "line_width"};
+            if (!validate_extrusion_width_for_nozzle(
+                    m_config, "initial_layer_line_width", object_config_index,
+                    object->slicing_parameters().first_print_layer_height, object_nozzle, err_msg))
+                return {err_msg, object, "initial_layer_line_width"};
             if (object->has_support() || object->has_raft()) {
-                if (!validate_extrusion_width(object->config(), "support_line_width", layer_height, err_msg))
+                const unsigned int support_filament_id = std::max(1, object->config().support_filament.value);
+                const size_t support_config_index = this->get_print_config_index(support_filament_id);
+                const double support_nozzle = m_config.nozzle_diameter.get_at(
+                    get_extruder_index_from_filament_id(m_config, support_filament_id));
+                if (!validate_extrusion_width_for_nozzle(
+                        object->config(), "support_line_width", support_config_index, layer_height, support_nozzle, err_msg))
                     return {err_msg, object, "support_line_width"};
             }
             // Per-role width validation: each key checks against the height it prints at and
@@ -2143,11 +2162,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     else                                                               filament_id = rc.sparse_infill_filament_id.value;
                     const double role_nozzle = m_config.nozzle_diameter.get_at(
                         get_extruder_index_from_filament_id(m_config, filament_id));
+                    const size_t role_config_index = this->get_print_config_index(filament_id);
                     const std::vector<double> heights = cadence_active ? cadence_heights_for_region(region) :
                                                                          std::vector<double>{layer_height};
                     for (double height : heights)
                         if (!validate_extrusion_width_for_nozzle(
-                                rc, opt_key, height, role_nozzle, role_nozzle, err_msg))
+                                rc, opt_key, role_config_index, height, role_nozzle, err_msg))
                             return {err_msg, object, opt_key};
                 }
 
@@ -2514,11 +2534,14 @@ double Print::skirt_first_layer_height() const
 
 Flow Print::brim_flow() const
 {
-    ConfigOptionFloatOrPercent width = m_config.initial_layer_line_width;
+    const unsigned int filament_id = m_print_regions.front()->config().outer_wall_filament_id;
+    const size_t config_index = this->get_print_config_index(filament_id);
+    FloatOrPercent width = m_config.initial_layer_line_width.get_at(config_index);
     if (width.value <= 0)
-        width = m_print_regions.front()->config().inner_wall_line_width;
+        width = m_print_regions.front()->config().inner_wall_line_width.get_at(config_index);
+    // The generic width follows the perimeter tool selected for the brim.
     if (width.value <= 0)
-        width = m_objects.front()->config().line_width;
+        width = m_objects.front()->config().line_width.get_at(config_index);
 
     /* We currently use a random region's perimeter extruder.
        While this works for most cases, we should probably consider all of the perimeter
@@ -2529,7 +2552,7 @@ Flow Print::brim_flow() const
         frPerimeter,
         // Flow::new_from_config_width takes care of the percent to value substitution
 		width,
-        (float)m_config.nozzle_diameter.get_at(get_extruder_index_from_filament_id(m_config, m_print_regions.front()->config().outer_wall_filament_id)),
+        (float)m_config.nozzle_diameter.get_at(get_extruder_index_from_filament_id(m_config, filament_id)),
 		(float)this->skirt_first_layer_height());
 }
 
@@ -2537,9 +2560,12 @@ Flow Print::skirt_flow() const
 {
 
     // Orca: fall back to m_config if no objects are present
-    ConfigOptionFloatOrPercent width = m_config.initial_layer_line_width;
+    const unsigned int filament_id = m_objects.empty() ? 1 : std::max(1, m_objects.front()->config().support_filament.value);
+    const size_t config_index = this->get_print_config_index(filament_id);
+    FloatOrPercent width = m_config.initial_layer_line_width.get_at(config_index);
+    // The generic width follows the support tool selected for the skirt.
     if (width.value <= 0)
-        width = m_objects.empty() ? m_config.initial_layer_line_width : m_objects.front()->config().line_width;
+        width = m_objects.empty() ? m_config.initial_layer_line_width.get_at(config_index) : m_objects.front()->config().line_width.get_at(config_index);
 
     /* We currently use a random object's support material extruder.
        While this works for most cases, we should probably consider all of the support material
@@ -2550,7 +2576,7 @@ Flow Print::skirt_flow() const
                                        // Flow::new_from_config_width takes care of the percent to value substitution
                                        width,
                                        (float) m_config.nozzle_diameter.get_at(
-                                           m_objects.empty() ? 0 : m_objects.front()->config().support_filament - 1),
+                                           get_extruder_index_from_filament_id(m_config, filament_id)),
                                        (float) this->skirt_first_layer_height());
 }
 
@@ -4183,6 +4209,11 @@ size_t Print::get_extruder_id(unsigned int filament_id) const
     return 0;
 }
 
+size_t Print::get_print_config_index(unsigned int filament_id) const
+{
+    return get_print_config_index_from_filament_id(m_config, filament_id);
+}
+
 // Region reachable by every extruder = intersection of all per-extruder printable areas.
 // For single-nozzle printers, or whenever extruder_printable_area is unpopulated / degenerate (all
 // current single/dual profiles), fall back to the full printable_area so the wipe-tower-center clamp
@@ -4913,9 +4944,12 @@ std::tuple<float, float> Print::object_skirt_offset(double margin_height) const
     if (config().skirt_loops == 0 || config().skirt_type != stPerObject || m_objects.empty())
         return std::make_tuple(0, 0);
     
-    float max_nozzle_diameter = *std::max_element(m_config.nozzle_diameter.values.begin(), m_config.nozzle_diameter.values.end());
     float max_layer_height    = *std::max_element(config().max_layer_height.values.begin(), config().max_layer_height.values.end());
-    float line_width = m_config.initial_layer_line_width.get_abs_value(max_nozzle_diameter);
+    const unsigned int filament_id = std::max(1, m_objects.front()->config().support_filament.value);
+    const size_t config_index = get_print_config_index(filament_id);
+    // The draft-shield offset follows the same support tool selected by skirt_flow().
+    const float line_width = m_config.initial_layer_line_width.get_at(config_index).get_abs_value(
+        m_config.nozzle_diameter.get_at(get_extruder_index_from_filament_id(m_config, filament_id)));
     float object_skirt_witdh  = skirt_flow().width() + (config().skirt_loops - 1) * skirt_flow().spacing();
     float object_skirt_offset = 0;
 

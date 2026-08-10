@@ -104,8 +104,9 @@ private:
 const PrintRegionConfig *region_with_outer_width(const PrintObject &object, double width)
 {
     for (const PrintRegion &region : object.all_regions())
-        if (std::abs(region.config().outer_wall_line_width.value - width) <= 1e-9)
-            return &region.config();
+        for (const FloatOrPercent &candidate : region.config().outer_wall_line_width.values)
+            if (std::abs(candidate.value - width) <= 1e-9)
+                return &region.config();
     return nullptr;
 }
 
@@ -488,8 +489,8 @@ TEST_CASE("An object's base filament supplies its process delta", "[FeatureCaden
     CHECK_THAT(object.config().layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
     REQUIRE(object.num_printing_regions() == 1);
     const PrintRegionConfig &region = object.printing_region(0).config();
-    CHECK_THAT(region.outer_wall_line_width.value, Catch::Matchers::WithinAbs(0.22, 1e-9));
-    CHECK_THAT(region.sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.25, 1e-9));
+    CHECK_THAT(region.outer_wall_line_width.get_at(1).value, Catch::Matchers::WithinAbs(0.22, 1e-9));
+    CHECK_THAT(region.sparse_infill_line_width.get_at(1).value, Catch::Matchers::WithinAbs(0.25, 1e-9));
     CHECK(region.wall_loops.value == 4);
 
     print.process();
@@ -497,6 +498,66 @@ TEST_CASE("An object's base filament supplies its process delta", "[FeatureCaden
         "layer_height=0.12;outer_wall_line_width=0.24;sparse_infill_line_width=0.26";
     CHECK(print.apply(model, config) == PrintBase::APPLY_STATUS_INVALIDATED);
     CHECK_THAT(print.objects().front()->config().layer_height.value, Catch::Matchers::WithinAbs(0.12, 1e-9));
+}
+
+TEST_CASE("Multiple separated fine zones validate and slice", "[FeatureCadence][FilamentProcess][Zones][Regression]")
+{
+    // ZoneRuler shape: a coarse staircase with a fine 1.2mm cap on each step — three disjoint
+    // fine Z bands. Reported by the user's test asset: validation refused with a coarse-height
+    // wall on the fine tool.
+    // Two configurations: per-part fine walls only, and the golden-path shape where ALL walls
+    // ride the fine filament globally (the reported failure: the synthetic sub-first-layer base
+    // zone leaked height 0.2 into wall validation for the fine tool).
+    const bool walls_globally_fine = GENERATE(false, true);
+    CAPTURE(walls_globally_fine);
+    DynamicPrintConfig config = filament_delta_test_config();
+    config.option<ConfigOptionStrings>("filament_process_projection", true)->values = {
+        "layer_height=0.1;outer_wall_line_width=0.22;inner_wall_line_width=0.22;wall_loops=4", ""};
+    if (walls_globally_fine) {
+        config.set_deserialize_strict("outer_wall_filament_id", "1");
+        config.set_deserialize_strict("inner_wall_filament_id", "1");
+    }
+
+    Print print;
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = "zone-ruler";
+    auto add_box = [&](double x0, double x1, double z0, double z1, int extruder) {
+        TriangleMesh mesh = make_cube(x1 - x0, 20., z1 - z0);
+        Transform3d t = Transform3d::Identity();
+        t.translation() = Vec3d(x0, 0., z0);
+        mesh.transform(t, false);
+        ModelVolume *volume = object->add_volume(std::move(mesh));
+        volume->config.set_key_value("extruder", new ConfigOptionInt(extruder));
+    };
+    // Steps (coarse, filament 2): heights 4 / 8 / 12; caps (fine, filament 1): 1.2 on each step.
+    add_box(0., 20., 0., 4., 2);
+    add_box(20., 40., 0., 8., 2);
+    add_box(40., 60., 0., 12., 2);
+    add_box(0., 20., 4., 5.2, 1);
+    add_box(20., 40., 8., 9.2, 1);
+    add_box(40., 60., 12., 13.2, 1);
+    object->config.set_key_value("extruder", new ConfigOptionInt(2));
+    object->add_instance();
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+
+    const PrintObject &print_object = *print.objects().front();
+    std::ostringstream dump;
+    for (const CadenceZone &zone : print_object.cadence_zones())
+        dump << "zone [" << zone.lo << "," << zone.hi << ") mixed=" << zone.mixed
+             << " h=" << zone.height << " fine_h=" << zone.fine_height << "\n";
+    for (const PrintRegion &region : print_object.all_regions())
+        dump << "region outer_fil=" << region.config().outer_wall_filament_id.value
+             << " wall_h=" << region.config().wall_layer_height.value
+             << " outer_w=" << region.config().outer_wall_line_width.get_at(0).value
+             << "/" << region.config().outer_wall_line_width.get_at(1).value << "\n";
+    INFO(dump.str());
+
+    const StringObjectException error = print.validate();
+    INFO(error.string);
+    CHECK(error.string.empty());
 }
 
 TEST_CASE("A delta-free filament keeps global process values other slots project", "[FeatureCadence][FilamentProcess][Regression]")
@@ -541,7 +602,7 @@ TEST_CASE("Part, modifier, and layer-range base filaments consume their own delt
         REQUIRE(region_with_outer_width(print_object, 0.44) != nullptr);
         const PrintRegionConfig *fine = region_with_outer_width(print_object, 0.22);
         REQUIRE(fine != nullptr);
-        CHECK_THAT(fine->sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.25, 1e-9));
+        CHECK_THAT(fine->sparse_infill_line_width.get_at(1).value, Catch::Matchers::WithinAbs(0.25, 1e-9));
     }
 
     DYNAMIC_SECTION("modifier") {
@@ -607,9 +668,9 @@ TEST_CASE("Role filament deltas stay within their partitions and populate cadenc
     CHECK_FALSE(model.objects.front()->config.has("wall_layer_height"));
     CHECK_THAT(print.objects().front()->config().layer_height.value, Catch::Matchers::WithinAbs(0.2, 1e-9));
     const PrintRegionConfig &region = print.objects().front()->printing_region(0).config();
-    CHECK_THAT(region.outer_wall_line_width.value, Catch::Matchers::WithinAbs(0.22, 1e-9));
+    CHECK_THAT(region.outer_wall_line_width.get_at(1).value, Catch::Matchers::WithinAbs(0.22, 1e-9));
     CHECK(region.wall_loops.value == 4);
-    CHECK_THAT(region.sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.45, 1e-9));
+    CHECK_THAT(region.sparse_infill_line_width.get_at(0).value, Catch::Matchers::WithinAbs(0.45, 1e-9));
     CHECK_THAT(region.wall_layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
     CHECK_THAT(region.sparse_infill_process_layer_height.value, Catch::Matchers::WithinAbs(0., 1e-9));
 }
@@ -679,13 +740,13 @@ TEST_CASE("Explicit object and region process values win over filament deltas",
     }};
     init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
     CHECK_THAT(print.objects().front()->config().layer_height.value, Catch::Matchers::WithinAbs(0.3, 1e-9));
-    CHECK_THAT(print.objects().front()->printing_region(0).config().outer_wall_line_width.value,
+    CHECK_THAT(print.objects().front()->printing_region(0).config().outer_wall_line_width.get_at(1).value,
                Catch::Matchers::WithinAbs(0.55, 1e-9));
 
     ModelVolume *volume = model.objects.front()->volumes.front();
     volume->config.set("outer_wall_line_width", 0.5);
     print.apply(model, config);
-    CHECK_THAT(print.objects().front()->printing_region(0).config().outer_wall_line_width.value,
+    CHECK_THAT(print.objects().front()->printing_region(0).config().outer_wall_line_width.get_at(1).value,
                Catch::Matchers::WithinAbs(0.5, 1e-9));
 
     ModelVolume *modifier = model.objects.front()->add_volume(
@@ -695,7 +756,7 @@ TEST_CASE("Explicit object and region process values win over filament deltas",
     const PrintObject &print_object = *print.objects().front();
     REQUIRE(print_object.num_printing_regions() >= 2);
     for (size_t region_id = 0; region_id < print_object.num_printing_regions(); ++region_id)
-        CHECK_THAT(print_object.printing_region(region_id).config().outer_wall_line_width.value,
+        CHECK_THAT(print_object.printing_region(region_id).config().outer_wall_line_width.get_at(1).value,
                    Catch::Matchers::WithinAbs(0.5, 1e-9));
 }
 
@@ -714,7 +775,7 @@ TEST_CASE("Support and interface filaments supply their object-scope partitions"
     init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
 
     const PrintObjectConfig &object = print.objects().front()->config();
-    CHECK_THAT(object.support_line_width.value, Catch::Matchers::WithinAbs(0.23, 1e-9));
+    CHECK_THAT(object.support_line_width.get_at(1).value, Catch::Matchers::WithinAbs(0.23, 1e-9));
     CHECK_THAT(object.support_speed.get_at(1), Catch::Matchers::WithinAbs(33., 1e-9));
     CHECK_THAT(object.support_interface_speed.get_at(1), Catch::Matchers::WithinAbs(22., 1e-9));
     CHECK_THAT(object.support_top_z_distance.value, Catch::Matchers::WithinAbs(0.05, 1e-9));
@@ -741,7 +802,7 @@ TEST_CASE("Painted regions consume their filament delta identically on create an
     const PrintObject &print_object = *print.objects().front();
     const PrintRegionConfig *painted = region_with_outer_width(print_object, 0.22);
     REQUIRE(painted != nullptr);
-    CHECK_THAT(painted->sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.25, 1e-9));
+    CHECK_THAT(painted->sparse_infill_line_width.get_at(1).value, Catch::Matchers::WithinAbs(0.25, 1e-9));
     REQUIRE(print_object.cadence_zones().size() == 1);
     CHECK(print_object.cadence_zones().front().mixed);
     CHECK_THAT(print_object.cadence_zones().front().lo, Catch::Matchers::WithinAbs(0., EPSILON));
@@ -1201,7 +1262,7 @@ TEST_CASE("Base-zone top shells keep their unscaled layer count", "[FeatureCaden
         if (layer->print_z < 9. - EPSILON || layer->print_z > 10. + EPSILON)
             continue;
         for (const LayerRegion *region : layer->regions()) {
-            if (std::abs(region->region().config().outer_wall_line_width.value - 0.44) > 1e-6)
+            if (std::abs(region->region().config().outer_wall_line_width.get_at(0).value - 0.44) > 1e-6)
                 continue;
             for (const Surface &surface : region->fill_surfaces.surfaces)
                 if (surface.surface_type == stTop || surface.surface_type == stInternalSolid)

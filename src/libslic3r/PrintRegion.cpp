@@ -25,31 +25,37 @@ unsigned int PrintRegion::extruder(FlowRole role) const
 Flow PrintRegion::flow(const PrintObject &object, FlowRole role, double layer_height, bool first_layer) const
 {
     const PrintConfig          &print_config = object.print()->config();
+    const unsigned int filament_id = this->extruder(role);
+    const size_t tool_id = get_extruder_index_from_filament_id(print_config, filament_id);
+    const size_t config_index = object.print()->get_print_config_index(filament_id);
     ConfigOptionFloatOrPercent config_width;
+    auto width_at = [config_index](const ConfigOptionFloatsOrPercentsNullable &widths) {
+        const FloatOrPercent &width = widths.get_at(config_index);
+        return ConfigOptionFloatOrPercent(width.value, width.percent);
+    };
     // Get extrusion width from configuration.
     // (might be an absolute value, or a percent value, or zero for auto)
-    if (first_layer && print_config.initial_layer_line_width.value > 0) {
-        config_width = print_config.initial_layer_line_width;
+    if (first_layer && print_config.initial_layer_line_width.get_at(config_index).value > 0) {
+        config_width = width_at(print_config.initial_layer_line_width);
     } else if (role == frExternalPerimeter) {
-        config_width = m_config.outer_wall_line_width;
+        config_width = width_at(m_config.outer_wall_line_width);
     } else if (role == frPerimeter) {
-        config_width = m_config.inner_wall_line_width;
+        config_width = width_at(m_config.inner_wall_line_width);
     } else if (role == frInfill) {
-        config_width = m_config.sparse_infill_line_width;
+        config_width = width_at(m_config.sparse_infill_line_width);
     } else if (role == frSolidInfill) {
-        config_width = m_config.internal_solid_infill_line_width;
+        config_width = width_at(m_config.internal_solid_infill_line_width);
     } else if (role == frTopSolidInfill) {
-        config_width = m_config.top_surface_line_width;
+        config_width = width_at(m_config.top_surface_line_width);
     } else {
         throw Slic3r::InvalidArgument("Unknown role");
     }
 
     if (config_width.value == 0)
-        config_width = object.config().line_width;
+        config_width = width_at(object.config().line_width);
     
     // Get the configured nozzle_diameter for the extruder associated to the flow role requested.
-    const size_t extruder_id = get_extruder_index_from_filament_id(print_config, this->extruder(role));
-    auto nozzle_diameter = float(print_config.nozzle_diameter.get_at(extruder_id));
+    auto nozzle_diameter = float(print_config.nozzle_diameter.get_at(tool_id));
     return Flow::new_from_config_width(role, config_width, nozzle_diameter, float(layer_height));
 }
 

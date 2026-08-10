@@ -10,6 +10,7 @@ add_executable(${_TEST_NAME}_tests
 	test_flow.cpp
 	test_gcode_timing.cpp
 	test_gcodewriter.cpp
+	test_line_width_variants.cpp
 	test_model.cpp
 	test_multifilament.cpp
 	test_perimeters.cpp

@@ -1074,6 +1074,8 @@ public:
     std::vector<int> get_filament_nozzle_maps() const;
     // get the group label of filament
     size_t get_extruder_id(unsigned int filament_id) const;
+    // Resolve a 1-based filament to its per-(extruder x variant) process-config slot.
+    size_t get_print_config_index(unsigned int filament_id) const;
 
     // The region every extruder can reach,
     // i.e. the intersection of all per-extruder printable areas. Falls back to the full printable_area

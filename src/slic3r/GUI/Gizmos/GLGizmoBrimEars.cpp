@@ -1160,8 +1160,10 @@ float GLGizmoBrimEars::get_brim_default_radius() const
 {
     const double              nozzle_diameter = wxGetApp().preset_bundle->printers.get_edited_preset().config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0);
     const DynamicPrintConfig &print_cfg = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+    // print_cfg has no printer keys, so resolve a percent width against the locally known nozzle.
+    const FloatOrPercent width = print_cfg.option<ConfigOptionFloatsOrPercentsNullable>("initial_layer_line_width")->get_at(0);
     return std::clamp(
-        float(print_cfg.get_abs_value("initial_layer_line_width", nozzle_diameter) * 8.0),
+        float(width.get_abs_value(nozzle_diameter) * 8.0),
         BRIM_EAR_RADIUS_MIN,
         BRIM_EAR_RADIUS_MAX);
 }

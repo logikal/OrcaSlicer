@@ -117,6 +117,19 @@ size_t get_extruder_index_from_filament_id(const GCodeConfig& config, unsigned i
     return idx;
 }
 
+size_t get_print_config_index_from_filament_id(const GCodeConfig& config, unsigned int filament_id)
+{
+    if (filament_id > 0) {
+        const size_t filament_index = size_t(filament_id - 1);
+        if (filament_index < config.filament_map_2.size()) {
+            const int config_index = config.filament_map_2.get_at(filament_index);
+            if (config_index >= 0)
+                return size_t(config_index);
+        }
+    }
+    return get_extruder_index_from_filament_id(config, filament_id);
+}
+
 
 // Orca: input shaping values types by flavor
 std::vector<std::string> get_shaper_type_values_for_flavor(GCodeFlavor flavor)
@@ -2491,7 +2504,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels   = def_top_fill_pattern->enum_labels;
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipMonotonic));
     
-    def = this->add("outer_wall_line_width", coFloatOrPercent);
+    def = this->add("outer_wall_line_width", coFloatsOrPercents);
     def->label = L("Outer wall");
     def->category = L("Quality");
     def->tooltip = L("Line width of outer wall. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -2501,7 +2514,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("outer_wall_speed", coFloats);
     def->label = L("Outer wall");
@@ -2810,7 +2824,7 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloats { 0.0 });
 
-    def = this->add("line_width", coFloatOrPercent);
+    def = this->add("line_width", coFloatsOrPercents);
     def->label = L("Default");
     def->category = L("Quality");
     def->tooltip = L("Default line width if other line widths are set to 0. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -2820,7 +2834,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0, false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0, false)});
 
     def = this->add("reduce_fan_stop_start_freq", coBools);
     def->label = L("Keep fan always on");
@@ -3746,7 +3761,7 @@ void PrintConfigDef::init_fff_params()
     def->nullable = true;
     def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(100, true)});
 
-    def = this->add("initial_layer_line_width", coFloatOrPercent);
+    def = this->add("initial_layer_line_width", coFloatsOrPercents);
     def->label = L("First layer");
     def->category = L("Quality");
     def->tooltip = L("Line width of the first layer. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -3756,7 +3771,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("initial_layer_print_height", coFloat);
     def->label = L("First layer height");
@@ -4492,7 +4508,7 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(1.0));
 
-    def           = this->add("skin_infill_line_width", coFloatOrPercent);
+    def           = this->add("skin_infill_line_width", coFloatsOrPercents);
     def->label    = L("Skin line width");
     def->category = L("Strength");
     def->tooltip  = L("Adjust the line width of the selected skin paths.");
@@ -4500,9 +4516,10 @@ void PrintConfigDef::init_fff_params()
     def->ratio_over = "nozzle_diameter";
     def->min      = 0;
     def->mode     = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(100, true));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(100, true)});
 
-    def           = this->add("skeleton_infill_line_width", coFloatOrPercent);
+    def           = this->add("skeleton_infill_line_width", coFloatsOrPercents);
     def->label    = L("Skeleton line width");
     def->category = L("Strength");
     def->tooltip  = L("Adjust the line width of the selected skeleton paths.");
@@ -4510,7 +4527,8 @@ void PrintConfigDef::init_fff_params()
     def->ratio_over = "nozzle_diameter";
     def->min      = 0;
     def->mode     = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(100, true));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(100, true)});
 
     def           = this->add("symmetric_infill_y_axis", coBool);
     def->label    = L("Symmetric infill Y axis");
@@ -4680,7 +4698,7 @@ void PrintConfigDef::init_fff_params()
         "sparse_infill_process", "sparse_infill_process_layer_height",
         L("Sparse infill process policy"), L("Sparse infill process preset"), L("Sparse infill layer height"));
 
-    def = this->add("sparse_infill_line_width", coFloatOrPercent);
+    def = this->add("sparse_infill_line_width", coFloatsOrPercents);
     def->label = L("Sparse infill");
     def->category = L("Quality");
     def->tooltip = L("Line width of internal sparse infill. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -4690,7 +4708,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("infill_wall_overlap", coPercent);
     def->label = L("Infill/wall overlap");
@@ -5602,7 +5621,7 @@ void PrintConfigDef::init_fff_params()
         "wall_process", "wall_layer_height",
         L("Wall process policy"), L("Wall process preset"), L("Wall layer height"));
 
-    def = this->add("inner_wall_line_width", coFloatOrPercent);
+    def = this->add("inner_wall_line_width", coFloatsOrPercents);
     def->label = L("Inner wall");
     def->category = L("Quality");
     def->tooltip = L("Line width of inner wall. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -5612,7 +5631,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("inner_wall_speed", coFloats);
     def->label = L("Inner wall");
@@ -6482,7 +6502,7 @@ void PrintConfigDef::init_fff_params()
         "bottom_surface_process", "bottom_surface_process_layer_height",
         L("Bottom surface process policy"), L("Bottom surface process preset"), L("Bottom surface layer height"));
 
-    def = this->add("internal_solid_infill_line_width", coFloatOrPercent);
+    def = this->add("internal_solid_infill_line_width", coFloatsOrPercents);
     def->label = L("Internal solid infill");
     def->category = L("Quality");
     def->tooltip = L("Line width of internal solid infill. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -6492,7 +6512,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("internal_solid_infill_speed", coFloats);
     def->label = L("Internal solid infill");
@@ -6904,7 +6925,7 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(true));
 
-    def = this->add("support_line_width", coFloatOrPercent);
+    def = this->add("support_line_width", coFloatsOrPercents);
     def->label = L("Support");
     def->category = L("Quality");
     def->tooltip = L("Line width of support. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -6914,7 +6935,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("support_interface_loop_pattern", coBool);
     def->label = L("Loop pattern interface");
@@ -7419,7 +7441,7 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionStrings{ "" });
 
-    def = this->add("top_surface_line_width", coFloatOrPercent);
+    def = this->add("top_surface_line_width", coFloatsOrPercents);
     def->label = L("Top surface");
     def->category = L("Quality");
     def->tooltip = L("Line width for top surfaces. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -7429,7 +7451,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("top_surface_speed", coFloats);
     def->label = L("Top surface");
@@ -9324,11 +9347,22 @@ const PrintConfigDef print_config_def;
 
 //todo
 std::set<std::string> print_options_with_variant = {
+    "line_width",
+    "outer_wall_line_width",
+    "inner_wall_line_width",
+    "sparse_infill_line_width",
+    "internal_solid_infill_line_width",
+    "top_surface_line_width",
+    "skin_infill_line_width",
+    "skeleton_infill_line_width",
+    "support_line_width",
+    "initial_layer_line_width",
     "initial_layer_speed",
     "initial_layer_infill_speed",
     "outer_wall_speed",
     "inner_wall_speed",
     "small_perimeter_speed",  //coFloatsOrPercents
+    "small_support_perimeter_speed",
     "small_perimeter_threshold",
     "sparse_infill_speed",
     "internal_solid_infill_speed",
@@ -11913,6 +11947,15 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
                     break;
                 }
             break;
+        case coFloatsOrPercents: {
+            const auto *values = static_cast<const ConfigOptionVector<FloatOrPercent> *>(opt);
+            for (size_t index = 0; index < values->values.size(); ++index)
+                if (!values->is_nil(index) && !optdef->is_value_valid(values->values[index].value)) {
+                    out_of_range = true;
+                    break;
+                }
+            break;
+        }
         case coInt:
         {
             auto *iopt = static_cast<const ConfigOptionInt*>(opt);

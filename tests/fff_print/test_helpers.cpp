@@ -246,6 +246,7 @@ DynamicPrintConfig mixed_nozzle_config(std::initializer_list<ConfigBase::SetDese
         // PRINTER-side variant expansion inert for these fixtures, as it has been for all fff
         // tests (activating it rewrites retract/machine vectors sized for defaults).
         { "printer_extruder_variant",        "Direct Drive Standard,Direct Drive Standard" },
+        { "extruder_variant_list",           "Direct Drive Standard;Direct Drive Standard" },
         // FILAMENT-side variant columns are materialized like PresetBundle does for a real
         // project, so per-filament values (temperatures, flow) resolve for every filament.
         { "filament_extruder_variant",       "Direct Drive Standard;Direct Drive Standard" },

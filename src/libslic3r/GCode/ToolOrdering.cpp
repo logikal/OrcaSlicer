@@ -582,8 +582,13 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
         const Layer* target_layer = nullptr;
         for(auto layer : object->layers()){
             for(auto layerm : layer->regions()){
+                const unsigned int filament_id = layerm->region().config().outer_wall_filament_id.value;
+                const size_t tool_id = get_extruder_index_from_filament_id(print.config(), filament_id);
+                const size_t config_index = get_print_config_index_from_filament_id(print.config(), filament_id);
+                const double initial_layer_line_width = print.config().initial_layer_line_width.get_at(config_index).get_abs_value(
+                    print.config().nozzle_diameter.get_at(tool_id));
                 for(auto& expoly : layerm->raw_slices){
-                    if (!offset_ex(expoly, -0.2 * scale_(print.config().initial_layer_line_width)).empty()) {
+                    if (!offset_ex(expoly, -0.2 * scale_(initial_layer_line_width)).empty()) {
                         target_layer = layer;
                         break;
                     }
@@ -600,10 +605,12 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
 
         for (auto layerm : target_layer->regions()) {
             int extruder_id = layerm->region().config().option("outer_wall_filament_id")->getInt();
+            const size_t tool_id = get_extruder_index_from_filament_id(print.config(), unsigned(extruder_id));
+            const size_t config_index = get_print_config_index_from_filament_id(print.config(), unsigned(extruder_id));
 
             for (auto expoly : layerm->raw_slices) {
-                const double nozzle_diameter = print.config().nozzle_diameter.get_at(0);
-                const coordf_t initial_layer_line_width = print.config().get_abs_value("initial_layer_line_width", nozzle_diameter);
+                const double nozzle_diameter = print.config().nozzle_diameter.get_at(tool_id);
+                const coordf_t initial_layer_line_width = print.config().initial_layer_line_width.get_at(config_index).get_abs_value(nozzle_diameter);
 
                 if (offset_ex(expoly, -0.2 * scale_(initial_layer_line_width)).empty())
                     continue;
@@ -646,8 +653,14 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
     const Layer* target_layer = nullptr;
     for(auto layer : object.layers()){
         for(auto layerm : layer->regions()){
+            const unsigned int filament_id = layerm->region().config().outer_wall_filament_id.value;
+            const size_t tool_id = get_extruder_index_from_filament_id(object.print()->config(), filament_id);
+            const size_t config_index = get_print_config_index_from_filament_id(object.print()->config(), filament_id);
+            // Generic line width follows the region's wall tool for this wall-ordering heuristic.
+            const double line_width = object.config().line_width.get_at(config_index).get_abs_value(
+                object.print()->config().nozzle_diameter.get_at(tool_id));
             for(auto& expoly : layerm->raw_slices){
-                if (!offset_ex(expoly, -0.2 * scale_(object.config().line_width)).empty()) {
+                if (!offset_ex(expoly, -0.2 * scale_(line_width)).empty()) {
                     target_layer = layer;
                     break;
                 }
@@ -664,9 +677,11 @@ std::vector<unsigned int> ToolOrdering::generate_first_layer_tool_order(const Pr
 
     for (auto layerm : target_layer->regions()) {
         int extruder_id = layerm->region().config().option("outer_wall_filament_id")->getInt();
+        const size_t tool_id = get_extruder_index_from_filament_id(object.print()->config(), unsigned(extruder_id));
+        const size_t config_index = get_print_config_index_from_filament_id(object.print()->config(), unsigned(extruder_id));
         for (auto expoly : layerm->raw_slices) {
-            const double nozzle_diameter = object.print()->config().nozzle_diameter.get_at(0);
-            const coordf_t line_width = object.config().get_abs_value("line_width", nozzle_diameter);
+            const double nozzle_diameter = object.print()->config().nozzle_diameter.get_at(tool_id);
+            const coordf_t line_width = object.config().line_width.get_at(config_index).get_abs_value(nozzle_diameter);
 
             if (offset_ex(expoly, -0.2 * scale_(line_width)).empty())
                 continue;

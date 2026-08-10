@@ -214,7 +214,12 @@ static std::vector<std::pair<TreeSupportSettings, std::vector<size_t>>> group_me
     const coordf_t radius_sample_resolution = g_config_tree_support_collision_resolution;
 
     // calc the extrudable expolygons of each layer
-    const coordf_t extrusion_width = config.line_width.value;
+    const unsigned int interface_filament_id = std::max(1, config.support_interface_filament.value);
+    const size_t interface_config_index = print_object.print()->get_print_config_index(interface_filament_id);
+    const double nozzle_diameter = print_config.nozzle_diameter.get_at(
+        get_extruder_index_from_filament_id(print_config, interface_filament_id));
+    // The generic width follows the support-interface tool used for overhang detection.
+    const coordf_t extrusion_width = config.line_width.get_at(interface_config_index).get_abs_value(nozzle_diameter);
     const coordf_t extrusion_width_scaled = scale_(extrusion_width);
     tbb::parallel_for(tbb::blocked_range<size_t>(0, print_object.layer_count()),
         [&](const tbb::blocked_range<size_t>& range) {

@@ -73,8 +73,23 @@ DynamicPrintConfig materialized_preset_config(const Preset &preset, const Preset
     }
 
     DynamicPrintConfig result;
-    for (auto it = chain.rbegin(); it != chain.rend(); ++it)
-        result.apply((*it)->config);
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        const DynamicPrintConfig &source_config = (*it)->config;
+        for (const std::string &key : source_config.keys()) {
+            const ConfigOption *source = source_config.option(key);
+            const ConfigOption *target = result.option(key);
+            const ConfigOptionDef *definition = print_config_def.get(key);
+            const bool line_width_key = key == "line_width" ||
+                (key.size() >= 11 && key.compare(key.size() - 11, 11, "_line_width") == 0);
+            const bool legacy_width_type = line_width_key && definition != nullptr && definition->type == coFloatsOrPercents &&
+                (source->type() == coFloatOrPercent ||
+                 (target != nullptr && target->type() == coFloatOrPercent));
+            if (legacy_width_type)
+                result.set_key_value(key, source->clone());
+            else
+                result.apply_only(source_config, {key});
+        }
+    }
     return result;
 }
 

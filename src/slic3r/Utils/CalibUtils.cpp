@@ -115,7 +115,7 @@ void update_speed_parameter( const std::string& key)
 
     float nozzle_diameter = printer_config.option<ConfigOptionFloats>("nozzle_diameter")->values[0];
     float layer_height = print_config.option<ConfigOptionFloat>("layer_height")->value;
-    float line_width = print_config.get_abs_value("line_width", nozzle_diameter);
+    float line_width = print_config.option<ConfigOptionFloatsOrPercentsNullable>("line_width")->get_at(0).get_abs_value(nozzle_diameter);
     if (line_width <= 0.) line_width = Flow::auto_extrusion_width(frPerimeter, nozzle_diameter);
 
     Flow flow = Flow(line_width, layer_height, nozzle_diameter);
@@ -144,7 +144,7 @@ std::vector<double> generate_max_speed_parameter_value(const std::string &key, c
 
     float nozzle_diameter = printer_config.option<ConfigOptionFloats>("nozzle_diameter")->values[0];
     float layer_height    = print_config.option<ConfigOptionFloat>("layer_height")->value;
-    float line_width      = print_config.get_abs_value("line_width", nozzle_diameter);
+    float line_width      = print_config.option<ConfigOptionFloatsOrPercentsNullable>("line_width")->get_at(0).get_abs_value(nozzle_diameter);
 
     Flow flow = Flow(line_width, layer_height, nozzle_diameter);
 
@@ -798,14 +798,16 @@ void CalibUtils::calib_pa_pattern(const CalibInfo &calib_info, Model& model)
     full_config.apply(printer_config);
     const auto& config_pattern = SuggestedConfigCalibPAPattern();
 
-    float nozzle_diameter = printer_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(0);
+    const double nozzle_diameter = full_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(calib_info.extruder_id);
 
     for (const auto& opt : config_pattern.floats_pairs) {
         print_config.set_key_value(opt.first, new ConfigOptionFloatsNullable(opt.second));
     }
 
     int index = get_index_for_extruder_parameter(print_config, "outer_wall_speed", calib_info.extruder_id, calib_info.extruder_type, calib_info.nozzle_volume_type);
-    float wall_speed = CalibPressureAdvance::find_optimal_PA_speed(full_config, print_config.get_abs_value("line_width"), print_config.get_abs_value("layer_height"), calib_info.extruder_id, 0);
+    const double line_width = full_config.option<ConfigOptionFloatsOrPercentsNullable>("line_width")->get_at(index).get_abs_value(nozzle_diameter);
+    float wall_speed = CalibPressureAdvance::find_optimal_PA_speed(
+        full_config, line_width, print_config.get_abs_value("layer_height"), calib_info.extruder_id, 0);
     ConfigOptionFloatsNullable *wall_speed_speed_opt = print_config.option<ConfigOptionFloatsNullable>("outer_wall_speed");
     wall_speed_speed_opt->values[index]              = wall_speed;
 
@@ -859,7 +861,9 @@ void CalibUtils::set_for_auto_pa_model_and_config(const std::vector<CalibInfo> &
 
     for (const CalibInfo &calib_info : calib_infos) {
         int   index      = get_index_for_extruder_parameter(print_config, "outer_wall_speed", calib_info.extruder_id, calib_info.extruder_type, calib_info.nozzle_volume_type);
-        float wall_speed = CalibPressureAdvance::find_optimal_PA_speed(full_config, print_config.get_abs_value("line_width"), print_config.get_abs_value("layer_height"),
+        const double nozzle_diameter = full_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(calib_info.extruder_id);
+        const double line_width = full_config.option<ConfigOptionFloatsOrPercentsNullable>("line_width")->get_at(index).get_abs_value(nozzle_diameter);
+        float wall_speed = CalibPressureAdvance::find_optimal_PA_speed(full_config, line_width, print_config.get_abs_value("layer_height"),
                                                                        calib_info.extruder_id, 0);
 
         ConfigOptionFloatsNullable *wall_speed_speed_opt = print_config.option<ConfigOptionFloatsNullable>("outer_wall_speed");

@@ -14489,7 +14489,7 @@ void Plater::_calib_pa_pattern(const Calib_Params& params)
         // TODO: per-variant cap
         double speed = CalibPressureAdvance::find_optimal_PA_speed(
             wxGetApp().preset_bundle->full_config(),
-            print_config.get_abs_value("line_width", nozzle_diameter),
+            print_config.option<ConfigOptionFloatsOrPercentsNullable>("line_width")->get_at(0).get_abs_value(nozzle_diameter),
             print_config.get_abs_value("layer_height"), 0, 0);
         set_config_values<double, ConfigOptionFloatsNullable>(&print_config, "outer_wall_speed", speed);
 

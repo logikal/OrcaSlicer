@@ -904,8 +904,14 @@ static const float g_min_overhang_percent_for_lift = 0.3f;
 void PrintObject::detect_overhangs_for_lift()
 {
     if (this->set_started(posDetectOverhangsForLift)) {
-        const double nozzle_diameter = m_print->config().nozzle_diameter.get_at(0);
-        const coordf_t line_width = this->config().get_abs_value("line_width", nozzle_diameter);
+        const auto *object_extruder = this->model_object()->config.get().option<ConfigOptionInt>("extruder");
+        const unsigned int filament_id = object_extruder == nullptr || object_extruder->value <= 0 ?
+            1u : unsigned(object_extruder->value);
+        const size_t config_index = m_print->get_print_config_index(filament_id);
+        const double nozzle_diameter = m_print->config().nozzle_diameter.get_at(
+            get_extruder_index_from_filament_id(m_print->config(), filament_id));
+        // The generic width follows the object's base filament for lift detection.
+        const coordf_t line_width = this->config().line_width.get_at(config_index).get_abs_value(nozzle_diameter);
 
         const float min_overlap = line_width * g_min_overhang_percent_for_lift;
         size_t num_layers = this->layer_count();
@@ -3998,7 +4004,7 @@ static void apply_feature_process_projection_for_role(PrintRegionConfig &out, co
         return;
 
     const std::vector<std::string> &allowed = feature_projection_keys(role);
-    const size_t tool_id = get_extruder_index_from_filament_id(
+    const size_t tool_slot = get_print_config_index_from_filament_id(
         print_config, effective_feature_filament(out, in, feature_overrides, role, filament_key));
     for (size_t begin = 0; begin <= serialized->value.size();) {
         const size_t end = serialized->value.find(';', begin);
@@ -4015,7 +4021,7 @@ static void apply_feature_process_projection_for_role(PrintRegionConfig &out, co
                     parsed.set_deserialize_strict(key, std::string(trim_projection_token(entry.substr(equals + 1))));
                     const ConfigOption *source = parsed.option(key);
                     if (auto *target_vector = dynamic_cast<ConfigOptionVectorBase *>(target); target_vector != nullptr)
-                        target_vector->set_at(source, tool_id, 0);
+                        target_vector->set_at(source, tool_slot, 0);
                     else
                         target->set(source);
                     if (explicit_keys != nullptr)
@@ -4100,11 +4106,19 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
                             feature_overrides.inner_wall_filament_id = false;
                     }
                 } else {
-                    if (*my_opt != *(it->second)) {
-                        if (my_opt->is_scalar() || variant_index.empty() || (print_options_with_variant.find(it->first) == print_options_with_variant.end()))
+                    const bool types_differ = my_opt->type() != it->second->type();
+                    if (types_differ || *my_opt != *(it->second)) {
+                        auto *target_vector = dynamic_cast<ConfigOptionVectorBase *>(my_opt);
+                        if (target_vector != nullptr && it->second->is_scalar() &&
+                            print_options_with_variant.find(it->first) != print_options_with_variant.end()) {
+                            // Legacy scalar object / volume overrides broadcast to every variant column.
+                            const size_t count = std::max<size_t>(1, std::max(target_vector->size(), variant_index.size()));
+                            for (size_t index = 0; index < count; ++index)
+                                target_vector->set_at(it->second.get(), index, 0);
+                        } else if (my_opt->is_scalar() || variant_index.empty() ||
+                                   print_options_with_variant.find(it->first) == print_options_with_variant.end()) {
                             my_opt->set(it->second.get());
-                            //my_opt->set(it->second.get());
-                        else {
+                        } else {
                             ConfigOptionVectorBase* opt_vec_src = static_cast<ConfigOptionVectorBase*>(my_opt);
                             const ConfigOptionVectorBase* opt_vec_dest = static_cast<const ConfigOptionVectorBase*>(it->second.get());
                             opt_vec_src->set_to_index(opt_vec_dest, variant_index, 1);
@@ -4231,14 +4245,14 @@ void apply_filament_process_delta(PrintRegionConfig &config, const PrintConfig &
 
     base_filament = std::max(base_filament, 1u);
     const DynamicPrintConfig &base_delta = filament_process_delta(print_config, base_filament, cache);
-    const size_t base_tool = get_extruder_index_from_filament_id(print_config, base_filament);
+    const size_t base_tool_slot = get_print_config_index_from_filament_id(print_config, base_filament);
     for (const std::string &key : base_delta.keys()) {
         if (role_keys.count(key) != 0 || key == "layer_height" || key == "wall_layer_height" ||
             key.find("_process_") != std::string::npos ||
             std::any_of(keys_extruders.begin(), keys_extruders.end(), [&key](std::string_view item) { return item == key; }))
             continue;
         if (config.option(key, false) != nullptr)
-            apply_delta_key(config, base_delta, key, base_tool, explicit_keys);
+            apply_delta_key(config, base_delta, key, base_tool_slot, explicit_keys);
     }
 
     if (object_layer_height <= 0.) {
@@ -4248,9 +4262,9 @@ void apply_filament_process_delta(PrintRegionConfig &config, const PrintConfig &
     for (FeatureRole role : roles) {
         const unsigned int filament = filament_for_role(config, role);
         const DynamicPrintConfig &delta = filament_process_delta(print_config, filament, cache);
-        const size_t tool_id = get_extruder_index_from_filament_id(print_config, filament);
+        const size_t tool_slot = get_print_config_index_from_filament_id(print_config, filament);
         for (const std::string &key : filament_delta_keys_for_role(role))
-            apply_delta_key(config, delta, key, tool_id, explicit_keys);
+            apply_delta_key(config, delta, key, tool_slot, explicit_keys);
 
         const auto *height = delta.option<ConfigOptionFloat>("layer_height");
         const char *height_key = height_key_for_role(role);

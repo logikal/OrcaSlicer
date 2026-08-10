@@ -799,9 +799,10 @@ void VFA_Test_Dlg::on_start(wxCommandEvent& event)
         const double machine_min_lh  = get_at(printer_config.option<ConfigOptionFloats>("min_layer_height"), 0.0);
         const double machine_max_lh  = get_at(printer_config.option<ConfigOptionFloats>("max_layer_height"), 0.0);
 
-        double line_width = print_config.get_abs_value("outer_wall_line_width", nozzle_diameter);
+        // print_config lacks printer keys; resolve percent widths against the local nozzle diameter.
+        double line_width = print_config.option<ConfigOptionFloatsOrPercentsNullable>("outer_wall_line_width")->get_at(0).get_abs_value(nozzle_diameter);
         if (line_width <= 0.0)
-            line_width = print_config.get_abs_value("line_width", nozzle_diameter);
+            line_width = print_config.option<ConfigOptionFloatsOrPercentsNullable>("line_width")->get_at(0).get_abs_value(nozzle_diameter);
         if (line_width <= 0.0)
             line_width = nozzle_diameter;
 

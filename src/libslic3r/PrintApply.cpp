@@ -306,6 +306,21 @@ static t_config_option_keys full_print_config_diffs(const DynamicPrintConfig &cu
     return full_config_diff;
 }
 
+static void normalize_legacy_line_width_vectors(DynamicPrintConfig &config)
+{
+    for (const std::string &key : print_options_with_variant) {
+        const ConfigOptionDef *definition = print_config_def.get(key);
+        const auto *legacy = dynamic_cast<const ConfigOptionFloatOrPercent *>(config.option(key));
+        const bool line_width_key = key == "line_width" ||
+            (key.size() >= 11 && key.compare(key.size() - 11, 11, "_line_width") == 0);
+        if (!line_width_key || definition == nullptr || definition->type != coFloatsOrPercents || legacy == nullptr)
+            continue;
+        auto *values = new ConfigOptionFloatsOrPercentsNullable;
+        values->values.emplace_back(legacy->value, legacy->percent);
+        config.set_key_value(key, values);
+    }
+}
+
 static bool is_printable_filament_changed(const DynamicPrintConfig& new_full_config, const Polygon& old_poly, const Polygon& new_poly)
 {
     if (old_poly != new_poly) {
@@ -1187,6 +1202,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     // effective nozzle/min/max values; dropping the consumed key also keeps an empty overlay
     // byte-identical in the exported full-config block.
     new_full_config.erase("project_nozzle_diameter");
+
+    // Programmatic and old project configs may still carry pre-promotion scalar widths.
+    // Normalize them before variant expansion, diffing, and static-config application.
+    normalize_legacy_line_width_vectors(new_full_config);
 
     // Normalize the config.
 	new_full_config.option("print_settings_id",            true);

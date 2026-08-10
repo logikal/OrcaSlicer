@@ -2639,14 +2639,14 @@ void TabPrint::build()
         optgroup->append_single_option_line("initial_layer_print_height","quality_settings_layer_height");
 
         optgroup = page->new_optgroup(L("Line width"), L"param_line_width");
-        optgroup->append_single_option_line("line_width","quality_settings_line_width");
-        optgroup->append_single_option_line("initial_layer_line_width","quality_settings_line_width#first-layer");
-        optgroup->append_single_option_line("outer_wall_line_width","quality_settings_line_width#outer-wall");
-        optgroup->append_single_option_line("inner_wall_line_width","quality_settings_line_width#inner-wall");
-        optgroup->append_single_option_line("top_surface_line_width","quality_settings_line_width#top-surface");
-        optgroup->append_single_option_line("sparse_infill_line_width","quality_settings_line_width#sparse-infill");
-        optgroup->append_single_option_line("internal_solid_infill_line_width","quality_settings_line_width#internal-solid-infill");
-        optgroup->append_single_option_line("support_line_width","quality_settings_line_width#support");
+        optgroup->append_single_option_line("line_width","quality_settings_line_width", 0);
+        optgroup->append_single_option_line("initial_layer_line_width","quality_settings_line_width#first-layer", 0);
+        optgroup->append_single_option_line("outer_wall_line_width","quality_settings_line_width#outer-wall", 0);
+        optgroup->append_single_option_line("inner_wall_line_width","quality_settings_line_width#inner-wall", 0);
+        optgroup->append_single_option_line("top_surface_line_width","quality_settings_line_width#top-surface", 0);
+        optgroup->append_single_option_line("sparse_infill_line_width","quality_settings_line_width#sparse-infill", 0);
+        optgroup->append_single_option_line("internal_solid_infill_line_width","quality_settings_line_width#internal-solid-infill", 0);
+        optgroup->append_single_option_line("support_line_width","quality_settings_line_width#support", 0);
         optgroup->append_single_option_line("bridge_line_width","quality_settings_line_width#bridge");
 
         optgroup = page->new_optgroup(L("Seam"), L"param_seam");
@@ -2805,8 +2805,8 @@ void TabPrint::build()
         optgroup->append_single_option_line("skeleton_infill_density", "strength_settings_patterns#locked-zag");
         optgroup->append_single_option_line("infill_lock_depth", "strength_settings_patterns#locked-zag");
         optgroup->append_single_option_line("skin_infill_depth", "strength_settings_patterns#locked-zag");
-        optgroup->append_single_option_line("skin_infill_line_width", "strength_settings_patterns#locked-zag");
-        optgroup->append_single_option_line("skeleton_infill_line_width", "strength_settings_patterns#locked-zag");
+        optgroup->append_single_option_line("skin_infill_line_width", "strength_settings_patterns#locked-zag", 0);
+        optgroup->append_single_option_line("skeleton_infill_line_width", "strength_settings_patterns#locked-zag", 0);
         optgroup->append_single_option_line("symmetric_infill_y_axis", "strength_settings_infill#symmetric-infill-y-axis");
         optgroup->append_single_option_line("infill_shift_step", "strength_settings_patterns#cross-hatch");
         optgroup->append_single_option_line("lateral_lattice_angle_1", "strength_settings_patterns#lateral-lattice");
@@ -2855,7 +2855,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("ironing_speed", "speed_settings_other_layers_speed#ironing-speed");
         optgroup->append_single_option_line("support_speed", "speed_settings_other_layers_speed#support", 0);
         optgroup->append_single_option_line("support_interface_speed", "speed_settings_other_layers_speed#support-interface", 0);
-        optgroup->append_single_option_line("small_support_perimeter_speed", "speed_settings_other_layers_speed#small-tree-support-perimeters", 0);
+        optgroup->append_single_option_line("small_support_perimeter_speed", "speed_settings_other_layers_speed#small-tree-support-perimeters");
         optgroup->append_single_option_line("small_support_perimeter_threshold", "speed_settings_other_layers_speed#small-tree-support-perimeters-threshold", 0);
         optgroup = page->new_optgroup(L("Overhang speed"), L"param_overhang_speed", 15);
         optgroup->append_single_option_line("enable_overhang_speed", "speed_settings_overhang_speed#slow-down-for-overhang", 0);

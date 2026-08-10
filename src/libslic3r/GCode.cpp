@@ -653,11 +653,12 @@ static std::vector<Vec2d> get_path_of_change_filament(const Print& print)
     static float get_outer_wall_volumetric_speed(const FullPrintConfig& config, const Print& print, int filament_id, int filament_variant_idx, int extruder_id) {
         float outer_wall_volumetric_speed = 0;
         float filament_max_volumetric_speed = config.filament_max_volumetric_speed.get_at(filament_variant_idx);
-        const double filament_diameter = config.filament_diameter.get_at(filament_id);
-        float outer_wall_line_width = print.default_region_config().get_abs_value("outer_wall_line_width", filament_diameter);
+        const double nozzle_diameter = config.nozzle_diameter.get_at(extruder_id);
+        float outer_wall_line_width = print.default_region_config().outer_wall_line_width.get_at(filament_variant_idx).get_abs_value(nozzle_diameter);
         if (outer_wall_line_width == 0.0) {
-            float default_line_width = print.default_object_config().get_abs_value("line_width", filament_diameter);
-            outer_wall_line_width = default_line_width == 0.0 ? filament_diameter : default_line_width;
+            // The generic width follows the same wall tool and variant column.
+            float default_line_width = print.default_object_config().line_width.get_at(filament_variant_idx).get_abs_value(nozzle_diameter);
+            outer_wall_line_width = default_line_width == 0.0 ? nozzle_diameter : default_line_width;
         }
         Flow outer_wall_flow = Flow(outer_wall_line_width, config.layer_height, config.nozzle_diameter.get_at(extruder_id));
         float outer_wall_speed = print.default_region_config().outer_wall_speed.get_at(extruder_id);
@@ -3119,7 +3120,7 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
         file.write_format("; top infill extrusion width = %.2fmm\n",          region.flow(*first_object, frTopSolidInfill,    layer_height).width());
         if (print.has_support_material())
             file.write_format("; support material extrusion width = %.2fmm\n", support_material_flow(first_object).width());
-        if (print.config().initial_layer_line_width.value > 0)
+        if (print.config().initial_layer_line_width.get_at(print.get_print_config_index(region.extruder(frPerimeter))).value > 0)
             file.write_format("; first layer extrusion width = %.2fmm\n",   region.flow(*first_object, frPerimeter, initial_layer_print_height, true).width());
         file.write_format("\n");
     }
@@ -6894,8 +6895,9 @@ std::string GCode::extrude_loop(const ExtrusionLoop&        loop_ref,
     }
 
     if (enable_seam_slope && m_config.seam_slope_conditional.value && m_config.scarf_overhang_threshold.value > 0.0f) {
-        const auto _line_width = loop.role() == erExternalPerimeter ? m_config.outer_wall_line_width.get_abs_value(nozzle_diameter) :
-                                                                      m_config.inner_wall_line_width.get_abs_value(nozzle_diameter);
+        const size_t config_index = get_nozzle_config_index(m_writer.filament()->id());
+        const auto _line_width = loop.role() == erExternalPerimeter ? m_config.outer_wall_line_width.get_at(config_index).get_abs_value(nozzle_diameter) :
+                                                                      m_config.inner_wall_line_width.get_at(config_index).get_abs_value(nozzle_diameter);
         enable_seam_slope      = seam_overhang < m_config.scarf_overhang_threshold.value * 0.01f * _line_width;
     }
 

@@ -645,6 +645,12 @@ Option ConfigOptionsGroup::get_option(const std::string& opt_key, int opt_index 
         std::cerr << "No " << opt_key << " in ConfigOptionsGroup config.\n";
     }
 
+    if (opt_index == -1 && (print_options_with_variant.count(opt_key) > 0 ||
+                            filament_options_with_variant.count(opt_key) > 0 ||
+                            printer_options_with_variant_1.count(opt_key) > 0 ||
+                            printer_options_with_variant_2.count(opt_key) > 0))
+        opt_index = 0;
+
     std::string opt_id = opt_index == -1 ? opt_key : opt_key + "#" + std::to_string(opt_index);
     std::pair<std::string, int> pair(opt_key, opt_index);
     m_opt_map.emplace(opt_id, pair);
