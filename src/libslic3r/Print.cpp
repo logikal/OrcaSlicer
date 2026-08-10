@@ -1413,7 +1413,8 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             layer_height_profiles.assign(m_objects.size(), std::vector<coordf_t>());
         std::vector<coordf_t>   &profile      = layer_height_profiles[print_object_idx];
         if (profile.empty())
-            PrintObject::update_layer_height_profile(*print_object.model_object(), print_object.slicing_parameters(), profile);
+            PrintObject::update_layer_height_profile(*print_object.model_object(), print_object.slicing_parameters(),
+                                                     profile, print_object.cadence_zones());
         return profile;
     };
 
@@ -1459,10 +1460,13 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             print_object.has_support_material() && is_tree(print_object.config().support_type.value) && (print_object.config().support_style.value == smsTreeOrganic || 
                 // Orca: use organic as default
                 print_object.config().support_style.value == smsDefault) &&
-            print_object.model_object()->has_custom_layering()) {
+            (print_object.model_object()->has_custom_layering() || print_object.slicing_parameters().cadence_zone_digest != 0)) {
             if (const std::vector<coordf_t> &layers = layer_height_profile(print_object_idx); ! layers.empty())
-                if (! check_object_layers_fixed(print_object.slicing_parameters(), layers))
+                if (! check_object_layers_fixed(print_object.slicing_parameters(), layers)) {
+                    if (print_object.slicing_parameters().cadence_zone_digest != 0)
+                        return {_u8L("Cadence zones are not supported with Organic supports. Use normal supports or uniform feature cadence.") };
                     return {_u8L("Variable layer height is not supported with Organic supports.") };
+                }
         }
 
     if (this->has_wipe_tower() && ! m_objects.empty()) {
@@ -1929,6 +1933,22 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             }
 
             const bool cadence_active = slicing_params.cadence_ratio > 1;
+            const auto cadence_heights_for_region = [&](const PrintRegion &region) {
+                std::vector<double> heights;
+                if (!cadence_active)
+                    heights.push_back(layer_height);
+                else if (slicing_params.cadence_zone_digest == 0)
+                    heights.push_back(slicing_params.layer_height);
+                else {
+                    if (object->region_intersects_cadence_zone(region, true))
+                        heights.push_back(slicing_params.layer_height);
+                    if (object->region_intersects_cadence_zone(region, false))
+                        heights.push_back(base_layer_height);
+                    if (heights.empty())
+                        heights.push_back(slicing_params.layer_height);
+                }
+                return heights;
+            };
             if (!cadence_active) {
                 if (layer_height > min_nozzle_diameter)
                     return {L("Layer height cannot exceed nozzle diameter."), object, "layer_height"};
@@ -2000,11 +2020,17 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                                 object, "wall_process_policy"};
                     }
 
+                    for (double wall_height : cadence_heights_for_region(region)) {
+                        if (StringObjectException error = validate_feature_height(
+                                object, L("Outer wall"), wall_height,
+                                region_config.outer_wall_filament_id.value, "wall_layer_height"); !error.string.empty())
+                            return error;
+                        if (StringObjectException error = validate_feature_height(
+                                object, L("Inner wall"), wall_height,
+                                region_config.inner_wall_filament_id.value, "wall_layer_height"); !error.string.empty())
+                            return error;
+                    }
                     for (StringObjectException error : {
-                             validate_feature_height(object, L("Outer wall"), slicing_params.layer_height,
-                                                     region_config.outer_wall_filament_id.value, "wall_layer_height"),
-                             validate_feature_height(object, L("Inner wall"), slicing_params.layer_height,
-                                                     region_config.inner_wall_filament_id.value, "wall_layer_height"),
                              validate_feature_height(object, L("Sparse infill"), sparse_feature_height,
                                                      region_config.sparse_infill_filament_id.value, "layer_height"),
                              validate_feature_height(object, L("Internal solid infill"), internal_solid_feature_height,
@@ -2043,11 +2069,12 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     else                                                               filament_id = rc.sparse_infill_filament_id.value;
                     const double role_nozzle = m_config.nozzle_diameter.get_at(
                         get_extruder_index_from_filament_id(m_config, filament_id));
-                    if (!validate_extrusion_width_for_nozzle(
-                            rc, opt_key,
-                            cadence_active && is_wall_key ? slicing_params.layer_height : layer_height,
-                            role_nozzle, role_nozzle, err_msg))
-		            	return  {err_msg, object, opt_key};
+                    const std::vector<double> heights = is_wall_key ? cadence_heights_for_region(region) :
+                                                                     std::vector<double>{layer_height};
+                    for (double height : heights)
+                        if (!validate_extrusion_width_for_nozzle(
+                                rc, opt_key, height, role_nozzle, role_nozzle, err_msg))
+                            return {err_msg, object, opt_key};
                 }
 
             const bool allow_thin_bridge_width = object->config().thick_bridges && object->config().thick_internal_bridges;
@@ -2062,13 +2089,13 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                         err_msg = L("Bridge line width must not exceed nozzle diameter");
                         return { err_msg, object, "bridge_line_width" };
                     }
-                    // Bridges are excluded from cadence recombination, so on a refined grid
-                    // they print at the fine layer height — validate against that.
-                    const double bridge_layer_height = cadence_active ? slicing_params.layer_height : layer_height;
-                    if (!allow_thin_bridge_width && bridge_width <= bridge_layer_height) {
-                        err_msg = L("Line width too small");
-                        return { err_msg, object, "bridge_line_width" };
-                    }
+                    // Bridges are excluded from recombination, but zoned objects may contain
+                    // bridge geometry on both the base and fine grids.
+                    for (double bridge_layer_height : cadence_heights_for_region(region))
+                        if (!allow_thin_bridge_width && bridge_width <= bridge_layer_height) {
+                            err_msg = L("Line width too small");
+                            return { err_msg, object, "bridge_line_width" };
+                        }
                 }
             }
         }

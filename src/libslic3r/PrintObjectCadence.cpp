@@ -108,6 +108,8 @@ float PrintObject::infill_combination_clearance(const LayerRegion &layerm, Infil
 
 void PrintObject::recombine_feature_cadence()
 {
+    // Mixed cadence zones are handled by the thickness-driven groups below; base-height
+    // layers naturally become one-layer groups and take the self-skip path.
     if (m_slicing_params.cadence_ratio <= 1 || m_layers.size() < 2)
         return;
 

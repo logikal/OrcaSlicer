@@ -67,7 +67,8 @@ SlicingParameters SlicingParameters::create_from_config(
     const std::vector<unsigned int> &object_extruders,
     const Vec3d                     &object_shrinkage_compensation,
     const FeatureCadencePlan        *cadence_plan,
-    const std::vector<unsigned int> &fine_cadence_extruders)
+    const std::vector<unsigned int> &fine_cadence_extruders,
+    bool                             cadence_zones_active)
 {
     coordf_t initial_layer_print_height                      = (print_config.initial_layer_print_height.value <= 0) ? 
         object_config.layer_height.value : print_config.initial_layer_print_height.value;
@@ -157,6 +158,10 @@ SlicingParameters SlicingParameters::create_from_config(
 
     params.min_layer_height = std::min(params.min_layer_height, params.layer_height);
     params.max_layer_height = std::max(params.max_layer_height, params.layer_height);
+    if (cadence_zones_active) {
+        params.min_layer_height = std::min(params.min_layer_height, params.layer_height);
+        params.max_layer_height = std::max(params.max_layer_height, params.base_layer_height);
+    }
 
     /* -------------------------------------------------- */
     /*                ORCA: Gap assignment                */

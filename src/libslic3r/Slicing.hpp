@@ -4,6 +4,7 @@
 #define slic3r_Slicing_hpp_
 
 #include <cstring>
+#include <cstdint>
 #include <map>
 #include <set>
 #include <type_traits>
@@ -38,7 +39,8 @@ struct SlicingParameters
          const std::vector<unsigned int> &object_extruders,
          const Vec3d                     &object_shrinkage_compensation,
          const FeatureCadencePlan        *cadence_plan = nullptr,
-         const std::vector<unsigned int> &fine_cadence_extruders = {});
+         const std::vector<unsigned int> &fine_cadence_extruders = {},
+         bool                             cadence_zones_active = false);
 
     // Has any raft layers?
     bool        has_raft() const { return raft_layers() > 0; }
@@ -72,6 +74,8 @@ struct SlicingParameters
     // The object's process layer height before feature cadence refines the shared Z grid.
     coordf_t    base_layer_height { 0 };
     int         cadence_ratio { 1 };
+    // Hash of a mixed base/fine cadence-zone table. Zero means uniform layering.
+    uint64_t    cadence_zone_digest { 0 };
     // Minimum / maximum layer height, to be used for the automatic adaptive layer height algorithm,
     // or by an interactive layer height editor.
     coordf_t    min_layer_height { 0 };
@@ -133,6 +137,7 @@ inline bool equal_layering(const SlicingParameters &sp1, const SlicingParameters
             sp1.layer_height                        == sp2.layer_height                         &&
             sp1.base_layer_height                   == sp2.base_layer_height                    &&
             sp1.cadence_ratio                       == sp2.cadence_ratio                        &&
+            sp1.cadence_zone_digest                 == sp2.cadence_zone_digest                 &&
             sp1.min_layer_height                    == sp2.min_layer_height                     &&
             sp1.max_layer_height                    == sp2.max_layer_height                     &&
 //            sp1.max_suport_layer_height             == sp2.max_suport_layer_height              &&

@@ -333,6 +333,13 @@ struct FeatureCadencePlan
     int    ratio       = 1;
 };
 
+struct CadenceZone
+{
+    double lo   = 0.;
+    double hi   = 0.;
+    bool   fine = false;
+};
+
 class PrintObject : public PrintObjectBaseWithState<Print, PrintObjectStep, posCount>
 {
 private: // Prevents erroneous use by other classes.
@@ -434,6 +441,8 @@ public:
     // Initialize the layer_height_profile from the model_object's layer_height_profile, from model_object's layer height table, or from slicing parameters.
     // Returns true, if the layer_height_profile was changed.
     static bool     update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters, std::vector<coordf_t> &layer_height_profile);
+    static bool     update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters,
+                                                std::vector<coordf_t> &layer_height_profile, const std::vector<CadenceZone> &cadence_zones);
 
     // Collect the slicing parameters, to be used by variable layer thickness algorithm,
     // by the interactive layer height editor and by the printing process itself.
@@ -448,6 +457,9 @@ public:
     //FIXME returing all possible regions before slicing, thus some of the regions may not be slicing at the end.
     std::vector<std::reference_wrapper<const PrintRegion>> all_regions() const;
     const PrintObjectRegions*   shared_regions() const throw() { return m_shared_regions; }
+    const std::vector<CadenceZone>& cadence_zones() const { return m_cadence_zones; }
+    bool                        layer_z_in_fine_zone(coordf_t print_z) const;
+    bool                        region_intersects_cadence_zone(const PrintRegion &region, bool fine) const;
 
     bool                        has_support()           const { return m_config.enable_support || m_config.enforce_support_layers > 0; }
     bool                        has_raft()              const { return m_config.raft_layers > 0; }
@@ -583,6 +595,7 @@ private:
     PrintObjectRegions                     *m_shared_regions { nullptr };
 
     SlicingParameters                       m_slicing_params;
+    std::vector<CadenceZone>                m_cadence_zones;
     LayerPtrs                               m_layers;
     SupportLayerPtrs                        m_support_layers;
     // BBS

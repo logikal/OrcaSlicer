@@ -29,6 +29,7 @@
 
 #include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <float.h>
 #include <iterator>
 #include <limits>
@@ -2232,7 +2233,8 @@ void PrintObject::discover_vertical_shells()
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
     size_t   num_layers       = spiral_mode ?
         std::min(size_t(scaled_shell_layers(this->printing_region(0).config().bottom_shell_layers.value,
-                                            m_slicing_params.cadence_ratio,
+                                            !m_layers.empty() && layer_z_in_fine_zone(m_layers.front()->print_z) ?
+                                                m_slicing_params.cadence_ratio : 1,
                                             feature_height_for_role(this->printing_region(0).config(), FeatureRole::BottomSurface,
                                                                   m_slicing_params.base_layer_height),
                                             m_slicing_params.base_layer_height)), m_layers.size()) :
@@ -2438,7 +2440,7 @@ void PrintObject::discover_vertical_shells()
                     };
                     static constexpr const bool one_more_layer_below_top_bottom_surfaces = false;
                     if (int n_top_layers = scaled_shell_layers(region_config.top_shell_layers.value,
-                                                               m_slicing_params.cadence_ratio,
+                                                               layer_z_in_fine_zone(layer->print_z) ? m_slicing_params.cadence_ratio : 1,
                                                                feature_height_for_role(region_config, FeatureRole::TopSurface,
                                                                                      m_slicing_params.base_layer_height),
                                                                m_slicing_params.base_layer_height); n_top_layers > 0) {
@@ -2471,7 +2473,7 @@ void PrintObject::discover_vertical_shells()
                                 combine_holes(cache_top_botom_regions[i].holes);
                     }
                     if (int n_bottom_layers = scaled_shell_layers(region_config.bottom_shell_layers.value,
-                                                                  m_slicing_params.cadence_ratio,
+                                                                  layer_z_in_fine_zone(layer->print_z) ? m_slicing_params.cadence_ratio : 1,
                                                                   feature_height_for_role(region_config, FeatureRole::BottomSurface,
                                                                                      m_slicing_params.base_layer_height),
                                                                   m_slicing_params.base_layer_height); n_bottom_layers > 0) {
@@ -4353,6 +4355,113 @@ static void append_fine_cadence_extruders(const PrintConfig &print_config, const
     }
 }
 
+static bool region_uses_fine_cadence(const PrintRegionConfig &region_config, double base_height)
+{
+    for (FeatureRole role : {FeatureRole::Wall, FeatureRole::SparseInfill, FeatureRole::InternalSolid,
+                             FeatureRole::TopSurface, FeatureRole::BottomSurface})
+        if (feature_height_for_role(region_config, role, base_height) < base_height - EPSILON)
+            return true;
+    return false;
+}
+
+static std::vector<CadenceZone> compute_cadence_zones(const PrintObject &object, const FeatureCadencePlan &plan,
+                                                       double first_layer_height, double object_height)
+{
+    if (plan.ratio <= 1 || object.shared_regions() == nullptr || object_height <= EPSILON)
+        return {};
+
+    std::vector<std::pair<double, double>> fine_extents;
+    const auto append_extent = [&](const PrintRegion *region, const PrintObjectRegions::BoundingBox *bbox) {
+        if (region == nullptr || bbox == nullptr || !region_uses_fine_cadence(region->config(), plan.base_height))
+            return;
+        const double lo = std::max(0., double(bbox->min().z()));
+        const double hi = std::min(object_height, double(bbox->max().z()));
+        if (lo + EPSILON < hi)
+            fine_extents.emplace_back(lo, hi);
+    };
+
+    for (const PrintObjectRegions::LayerRangeRegions &layer_range : object.shared_regions()->layer_ranges) {
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions)
+            append_extent(volume_region.region, volume_region.bbox);
+        for (const PrintObjectRegions::PaintedRegion &painted_region : layer_range.painted_regions) {
+            if (painted_region.parent < 0 || painted_region.parent >= int(layer_range.volume_regions.size()))
+                continue;
+            // Painted regions have no independent bbox. Conservatively use the parent volume's full Z extent.
+            append_extent(painted_region.region, layer_range.volume_regions[painted_region.parent].bbox);
+        }
+    }
+    if (fine_extents.empty())
+        return {};
+
+    std::sort(fine_extents.begin(), fine_extents.end());
+    std::vector<std::pair<double, double>> merged;
+    for (const auto &extent : fine_extents) {
+        if (merged.empty() || extent.first > merged.back().second + EPSILON)
+            merged.push_back(extent);
+        else
+            merged.back().second = std::max(merged.back().second, extent.second);
+    }
+
+    const bool whole_object_fine = merged.size() == 1 && merged.front().first <= EPSILON &&
+                                   merged.front().second >= object_height - EPSILON;
+    if (whole_object_fine)
+        return {{0., object_height, true}};
+
+    std::vector<std::pair<double, double>> snapped;
+    for (const auto &[extent_lo, extent_hi] : merged) {
+        // Bounding boxes are float-valued, so tolerate their representational noise when an
+        // extent is already on an exact base-layer boundary.
+        constexpr double snap_epsilon_in_steps = 1e-2;
+        double lo = std::floor(extent_lo / plan.base_height + snap_epsilon_in_steps) * plan.base_height;
+        double hi = std::ceil(extent_hi / plan.base_height - snap_epsilon_in_steps) * plan.base_height;
+        lo = std::max(first_layer_height, std::max(0., lo));
+        hi = std::min(object_height, hi);
+        if (lo + EPSILON >= hi)
+            continue;
+        if (!snapped.empty() && lo <= snapped.back().second + EPSILON)
+            snapped.back().second = std::max(snapped.back().second, hi);
+        else
+            snapped.emplace_back(lo, hi);
+    }
+    if (snapped.empty())
+        return {};
+
+    std::vector<CadenceZone> zones;
+    double cursor = 0.;
+    for (const auto &[lo, hi] : snapped) {
+        if (cursor + EPSILON < lo)
+            zones.push_back({cursor, lo, false});
+        zones.push_back({lo, hi, true});
+        cursor = hi;
+    }
+    if (cursor + EPSILON < object_height)
+        zones.push_back({cursor, object_height, false});
+    return zones;
+}
+
+static uint64_t cadence_zone_digest(const std::vector<CadenceZone> &zones)
+{
+    const bool has_base = std::any_of(zones.begin(), zones.end(), [](const CadenceZone &zone) { return !zone.fine; });
+    const bool has_fine = std::any_of(zones.begin(), zones.end(), [](const CadenceZone &zone) { return zone.fine; });
+    if (!has_base || !has_fine)
+        return 0;
+
+    uint64_t digest = 1469598103934665603ULL;
+    const auto append = [&digest](const void *data, size_t size) {
+        const auto *bytes = static_cast<const unsigned char *>(data);
+        for (size_t i = 0; i < size; ++i) {
+            digest ^= bytes[i];
+            digest *= 1099511628211ULL;
+        }
+    };
+    for (const CadenceZone &zone : zones) {
+        append(&zone.lo, sizeof(zone.lo));
+        append(&zone.hi, sizeof(zone.hi));
+        append(&zone.fine, sizeof(zone.fine));
+    }
+    return digest == 0 ? 1 : digest;
+}
+
 void PrintObject::generate_support_preview()
 {
     POProfiler profiler;
@@ -4378,10 +4487,53 @@ void PrintObject::update_slicing_parameters()
                 append_fine_cadence_extruders(this->print()->config(), region.config(), plan, fine_cadence_extruders);
             sort_remove_duplicates(fine_cadence_extruders);
         }
+        const double first_layer_height = this->print()->config().initial_layer_print_height.value <= 0. ?
+            m_config.layer_height.value : this->print()->config().initial_layer_print_height.value;
+        m_cadence_zones = compute_cadence_zones(*this, plan, first_layer_height, this->model_object()->max_z());
+        const bool cadence_zones_active =
+            std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [](const CadenceZone &zone) { return zone.fine; }) &&
+            std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [](const CadenceZone &zone) { return !zone.fine; });
         m_slicing_params = SlicingParameters::create_from_config(
             this->print()->config(), m_config, this->model_object()->max_z(), this->object_extruders(),
-            this->print()->shrinkage_compensation(), &plan, fine_cadence_extruders);
+            this->print()->shrinkage_compensation(), &plan, fine_cadence_extruders, cadence_zones_active);
+        m_slicing_params.cadence_zone_digest = cadence_zone_digest(m_cadence_zones);
     }
+}
+
+bool PrintObject::layer_z_in_fine_zone(coordf_t print_z) const
+{
+    if (m_cadence_zones.empty())
+        return m_slicing_params.cadence_ratio > 1;
+    return std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [print_z](const CadenceZone &zone) {
+        return zone.fine && print_z > zone.lo + EPSILON && print_z <= zone.hi + EPSILON;
+    });
+}
+
+bool PrintObject::region_intersects_cadence_zone(const PrintRegion &region, bool fine) const
+{
+    const auto bbox_intersects = [&](const PrintObjectRegions::BoundingBox *bbox) {
+        if (bbox == nullptr)
+            return false;
+        const double lo = bbox->min().z();
+        const double hi = bbox->max().z();
+        return std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [&](const CadenceZone &zone) {
+            // Region bboxes are deliberately expanded by EPSILON in PrintApply. Require
+            // overlap beyond that expansion so touching a zone boundary is not geometry in
+            // both adjacent zones.
+            return zone.fine == fine && hi > zone.lo + 2. * EPSILON && lo < zone.hi - 2. * EPSILON;
+        });
+    };
+    for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges) {
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions)
+            if (volume_region.region == &region && bbox_intersects(volume_region.bbox))
+                return true;
+        for (const PrintObjectRegions::PaintedRegion &painted_region : layer_range.painted_regions)
+            if (painted_region.region == &region && painted_region.parent >= 0 &&
+                painted_region.parent < int(layer_range.volume_regions.size()) &&
+                bbox_intersects(layer_range.volume_regions[painted_region.parent].bbox))
+                return true;
+    }
+    return false;
 }
 
 FeatureCadencePlan PrintObject::compute_feature_cadence_plan() const
@@ -4470,7 +4622,16 @@ std::vector<unsigned int> PrintObject::object_extruders() const
     return extruders;
 }
 
-bool PrintObject::update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters, std::vector<coordf_t> &layer_height_profile)
+bool PrintObject::update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters,
+                                              std::vector<coordf_t> &layer_height_profile)
+{
+    // The GUI layer editor has no PrintObjectRegions and therefore intentionally shows the uniform grid in D6.a.
+    return update_layer_height_profile(model_object, slicing_parameters, layer_height_profile, {});
+}
+
+bool PrintObject::update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters,
+                                              std::vector<coordf_t> &layer_height_profile,
+                                              const std::vector<CadenceZone> &cadence_zones)
 {
     bool updated = false;
 
@@ -4491,7 +4652,28 @@ bool PrintObject::update_layer_height_profile(const ModelObject &model_object, c
             std::abs(layer_height_profile[layer_height_profile.size() - 2] - slicing_parameters.object_print_z_uncompensated_max + slicing_parameters.object_print_z_min) > 1e-3))
         layer_height_profile.clear();
 
-    if (layer_height_profile.empty() || layer_height_profile[1] != slicing_parameters.first_object_layer_height) {
+    const bool cadence_zones_active = slicing_parameters.cadence_zone_digest != 0 && model_object.layer_height_profile.empty();
+    if (cadence_zones_active &&
+        (layer_height_profile.empty() || layer_height_profile[1] != slicing_parameters.first_object_layer_height)) {
+        const auto append = [&layer_height_profile](coordf_t z, coordf_t height) {
+            if (layer_height_profile.size() >= 2 && is_approx(layer_height_profile[layer_height_profile.size() - 2], z) &&
+                is_approx(layer_height_profile.back(), height))
+                return;
+            layer_height_profile.push_back(z);
+            layer_height_profile.push_back(height);
+        };
+        append(0., slicing_parameters.first_object_layer_height);
+        append(slicing_parameters.first_object_layer_height, slicing_parameters.first_object_layer_height);
+        for (const CadenceZone &zone : cadence_zones) {
+            const double lo = std::max(zone.lo, slicing_parameters.first_object_layer_height);
+            if (lo + EPSILON >= zone.hi)
+                continue;
+            const double height = zone.fine ? slicing_parameters.layer_height : slicing_parameters.base_layer_height;
+            append(lo, height);
+            append(zone.hi, height);
+        }
+        updated = true;
+    } else if (layer_height_profile.empty() || layer_height_profile[1] != slicing_parameters.first_object_layer_height) {
         //layer_height_profile = layer_height_profile_adaptive(slicing_parameters, model_object.layer_config_ranges, model_object.volumes);
         layer_height_profile = layer_height_profile_from_ranges(slicing_parameters, model_object.layer_config_ranges);
         // The layer height profile is already compressed.
@@ -4651,12 +4833,13 @@ void PrintObject::discover_horizontal_shells()
                 SurfaceType type = (idx_surface_type == 0) ? stTop : (idx_surface_type == 1) ? stBottom : stBottomBridge;
                 int num_solid_layers = scaled_shell_layers(
                     (type == stTop) ? region_config.top_shell_layers.value : region_config.bottom_shell_layers.value,
-                    m_slicing_params.cadence_ratio,
+                    layer_z_in_fine_zone(layer->print_z) ? m_slicing_params.cadence_ratio : 1,
                     feature_height_for_role(region_config,
                                           type == stTop ? FeatureRole::TopSurface : FeatureRole::BottomSurface,
                                           m_slicing_params.base_layer_height),
                     m_slicing_params.base_layer_height);
-                if (type != stTop && i == 0 && m_slicing_params.cadence_ratio > 1 && num_solid_layers > 0)
+                if (type != stTop && i == 0 && layer_z_in_fine_zone(layer->print_z) &&
+                    m_slicing_params.cadence_ratio > 1 && num_solid_layers > 0)
                     // The initial layer is already one full base-cadence group, not one fine-grid layer.
                     num_solid_layers -= m_slicing_params.cadence_ratio - 1;
                 if (num_solid_layers == 0)
@@ -4845,7 +5028,8 @@ void PrintObject::combine_infill()
 {
     // Work on each region separately.
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
-        // Feature cadence owns every region on a refined object grid.
+        // TODO(D6.b): Base cadence zones could re-enable infill combination locally.
+        // Feature cadence owns every region while any refined object grid is active.
         if (m_slicing_params.cadence_ratio > 1)
             continue;
         const PrintRegion &region = this->printing_region(region_id);
