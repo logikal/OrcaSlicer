@@ -3919,7 +3919,8 @@ void GCodeViewer::render_legend(float &legend_height, int canvas_width, int canv
         }
         break;
     }
-    case libvgcode::EViewType::Height:                   { append_range(m_viewer.get_color_range(libvgcode::EViewType::Height), 2); break; }
+    // 3 decimals: zone-fitted layer heights (e.g. 0.2784) and fine heights like 0.08 must be distinguishable.
+    case libvgcode::EViewType::Height:                   { append_range(m_viewer.get_color_range(libvgcode::EViewType::Height), 3); break; }
     case libvgcode::EViewType::Width:                    { append_range(m_viewer.get_color_range(libvgcode::EViewType::Width), 2); break; }
     case libvgcode::EViewType::Speed:       {
         append_range(m_viewer.get_color_range(libvgcode::EViewType::Speed), 0);

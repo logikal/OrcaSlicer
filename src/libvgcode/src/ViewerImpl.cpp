@@ -1899,7 +1899,11 @@ void ViewerImpl::update_color_ranges()
     for (size_t i = 0; i < m_vertices.size(); i++) {
         const PathVertex& v = m_vertices[i];
         if (v.is_extrusion()) {
-            m_height_range.update(round_to_bin(v.height));
+            // Custom-gcode extrusions carry ESTIMATED heights (Z-differences across start-gcode
+            // priming, e.g. 5.8 on an H2D), never authored ones. Including them collapses every
+            // real layer height into the bottom color bucket — keep height gated like width.
+            if (!v.is_custom_gcode() && v.height > 0.0f)
+                m_height_range.update(round_to_bin(v.height));
             if (!v.is_custom_gcode() || m_settings.extrusion_roles_visibility[size_t(EGCodeExtrusionRole::Custom)]) {
                 m_width_range.update(round_to_bin(v.width));
                 m_volumetric_rate_range.update(round_to_bin(v.volumetric_rate()));
