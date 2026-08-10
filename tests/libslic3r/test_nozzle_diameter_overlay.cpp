@@ -2,6 +2,7 @@
 
 #include "libslic3r/FeatureProcessResolver.hpp"
 #include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Slicing.hpp"
 
 #include <optional>
 #include <string>
@@ -26,8 +27,10 @@ class OverlayResolverFixture
 public:
     static constexpr const char *printer_04  = "OverlayPrinter 0.4 nozzle";
     static constexpr const char *printer_02  = "OverlayPrinter 0.2 nozzle";
+    static constexpr const char *printer_02_user = "Custom OverlayPrinter 0.2 nozzle";
     static constexpr const char *standard_04 = "0.20mm Standard @OverlayPrinter 0.4 nozzle";
     static constexpr const char *standard_02 = "0.10mm Standard @OverlayPrinter 0.2 nozzle";
+    static constexpr const char *ultrafine_02 = "0.05mm Ultrafine @OverlayPrinter 0.2 nozzle";
 
     PresetBundle       bundle;
     DynamicPrintConfig printer_config = DynamicPrintConfig::full_print_config();
@@ -35,18 +38,18 @@ public:
 
     OverlayResolverFixture()
     {
-        add_printer(printer_02, 0.2, false);
-        add_printer(printer_04, 0.4, true);
+        add_printer(printer_02_user, {0.2}, {0.03}, {0.12}, false, false);
+        add_printer(printer_02, {0.2}, {0.04}, {0.14}, false, true);
+        add_printer(printer_04, {0.4, 0.4}, {0.08, 0.08}, {0.28, 0.28}, true, true);
         add_process(standard_04, 0.2, printer_04);
         add_process(standard_02, 0.1, printer_02);
+        add_process(ultrafine_02, 0.05, printer_02);
 
-        printer_config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {0.4, 0.4};
-        printer_config.option<ConfigOptionFloats>("project_nozzle_diameter", true)->values = {0.4, 0.2};
-        printer_config.option<ConfigOptionFloats>("min_layer_height", true)->values = {0.07, 0.07};
-        printer_config.option<ConfigOptionFloats>("max_layer_height", true)->values = {0.3, 0.3};
+        bundle.filament_presets = {bundle.filaments.get_selected_preset_name()};
+        bundle.project_config.option<ConfigOptionFloats>("project_nozzle_diameter", true)->values = {0.4, 0.2};
+        bundle.project_config.option<ConfigOptionInts>("filament_map", true)->values = {1, 2};
+        printer_config = bundle.full_config(false);
         printer_config.option<ConfigOptionInts>("filament_map", true)->values = {1, 2};
-        printer_config.option<ConfigOptionString>("printer_model", true)->value = "OverlayPrinter";
-        apply_project_nozzle_diameters(printer_config);
 
         object_config.option<ConfigOptionFloat>("layer_height", true)->value = 0.2;
         object_config.option<ConfigOptionInt>("extruder", true)->value = 1;
@@ -66,15 +69,17 @@ public:
     }
 
 private:
-    void add_printer(const std::string &name, double nozzle, bool select)
+    void add_printer(const std::string &name, std::vector<double> nozzles,
+                     std::vector<double> minimums, std::vector<double> maximums,
+                     bool select, bool system)
     {
         DynamicPrintConfig config(bundle.printers.default_preset().config);
         config.option<ConfigOptionString>("printer_model", true)->value = "OverlayPrinter";
-        config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {nozzle};
-        config.option<ConfigOptionFloats>("min_layer_height", true)->values = {0.07};
-        config.option<ConfigOptionFloats>("max_layer_height", true)->values = {nozzle == 0.2 ? 0.15 : 0.3};
+        config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = std::move(nozzles);
+        config.option<ConfigOptionFloats>("min_layer_height", true)->values = std::move(minimums);
+        config.option<ConfigOptionFloats>("max_layer_height", true)->values = std::move(maximums);
         Preset &preset = bundle.printers.load_preset({}, name, std::move(config), select);
-        preset.is_system = true;
+        preset.is_system = system;
     }
 
     void add_process(const std::string &name, double height, const std::string &compatible_printer)
@@ -150,6 +155,43 @@ TEST_CASE("Preset composition applies the project nozzle overlay after the print
     CHECK((composed.option<ConfigOptionFloats>("max_layer_height")->values == std::vector<double>{0.3, 0.}));
 }
 
+TEST_CASE("Project nozzle overlays borrow vendor limits from a system sibling printer", "[NozzleOverlay]")
+{
+    OverlayResolverFixture fixture;
+    const Preset *sibling = fixture.bundle.sibling_printer_preset_for_diameter(0.2);
+
+    REQUIRE(sibling != nullptr);
+    CHECK(sibling->name == OverlayResolverFixture::printer_02);
+    CHECK((fixture.printer_config.option<ConfigOptionFloats>("nozzle_diameter")->values ==
+           std::vector<double>{0.4, 0.2}));
+    CHECK((fixture.printer_config.option<ConfigOptionFloats>("min_layer_height")->values ==
+           std::vector<double>{0.08, 0.04}));
+    CHECK((fixture.printer_config.option<ConfigOptionFloats>("max_layer_height")->values ==
+           std::vector<double>{0.28, 0.14}));
+}
+
+TEST_CASE("Project nozzle overlays retain derived limits when no sibling printer exists", "[NozzleOverlay]")
+{
+    PresetBundle bundle;
+    DynamicPrintConfig printer(bundle.printers.default_preset().config);
+    printer.option<ConfigOptionString>("printer_model", true)->value = "LonePrinter";
+    printer.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {0.4, 0.4};
+    printer.option<ConfigOptionFloats>("min_layer_height", true)->values = {0.08, 0.08};
+    printer.option<ConfigOptionFloats>("max_layer_height", true)->values = {0.28, 0.28};
+    Preset &selected = bundle.printers.load_preset({}, "LonePrinter 0.4 nozzle", std::move(printer), true);
+    selected.is_system = true;
+    bundle.filament_presets = {bundle.filaments.get_selected_preset_name()};
+    bundle.project_config.option<ConfigOptionFloats>("project_nozzle_diameter", true)->values = {0.4, 0.2};
+
+    const DynamicPrintConfig composed = bundle.full_config(false);
+
+    CHECK(bundle.sibling_printer_preset_for_diameter(0.2) == nullptr);
+    CHECK((composed.option<ConfigOptionFloats>("min_layer_height")->values == std::vector<double>{0.08, 0.}));
+    CHECK((composed.option<ConfigOptionFloats>("max_layer_height")->values == std::vector<double>{0.28, 0.}));
+    CHECK_THAT(Slicing::min_layer_height_from_nozzle(composed, 2), Catch::Matchers::WithinAbs(0.07, 1e-9));
+    CHECK_THAT(Slicing::max_layer_height_from_nozzle(composed, 2), Catch::Matchers::WithinAbs(0.15, 1e-9));
+}
+
 TEST_CASE("Device extruder ids translate through the logical to physical map", "[NozzleOverlay]")
 {
     DynamicPrintConfig config;
@@ -191,4 +233,26 @@ TEST_CASE("Feature process resolution uses the overlaid tool nozzle", "[NozzleOv
     CHECK(result.tool_id == 1);
     CHECK_THAT(result.nozzle_diameter, Catch::Matchers::WithinAbs(0.2, 1e-9));
     CHECK_THAT(result.feature_layer_height, Catch::Matchers::WithinAbs(0.1, 1e-9));
+}
+
+TEST_CASE("Feature process resolution uses sibling printer layer height limits", "[NozzleOverlay]")
+{
+    OverlayResolverFixture fixture;
+    FeatureProcessRequest request = fixture.request();
+    request.policy = FeatureProcessPolicy::Pinned;
+    request.pinned_preset_name = OverlayResolverFixture::ultrafine_02;
+
+    FeatureProcessResolution result = resolve_feature_process(request);
+    REQUIRE(result.ok);
+    CHECK_THAT(result.feature_layer_height, Catch::Matchers::WithinAbs(0.05, 1e-9));
+
+    DynamicPrintConfig derived = overlay_config({0.4, 0.2});
+    derived.option<ConfigOptionInts>("filament_map", true)->values = {1, 2};
+    derived.option<ConfigOptionString>("printer_model", true)->value = "OverlayPrinter";
+    apply_project_nozzle_diameters(derived);
+    request.printer_config = &derived;
+
+    result = resolve_feature_process(request);
+    CHECK_FALSE(result.ok);
+    CHECK(result.rejection == FeatureProcessRejection::LayerHeightOutOfToolRange);
 }

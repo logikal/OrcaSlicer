@@ -30,6 +30,8 @@
 
 namespace Slic3r {
 
+class Preset;
+
 enum GCodeFlavor : unsigned char {
     gcfMarlinLegacy, 
     gcfKlipper, 
@@ -850,7 +852,9 @@ public:
     std::string get_filament_type() const;
 };
 
-void apply_project_nozzle_diameters(DynamicPrintConfig &config);
+void apply_project_nozzle_diameters(
+    DynamicPrintConfig &config,
+    const std::function<const Preset *(double)> &sibling_source = nullptr);
 std::vector<double> effective_nozzle_diameters(const DynamicPrintConfig &full_or_printer_config);
 int logical_index_for_device_extruder(const DynamicPrintConfig &config, int device_ext_id);
 

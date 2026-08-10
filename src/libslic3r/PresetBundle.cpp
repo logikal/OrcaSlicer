@@ -11,6 +11,7 @@
 #include "libslic3r_version.h"
 
 #include <algorithm>
+#include <cmath>
 #include <mutex>
 #include <set>
 #include <fstream>
@@ -39,6 +40,24 @@
 //#define SLIC3R_PROFILE_USE_PRESETS_SUBDIR
 
 namespace Slic3r {
+
+namespace {
+
+// Keep this in step with FeatureProcessResolver's sparse-preset inheritance walk without
+// coupling preset composition to the resolver.
+const ConfigOption *inherited_option(const Preset &preset, const PresetCollection &collection, const std::string &key)
+{
+    const Preset          *current = &preset;
+    std::set<const Preset *> visited;
+    while (current != nullptr && visited.insert(current).second) {
+        if (const ConfigOption *option = current->config.option(key); option != nullptr)
+            return option;
+        current = collection.get_preset_parent(*current);
+    }
+    return nullptr;
+}
+
+} // namespace
 
 static std::vector<std::string> s_project_options {
     "flush_volumes_vector",
@@ -3996,6 +4015,32 @@ DynamicPrintConfig PresetBundle::full_config_secure(std::optional<std::vector<in
     return config;
 }
 
+const Preset *PresetBundle::sibling_printer_preset_for_diameter(double diameter) const
+{
+    const Preset &selected = this->printers.get_selected_preset();
+    const auto *selected_model = dynamic_cast<const ConfigOptionString *>(
+        inherited_option(selected, this->printers, "printer_model"));
+    if (selected_model == nullptr || selected_model->value.empty())
+        return nullptr;
+
+    const Preset *fallback = nullptr;
+    for (const Preset &candidate : this->printers) {
+        const auto *candidate_model = dynamic_cast<const ConfigOptionString *>(
+            inherited_option(candidate, this->printers, "printer_model"));
+        const auto *candidate_diameters = dynamic_cast<const ConfigOptionFloats *>(
+            inherited_option(candidate, this->printers, "nozzle_diameter"));
+        if (candidate_model == nullptr || candidate_model->value != selected_model->value ||
+            candidate_diameters == nullptr || candidate_diameters->values.empty() ||
+            std::abs(candidate_diameters->get_at(0) - diameter) > 1e-6)
+            continue;
+        if (candidate.is_system)
+            return &candidate;
+        if (fallback == nullptr)
+            fallback = &candidate;
+    }
+    return fallback;
+}
+
 std::vector<std::vector<std::vector<float>>> PresetBundle::get_full_flush_matrix(bool with_multiplier) const
 {
     auto full_config = this->full_config();
@@ -4346,7 +4391,21 @@ DynamicPrintConfig PresetBundle::full_fff_config(bool apply_extruder, std::optio
     add_if_some_non_empty(std::move(print_compatible_printers),     "print_compatible_printers");
     out.option<ConfigOptionStrings>("extruder_ams_count", true)->values   = save_extruder_ams_count_to_string(this->extruder_ams_counts);
 
-	apply_project_nozzle_diameters(out);
+    std::vector<Preset> overlay_siblings;
+    overlay_siblings.reserve(out.option<ConfigOptionFloats>("nozzle_diameter")->values.size());
+    apply_project_nozzle_diameters(out, [this, &overlay_siblings](double diameter) -> const Preset * {
+        const Preset *sibling = this->sibling_printer_preset_for_diameter(diameter);
+        if (sibling == nullptr)
+            return nullptr;
+
+        overlay_siblings.push_back(*sibling);
+        Preset &materialized = overlay_siblings.back();
+        for (const char *key : {"min_layer_height", "max_layer_height"}) {
+            if (const ConfigOption *option = inherited_option(*sibling, this->printers, key); option != nullptr)
+                materialized.config.set_key_value(key, option->clone());
+        }
+        return &materialized;
+    });
 	out.option<ConfigOptionEnumGeneric>("printer_technology", true)->value = ptFFF;
     return out;
 }

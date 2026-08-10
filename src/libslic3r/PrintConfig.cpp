@@ -2,6 +2,7 @@
 #include "PrintConfigConstants.hpp"
 #include "ClipperUtils.hpp"
 #include "Config.hpp"
+#include "Preset.hpp"
 #include "MaterialType.hpp"
 #include "I18N.hpp"
 #include "format.hpp"
@@ -9524,7 +9525,9 @@ std::vector<double> effective_nozzle_diameters(const DynamicPrintConfig &full_or
     return result;
 }
 
-void apply_project_nozzle_diameters(DynamicPrintConfig &config)
+void apply_project_nozzle_diameters(
+    DynamicPrintConfig &config,
+    const std::function<const Preset *(double)> &sibling_source)
 {
     auto *nozzle_diameters = config.option<ConfigOptionFloats>("nozzle_diameter");
     const auto *project_diameters = config.option<ConfigOptionFloats>("project_nozzle_diameter");
@@ -9536,12 +9539,15 @@ void apply_project_nozzle_diameters(DynamicPrintConfig &config)
         if (nozzle_diameters->values[i] == project_diameters->values[i])
             continue;
 
-        nozzle_diameters->values[i] = project_diameters->values[i];
+        const double  project_diameter = project_diameters->values[i];
+        const Preset *sibling = sibling_source == nullptr ? nullptr : sibling_source(project_diameter);
+        nozzle_diameters->values[i] = project_diameter;
         for (const char *key : {"min_layer_height", "max_layer_height"}) {
             auto *limits = config.option<ConfigOptionFloats>(key, true);
             if (limits->values.size() < nozzle_diameters->values.size())
                 limits->resize(nozzle_diameters->values.size(), FullPrintConfig::defaults().option(key));
-            limits->values[i] = 0.;
+            const auto *sibling_limits = sibling == nullptr ? nullptr : sibling->config.option<ConfigOptionFloats>(key);
+            limits->values[i] = sibling_limits == nullptr || sibling_limits->values.empty() ? 0. : sibling_limits->get_at(0);
         }
     }
 }
