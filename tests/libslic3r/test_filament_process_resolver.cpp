@@ -258,6 +258,42 @@ TEST_CASE("Filament slot resizing keeps process vectors aligned", "[FilamentProc
     CHECK(bundle.project_config.option<ConfigOptionInts>("filament_map")->values == std::vector<int>{1, 1});
 }
 
+TEST_CASE("Candidate lists hide other printers and uninstalled nozzles", "[FilamentProcessResolver]")
+{
+    FilamentResolverFixture fixture;
+    // A different printer model and a same-model printer whose nozzle is not installed.
+    {
+        DynamicPrintConfig config(fixture.bundle.printers.default_preset().config);
+        config.option<ConfigOptionString>("printer_model", true)->value = "OtherPrinter";
+        config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {0.4};
+        fixture.bundle.printers.load_preset({}, "OtherPrinter 0.4 nozzle", std::move(config), false).is_system = true;
+    }
+    {
+        DynamicPrintConfig config(fixture.bundle.printers.default_preset().config);
+        config.option<ConfigOptionString>("printer_model", true)->value = "TestPrinter";
+        config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {0.6};
+        fixture.bundle.printers.load_preset({}, "TestPrinter 0.6 nozzle", std::move(config), false).is_system = true;
+    }
+    fixture.add_process("0.20mm Standard @OtherPrinter", 0.2, 0.42, "OtherPrinter 0.4 nozzle");
+    fixture.add_process("0.30mm Standard @TestPrinter 0.6 nozzle", 0.3, 0.62, "TestPrinter 0.6 nozzle");
+
+    const std::vector<FeatureProcessCandidate> candidates =
+        enumerate_filament_process_candidates(fixture.request(2));
+    const auto by_name = [&candidates](const char *name) {
+        return std::find_if(candidates.begin(), candidates.end(),
+                            [name](const FeatureProcessCandidate &c) { return c.preset_name == name; });
+    };
+    CHECK(by_name("0.20mm Standard @OtherPrinter") == candidates.end());
+    CHECK(by_name("0.30mm Standard @TestPrinter 0.6 nozzle") == candidates.end());
+    // The other INSTALLED nozzle's preset stays listed, visibly incompatible for this slot.
+    const auto other_installed = by_name(FilamentResolverFixture::standard_04);
+    REQUIRE(other_installed != candidates.end());
+    CHECK_FALSE(other_installed->compatible);
+    const auto matching = by_name(FilamentResolverFixture::standard_02);
+    REQUIRE(matching != candidates.end());
+    CHECK(matching->compatible);
+}
+
 TEST_CASE("Uninferable global process nozzle conservatively preserves the global process", "[FilamentProcessResolver]")
 {
     FilamentResolverFixture fixture;

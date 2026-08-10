@@ -432,6 +432,35 @@ double preset_nozzle_diameter(const Preset &printer, const PresetCollection &pri
     return diameters == nullptr || diameters->values.empty() ? 0. : diameters->get_at(0);
 }
 
+// Candidate dropdowns list only presets that target the CURRENT printer model at a nozzle that
+// is physically installed. Other-model and non-installed-nozzle vendor presets are catalog noise,
+// not alternatives; "visible with a reason" is reserved for the other INSTALLED nozzle. Presets
+// without a compatible_printers name list (user/custom or condition-based) are kept and classified
+// by the ordinary compatibility logic so hand-made presets never silently disappear.
+bool preset_listed_for_current_hardware(const Preset &preset, const PresetBundle &bundle,
+                                        const std::vector<double> &installed_nozzles)
+{
+    const Preset *source = compatibility_source(preset, bundle.prints);
+    const auto *compatible_printers = dynamic_cast<const ConfigOptionStrings *>(source->config.option("compatible_printers"));
+    if (compatible_printers == nullptr || compatible_printers->values.empty())
+        return true;
+
+    const std::string active_model = preset_printer_model(bundle.printers.get_selected_preset(), bundle.printers);
+    if (active_model.empty())
+        return true;
+
+    for (const std::string &printer_name : compatible_printers->values) {
+        const Preset *printer = bundle.printers.find_preset(printer_name, false);
+        if (printer == nullptr || preset_printer_model(*printer, bundle.printers) != active_model)
+            continue;
+        const double preset_nozzle = preset_nozzle_diameter(*printer, bundle.printers);
+        if (std::any_of(installed_nozzles.begin(), installed_nozzles.end(),
+                        [preset_nozzle](double installed) { return std::abs(installed - preset_nozzle) <= NOZZLE_EPSILON; }))
+            return true;
+    }
+    return false;
+}
+
 FeatureProcessRejection preset_compatible_with_tool_impl(const Preset             &process_preset,
                                                          const PresetBundle       &bundle,
                                                          double                    tool_nozzle_diameter,
@@ -866,9 +895,12 @@ std::vector<FeatureProcessCandidate> enumerate_filament_process_candidates(const
         const GCodeConfig gcode_config = gcode_config_from(&full_config);
         const unsigned int tool_id = unsigned(get_extruder_index_from_filament_id(gcode_config, request.filament_id));
         const double tool_nozzle = full_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(tool_id);
+        const std::vector<double> installed_nozzles =
+            full_config.option<ConfigOptionFloats>("nozzle_diameter")->values;
 
         for (const Preset &preset : request.bundle->prints) {
-            if (preset.is_default || !preset.is_visible)
+            if (preset.is_default || !preset.is_visible ||
+                !preset_listed_for_current_hardware(preset, *request.bundle, installed_nozzles))
                 continue;
             FeatureProcessCandidate candidate;
             candidate.preset_name = preset.name;
@@ -1044,9 +1076,12 @@ std::vector<FeatureProcessCandidate> enumerate_feature_process_candidates(const 
         const unsigned int tool_id = unsigned(get_extruder_index_from_filament_id(gcode_config, filament));
         const double tool_nozzle = printer_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(tool_id);
         const double base_height = request_base_layer_height(request);
+        const std::vector<double> installed_nozzles =
+            printer_config.option<ConfigOptionFloats>("nozzle_diameter")->values;
 
         for (const Preset &preset : request.bundle->prints) {
-            if (preset.is_default || !preset.is_visible)
+            if (preset.is_default || !preset.is_visible ||
+                !preset_listed_for_current_hardware(preset, *request.bundle, installed_nozzles))
                 continue;
             FeatureProcessCandidate candidate;
             candidate.preset_name = preset.name;
