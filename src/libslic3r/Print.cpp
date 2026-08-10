@@ -1816,83 +1816,119 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                                                  slicing_params.base_layer_height : layer_height;
             const double grid_layer_height = slicing_params.layer_height;
             if (mixed_nozzle_diameters) {
-                std::vector<double> resolved_feature_heights;
-                auto add_resolved_height = [&](double height) {
-                    for (double known_height : resolved_feature_heights) {
-                        if (std::abs(height - known_height) <= 0.0005)
-                            return;
-                    }
-                    resolved_feature_heights.push_back(height);
-                };
-                if (grid_layer_height < base_layer_height - EPSILON)
-                    add_resolved_height(grid_layer_height);
-                auto between_endpoint_error = [&](const std::string &feature_name, double height) -> StringObjectException {
-                    return {Slic3r::format(
-                                L("%1% layer height %2% mm is unsupported when the base layer height is %3% mm; supported heights are %4% mm and %5% mm."),
-                                feature_name, height, base_layer_height, grid_layer_height, base_layer_height), object, "layer_height"};
-                };
                 for (const PrintRegion &region : object->all_regions()) {
                     const PrintRegionConfig &cfg = region.config();
-                    const double wall_feature_height = cfg.wall_layer_height.value > EPSILON ? cfg.wall_layer_height.value : base_layer_height;
+                    const double wall_height = cfg.wall_layer_height.value > EPSILON ?
+                                                   cfg.wall_layer_height.value : base_layer_height;
                     for (StringObjectException error : {
-                             validate_feature_height(object, L("Outer wall"), wall_feature_height,
-                                                    cfg.outer_wall_filament_id.value, "wall_layer_height"),
-                             validate_feature_height(object, L("Inner wall"), wall_feature_height,
-                                                    cfg.inner_wall_filament_id.value, "wall_layer_height"),
+                             validate_feature_height(object, L("Outer wall"), wall_height,
+                                                     cfg.outer_wall_filament_id.value, "wall_layer_height"),
+                             validate_feature_height(object, L("Inner wall"), wall_height,
+                                                     cfg.inner_wall_filament_id.value, "wall_layer_height"),
+                             validate_feature_height(object, L("Sparse infill"),
+                                                     feature_height_for_role(cfg, base_layer_height, FeatureRole::SparseInfill),
+                                                     cfg.sparse_infill_filament_id.value, "layer_height"),
+                             validate_feature_height(object, L("Internal solid infill"),
+                                                     feature_height_for_role(cfg, base_layer_height, FeatureRole::InternalSolid),
+                                                     cfg.internal_solid_filament_id.value, "layer_height"),
+                             validate_feature_height(object, L("Top surface"),
+                                                     feature_height_for_role(cfg, base_layer_height, FeatureRole::TopSurface),
+                                                     cfg.top_surface_filament_id.value, "layer_height"),
+                             validate_feature_height(object, L("Bottom surface"),
+                                                     feature_height_for_role(cfg, base_layer_height, FeatureRole::BottomSurface),
+                                                     cfg.bottom_surface_filament_id.value, "layer_height"),
                          }) {
                         if (!error.string.empty())
                             return error;
                     }
-                    if (StringObjectException error = invalid_feature_divisor(object, L("Outer wall"), "wall_layer_height",
-                                                                            base_layer_height, wall_feature_height,
-                                                                            cfg.outer_wall_filament_id.value);
-                        !error.string.empty())
-                        return error;
-                    if (StringObjectException error = invalid_feature_divisor(object, L("Inner wall"), "wall_layer_height",
-                                                                            base_layer_height, wall_feature_height,
-                                                                            cfg.inner_wall_filament_id.value);
-                        !error.string.empty())
-                        return error;
-
-                    struct RoleCheck {
-                        FeatureRole role;
-                        std::string name;
-                        int         filament_id;
-                    };
-                    for (const RoleCheck &check : {
-                             RoleCheck{FeatureRole::SparseInfill, L("Sparse infill"), cfg.sparse_infill_filament_id.value},
-                             RoleCheck{FeatureRole::InternalSolid, L("Internal solid infill"), cfg.internal_solid_filament_id.value},
-                             RoleCheck{FeatureRole::TopSurface, L("Top surface"), cfg.top_surface_filament_id.value},
-                             RoleCheck{FeatureRole::BottomSurface, L("Bottom surface"), cfg.bottom_surface_filament_id.value},
-                         }) {
-                        const double role_height = feature_height_for_role(cfg, base_layer_height, check.role);
-                        if (StringObjectException error = validate_feature_height(object, check.name, role_height,
-                                                                                  check.filament_id, "layer_height");
-                            !error.string.empty())
-                            return error;
-                        if (role_height >= base_layer_height - EPSILON)
-                            continue;
-                        add_resolved_height(role_height);
-                        if (grid_layer_height + EPSILON < base_layer_height - EPSILON &&
-                            std::abs(role_height - grid_layer_height) > EPSILON &&
-                            std::abs(role_height - base_layer_height) > EPSILON)
-                            return between_endpoint_error(check.name, role_height);
-                        if (StringObjectException error = invalid_feature_divisor(object, check.name, "layer_height",
-                                                                                  base_layer_height, role_height,
-                                                                                  check.filament_id);
-                            !error.string.empty())
-                            return error;
-                    }
                 }
-                if (resolved_feature_heights.size() > 2) {
-                    std::ostringstream message_stream;
-                    for (size_t i = 0; i < resolved_feature_heights.size(); ++i) {
-                        if (i > 0)
-                            message_stream << ", ";
-                        message_stream << resolved_feature_heights[i];
+
+                std::vector<const CadenceZone *> mixed_zones;
+                for (const CadenceZone &zone : object->cadence_zones())
+                    if (zone.mixed)
+                        mixed_zones.push_back(&zone);
+                if (mixed_zones.empty() && slicing_params.cadence_ratio > 1)
+                    mixed_zones.push_back(nullptr);
+
+                for (const CadenceZone *zone : mixed_zones) {
+                    const double mixed_base_height = zone == nullptr ? base_layer_height : zone->height;
+                    const double mixed_grid_height = zone == nullptr ? grid_layer_height : zone->fine_height;
+                    std::vector<double> resolved_feature_heights;
+                    auto add_resolved_height = [&](double height) {
+                        for (double known_height : resolved_feature_heights)
+                            if (std::abs(height - known_height) <= 0.0005)
+                                return;
+                        resolved_feature_heights.push_back(height);
+                    };
+                    if (mixed_grid_height < mixed_base_height - EPSILON)
+                        add_resolved_height(mixed_grid_height);
+                    auto between_endpoint_error = [&](const std::string &feature_name, double height) -> StringObjectException {
+                        return {Slic3r::format(
+                                    L("%1% layer height %2% mm is unsupported when the base layer height is %3% mm; supported heights are %4% mm and %5% mm."),
+                                    feature_name, height, mixed_base_height, mixed_grid_height, mixed_base_height), object, "layer_height"};
+                    };
+                    for (const PrintRegion &region : object->all_regions()) {
+                        if (zone != nullptr && !object->region_intersects_cadence_zone(region, *zone))
+                            continue;
+                        const PrintRegionConfig &cfg = region.config();
+                        const double wall_feature_height = cfg.wall_layer_height.value > EPSILON ?
+                                                               cfg.wall_layer_height.value : mixed_base_height;
+                        for (StringObjectException error : {
+                                 validate_feature_height(object, L("Outer wall"), wall_feature_height,
+                                                         cfg.outer_wall_filament_id.value, "wall_layer_height"),
+                                 validate_feature_height(object, L("Inner wall"), wall_feature_height,
+                                                         cfg.inner_wall_filament_id.value, "wall_layer_height"),
+                             }) {
+                            if (!error.string.empty())
+                                return error;
+                        }
+                        if (StringObjectException error = invalid_feature_divisor(
+                                object, L("Outer wall"), "wall_layer_height", mixed_base_height,
+                                wall_feature_height, cfg.outer_wall_filament_id.value); !error.string.empty())
+                            return error;
+                        if (StringObjectException error = invalid_feature_divisor(
+                                object, L("Inner wall"), "wall_layer_height", mixed_base_height,
+                                wall_feature_height, cfg.inner_wall_filament_id.value); !error.string.empty())
+                            return error;
+
+                        struct RoleCheck {
+                            FeatureRole role;
+                            std::string name;
+                            int         filament_id;
+                        };
+                        for (const RoleCheck &check : {
+                                 RoleCheck{FeatureRole::SparseInfill, L("Sparse infill"), cfg.sparse_infill_filament_id.value},
+                                 RoleCheck{FeatureRole::InternalSolid, L("Internal solid infill"), cfg.internal_solid_filament_id.value},
+                                 RoleCheck{FeatureRole::TopSurface, L("Top surface"), cfg.top_surface_filament_id.value},
+                                 RoleCheck{FeatureRole::BottomSurface, L("Bottom surface"), cfg.bottom_surface_filament_id.value},
+                             }) {
+                            const double role_height = feature_height_for_role(cfg, mixed_base_height, check.role);
+                            if (StringObjectException error = validate_feature_height(
+                                    object, check.name, role_height, check.filament_id, "layer_height"); !error.string.empty())
+                                return error;
+                            if (role_height >= mixed_base_height - EPSILON)
+                                continue;
+                            add_resolved_height(role_height);
+                            if (mixed_grid_height + EPSILON < mixed_base_height - EPSILON &&
+                                std::abs(role_height - mixed_grid_height) > EPSILON &&
+                                std::abs(role_height - mixed_base_height) > EPSILON)
+                                return between_endpoint_error(check.name, role_height);
+                            if (StringObjectException error = invalid_feature_divisor(
+                                    object, check.name, "layer_height", mixed_base_height, role_height,
+                                    check.filament_id); !error.string.empty())
+                                return error;
+                        }
                     }
-                    return {Slic3r::format(L("Features resolve to more than two layer heights (%1%); pin processes so at most two heights remain, or disable per-filament processes."),
-                                           message_stream.str()), object, "layer_height"};
+                    if (resolved_feature_heights.size() > 2) {
+                        std::ostringstream message_stream;
+                        for (size_t i = 0; i < resolved_feature_heights.size(); ++i) {
+                            if (i > 0)
+                                message_stream << ", ";
+                            message_stream << resolved_feature_heights[i];
+                        }
+                        return {Slic3r::format(L("Features resolve to more than two layer heights (%1%) within one mixed cadence zone; pin processes so at most two heights remain, or disable per-filament processes."),
+                                               message_stream.str()), object, "layer_height"};
+                    }
                 }
             }
 
@@ -1932,18 +1968,28 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 }
             }
 
-            const bool cadence_active = slicing_params.cadence_ratio > 1;
+            const bool cadence_active = slicing_params.cadence_ratio > 1 || slicing_params.cadence_zone_digest != 0;
             const auto cadence_heights_for_region = [&](const PrintRegion &region) {
                 std::vector<double> heights;
+                const auto append_unique = [&heights](double height) {
+                    if (std::none_of(heights.begin(), heights.end(), [height](double item) {
+                            return std::abs(item - height) <= EPSILON;
+                        }))
+                        heights.push_back(height);
+                };
                 if (!cadence_active)
                     heights.push_back(layer_height);
                 else if (slicing_params.cadence_zone_digest == 0)
                     heights.push_back(slicing_params.layer_height);
                 else {
-                    if (object->region_intersects_cadence_zone(region, true))
-                        heights.push_back(slicing_params.layer_height);
-                    if (object->region_intersects_cadence_zone(region, false))
-                        heights.push_back(base_layer_height);
+                    for (const CadenceZone &zone : object->cadence_zones()) {
+                        if (!object->region_intersects_cadence_zone(region, zone))
+                            continue;
+                        if (zone.mixed)
+                            append_unique(zone.fine_height);
+                        else
+                            append_unique(zone.height);
+                    }
                     if (heights.empty())
                         heights.push_back(slicing_params.layer_height);
                 }
@@ -1977,6 +2023,36 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 const size_t object_tool = get_extruder_index_from_filament_id(
                     m_config, object_filament > 0 ? unsigned(object_filament) : 1u);
                 const double object_nozzle = m_config.nozzle_diameter.get_at(object_tool);
+
+                for (const CadenceZone &zone : object->cadence_zones()) {
+                    if (zone.mixed)
+                        continue;
+                    std::set<size_t> zone_tools;
+                    for (const PrintRegion &region : object->all_regions()) {
+                        if (!object->region_intersects_cadence_zone(region, zone))
+                            continue;
+                        const PrintRegionConfig &cfg = region.config();
+                        for (int filament_id : {
+                                 cfg.outer_wall_filament_id.value, cfg.inner_wall_filament_id.value,
+                                 cfg.sparse_infill_filament_id.value, cfg.internal_solid_filament_id.value,
+                                 cfg.top_surface_filament_id.value, cfg.bottom_surface_filament_id.value,
+                             })
+                            zone_tools.insert(get_extruder_index_from_filament_id(m_config, std::max(filament_id, 1)));
+                    }
+                    if (zone_tools.size() != 1)
+                        continue;
+                    const size_t tool = *zone_tools.begin();
+                    const double nozzle = m_config.nozzle_diameter.get_at(tool);
+                    const double min_height = Slicing::min_layer_height_from_nozzle(dynamic_print_config, int(tool + 1));
+                    const double max_height = Slicing::max_layer_height_from_nozzle(dynamic_print_config, int(tool + 1));
+                    if (zone.height > nozzle + EPSILON || zone.height < min_height - EPSILON ||
+                        zone.height > max_height + EPSILON) {
+                        return {Slic3r::format(
+                                    L("Cadence zone Z %1%-%2% mm requires %3% mm layers, outside tool %4%'s %5%-%6% mm layer-height range for its %7% mm nozzle."),
+                                    zone.lo, zone.hi, zone.height, tool + 1, min_height, max_height, nozzle),
+                                object, "layer_height"};
+                    }
+                }
 
                 for (const PrintRegion &region : object->all_regions()) {
                     const PrintRegionConfig &region_config = region.config();
@@ -2059,8 +2135,6 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             for (const char *opt_key : { "inner_wall_line_width", "outer_wall_line_width", "sparse_infill_line_width", "internal_solid_infill_line_width", "top_surface_line_width","skin_infill_line_width" ,"skeleton_infill_line_width"})
 				for (const PrintRegion &region : object->all_regions()) {
                     const PrintRegionConfig &rc = region.config();
-                    const bool is_wall_key = std::strcmp(opt_key, "inner_wall_line_width") == 0 ||
-                                             std::strcmp(opt_key, "outer_wall_line_width") == 0;
                     int filament_id = 0;
                     if (std::strcmp(opt_key, "inner_wall_line_width") == 0)            filament_id = rc.inner_wall_filament_id.value;
                     else if (std::strcmp(opt_key, "outer_wall_line_width") == 0)       filament_id = rc.outer_wall_filament_id.value;
@@ -2069,8 +2143,8 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     else                                                               filament_id = rc.sparse_infill_filament_id.value;
                     const double role_nozzle = m_config.nozzle_diameter.get_at(
                         get_extruder_index_from_filament_id(m_config, filament_id));
-                    const std::vector<double> heights = is_wall_key ? cadence_heights_for_region(region) :
-                                                                     std::vector<double>{layer_height};
+                    const std::vector<double> heights = cadence_active ? cadence_heights_for_region(region) :
+                                                                         std::vector<double>{layer_height};
                     for (double height : heights)
                         if (!validate_extrusion_width_for_nozzle(
                                 rc, opt_key, height, role_nozzle, role_nozzle, err_msg))

@@ -355,6 +355,23 @@ DynamicPrintConfig zoned_cadence_config(std::initializer_list<ConfigBase::SetDes
     return config;
 }
 
+DynamicPrintConfig independent_zoned_cadence_config(
+    std::initializer_list<ConfigBase::SetDeserializeItem> extra = {})
+{
+    DynamicPrintConfig config = zoned_cadence_config({
+        {"layer_height", 0.28},
+        {"initial_layer_print_height", 0.2},
+        {"infill_combination", false},
+    });
+    config.option<ConfigOptionStrings>("filament_process_projection", true)->values = {
+        "layer_height=0.28;outer_wall_line_width=0.44;inner_wall_line_width=0.43;sparse_infill_line_width=0.45",
+        "layer_height=0.08;outer_wall_line_width=0.22;inner_wall_line_width=0.21;sparse_infill_line_width=0.25",
+    };
+    if (extra.size() > 0)
+        config.set_deserialize_strict(extra);
+    return config;
+}
+
 ModelObject *add_zoned_text_cube(Model &model, const std::string &name, double x_shift = 0.,
                                  double fine_bottom = 10., bool whole_object_fine = false)
 {
@@ -388,6 +405,24 @@ ModelObject *add_zoned_text_cube(Model &model, const std::string &name, double x
         text_volume->config.set("top_surface_filament_id", 1);
         text_volume->config.set("bottom_surface_filament_id", 1);
     }
+    object->add_instance();
+    object->ensure_on_bed();
+    return object;
+}
+
+ModelObject *add_independent_zoned_text_cube(Model &model, const std::string &name,
+                                            double body_height = 35., double text_height = 1.)
+{
+    ModelObject *object = model.add_object();
+    object->name = name;
+    object->config.set("extruder", 1);
+    object->add_volume(make_cube(20., 20., body_height))->config.set("extruder", 1);
+
+    TriangleMesh text = make_cube(6., 6., text_height);
+    Transform3d transform = Transform3d::Identity();
+    transform.translation() = Vec3d(7., 7., body_height);
+    text.transform(transform, false);
+    object->add_volume(std::move(text))->config.set("extruder", 2);
     object->add_instance();
     object->ensure_on_bed();
     return object;
@@ -611,7 +646,7 @@ TEST_CASE("Painted regions consume their filament delta identically on create an
     REQUIRE(painted != nullptr);
     CHECK_THAT(painted->sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.25, 1e-9));
     REQUIRE(print_object.cadence_zones().size() == 1);
-    CHECK(print_object.cadence_zones().front().fine);
+    CHECK(print_object.cadence_zones().front().mixed);
     CHECK_THAT(print_object.cadence_zones().front().lo, Catch::Matchers::WithinAbs(0., EPSILON));
     CHECK_THAT(print_object.cadence_zones().front().hi, Catch::Matchers::WithinAbs(20., EPSILON));
     const size_t region_count = print_object.num_printing_regions();
@@ -819,7 +854,7 @@ TEST_CASE("A finer wall layer height refines the object grid", "[FeatureCadence]
     }
     CHECK_THAT(layers.back()->print_z, Catch::Matchers::WithinAbs(20., EPSILON));
     REQUIRE(print.objects().front()->cadence_zones().size() == 1);
-    CHECK(print.objects().front()->cadence_zones().front().fine);
+    CHECK(print.objects().front()->cadence_zones().front().mixed);
     CHECK(print.objects().front()->slicing_parameters().cadence_zone_digest == 0);
 }
 
@@ -833,10 +868,10 @@ TEST_CASE("Fine cadence is confined to the Z extent of a text part", "[FeatureCa
 
     const PrintObject &object = *print.objects().front();
     REQUIRE(object.cadence_zones().size() == 2);
-    CHECK_FALSE(object.cadence_zones()[0].fine);
+    CHECK_FALSE(object.cadence_zones()[0].mixed);
     CHECK_THAT(object.cadence_zones()[0].lo, Catch::Matchers::WithinAbs(0., EPSILON));
     CHECK_THAT(object.cadence_zones()[0].hi, Catch::Matchers::WithinAbs(10., EPSILON));
-    CHECK(object.cadence_zones()[1].fine);
+    CHECK(object.cadence_zones()[1].mixed);
     CHECK_THAT(object.cadence_zones()[1].lo, Catch::Matchers::WithinAbs(10., EPSILON));
     CHECK_THAT(object.cadence_zones()[1].hi, Catch::Matchers::WithinAbs(11., EPSILON));
     CHECK(object.slicing_parameters().cadence_zone_digest != 0);
@@ -896,6 +931,95 @@ TEST_CASE("Cadence zones snap down without consuming the first layer", "[Feature
     CHECK_THAT(object.cadence_zones()[0].hi, Catch::Matchers::WithinAbs(10., EPSILON));
     CHECK_THAT(object.cadence_zones()[1].lo, Catch::Matchers::WithinAbs(10., EPSILON));
     CHECK_FALSE(object.layer_z_in_fine_zone(object.slicing_parameters().first_object_layer_height));
+}
+
+TEST_CASE("Single-tool zones use independent non-divisor layer heights",
+          "[FeatureCadence][CadenceZones][IndependentZones][Regression]")
+{
+    Print print;
+    Model model;
+    add_independent_zoned_text_cube(model, "independent-text");
+    apply_zoned_model(print, model, independent_zoned_cadence_config());
+
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.slicing_parameters().cadence_ratio == 1);
+    REQUIRE(object.slicing_parameters().cadence_zone_digest != 0);
+    REQUIRE(object.cadence_zones().size() == 2);
+    CHECK_FALSE(object.cadence_zones()[0].mixed);
+    CHECK_FALSE(object.cadence_zones()[1].mixed);
+    CHECK_THAT(object.cadence_zones()[0].hi, Catch::Matchers::WithinAbs(35., EPSILON));
+    CHECK_THAT(object.cadence_zones()[1].lo, Catch::Matchers::WithinAbs(35., EPSILON));
+    CHECK_THAT(object.cadence_zones()[0].height, Catch::Matchers::WithinAbs(34.8 / 124., EPSILON));
+    CHECK_THAT(object.cadence_zones()[1].height, Catch::Matchers::WithinAbs(1. / 13., EPSILON));
+
+    const StringObjectException validation = print.validate();
+    CAPTURE(validation.string, validation.opt_key);
+    REQUIRE(validation.string.empty());
+
+    const std::string output = gcode(print);
+    bool found_body_wall = false;
+    bool found_text_wall = false;
+    for (const GCodeExtrusion &extrusion : gcode_extrusions(output)) {
+        if (!is_wall_role(extrusion.role))
+            continue;
+        CAPTURE(extrusion.tool, extrusion.z, extrusion.height);
+        if (extrusion.z <= 35. + EPSILON) {
+            found_body_wall = true;
+            CHECK(extrusion.tool == 0);
+            CHECK_THAT(extrusion.height, Catch::Matchers::WithinAbs(
+                extrusion.z <= 0.2 + EPSILON ? 0.2 : 34.8 / 124., 1e-4));
+        } else {
+            found_text_wall = true;
+            CHECK(extrusion.tool == 1);
+            CHECK_THAT(extrusion.height, Catch::Matchers::WithinAbs(1. / 13., 1e-4));
+        }
+    }
+    CHECK(found_body_wall);
+    CHECK(found_text_wall);
+
+    for (const Layer *layer : object.layers()) {
+        if (layer->print_z > 35. + EPSILON)
+            continue;
+        for (const LayerRegion *region : layer->regions())
+            CHECK(region->fill_surfaces.filter_by_type(stInternalVoid).empty());
+    }
+}
+
+TEST_CASE("Independent zone layers land exactly on a geometric boundary",
+          "[FeatureCadence][CadenceZones][IndependentZones]")
+{
+    Print print;
+    Model model;
+    add_independent_zoned_text_cube(model, "boundary-landing", 34.9);
+    apply_zoned_model(print, model, independent_zoned_cadence_config());
+
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.cadence_zones().size() == 2);
+    CHECK_THAT(object.cadence_zones()[0].height, Catch::Matchers::WithinAbs(34.7 / 124., 1e-4));
+    std::vector<coordf_t> profile;
+    REQUIRE(PrintObject::update_layer_height_profile(
+        *object.model_object(), object.slicing_parameters(), profile, object.cadence_zones()));
+    const std::vector<coordf_t> layers = generate_object_layers(object.slicing_parameters(), profile, false);
+    const auto boundary = std::min_element(layers.begin(), layers.end(), [](double lhs, double rhs) {
+        return std::abs(lhs - 34.9) < std::abs(rhs - 34.9);
+    });
+    REQUIRE(boundary != layers.end());
+    CHECK_THAT(*boundary, Catch::Matchers::WithinAbs(34.9, EPSILON));
+}
+
+TEST_CASE("An impossible independent zone height reports its tool range",
+          "[FeatureCadence][CadenceZones][IndependentZones][Validate]")
+{
+    Print print;
+    Model model;
+    add_independent_zoned_text_cube(model, "tiny-zone", 0.2, 0.02);
+    apply_zoned_model(print, model, independent_zoned_cadence_config());
+
+    const StringObjectException error = print.validate();
+    REQUIRE_FALSE(error.string.empty());
+    CHECK(error.string.find("Cadence zone Z") != std::string::npos);
+    CHECK(error.string.find("tool 2") != std::string::npos);
+    CHECK(error.string.find("0.05") != std::string::npos);
 }
 
 TEST_CASE("Default wall cadence leaves the object grid untouched", "[FeatureCadence][Regression]")

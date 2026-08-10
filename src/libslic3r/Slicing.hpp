@@ -40,7 +40,8 @@ struct SlicingParameters
          const Vec3d                     &object_shrinkage_compensation,
          const FeatureCadencePlan        *cadence_plan = nullptr,
          const std::vector<unsigned int> &fine_cadence_extruders = {},
-         bool                             cadence_zones_active = false);
+         double                           min_zone_height = 0.,
+         double                           max_zone_height = 0.);
 
     // Has any raft layers?
     bool        has_raft() const { return raft_layers() > 0; }
@@ -74,7 +75,7 @@ struct SlicingParameters
     // The object's process layer height before feature cadence refines the shared Z grid.
     coordf_t    base_layer_height { 0 };
     int         cadence_ratio { 1 };
-    // Hash of a mixed base/fine cadence-zone table. Zero means uniform layering.
+    // Hash of a non-uniform cadence-zone table. Zero means uniform layering.
     uint64_t    cadence_zone_digest { 0 };
     // Minimum / maximum layer height, to be used for the automatic adaptive layer height algorithm,
     // or by an interactive layer height editor.

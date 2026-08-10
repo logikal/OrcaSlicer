@@ -335,9 +335,11 @@ struct FeatureCadencePlan
 
 struct CadenceZone
 {
-    double lo   = 0.;
-    double hi   = 0.;
-    bool   fine = false;
+    double lo          = 0.;
+    double hi          = 0.;
+    bool   mixed       = false;
+    double height      = 0.;
+    double fine_height = 0.;
 };
 
 class PrintObject : public PrintObjectBaseWithState<Print, PrintObjectStep, posCount>
@@ -459,7 +461,7 @@ public:
     const PrintObjectRegions*   shared_regions() const throw() { return m_shared_regions; }
     const std::vector<CadenceZone>& cadence_zones() const { return m_cadence_zones; }
     bool                        layer_z_in_fine_zone(coordf_t print_z) const;
-    bool                        region_intersects_cadence_zone(const PrintRegion &region, bool fine) const;
+    bool                        region_intersects_cadence_zone(const PrintRegion &region, const CadenceZone &zone) const;
 
     bool                        has_support()           const { return m_config.enable_support || m_config.enforce_support_layers > 0; }
     bool                        has_raft()              const { return m_config.raft_layers > 0; }

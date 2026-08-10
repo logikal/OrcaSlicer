@@ -4355,60 +4355,115 @@ static void append_fine_cadence_extruders(const PrintConfig &print_config, const
     }
 }
 
-static bool region_uses_fine_cadence(const PrintRegionConfig &region_config, double base_height)
-{
-    for (FeatureRole role : {FeatureRole::Wall, FeatureRole::SparseInfill, FeatureRole::InternalSolid,
-                             FeatureRole::TopSurface, FeatureRole::BottomSurface})
-        if (feature_height_for_role(region_config, role, base_height) < base_height - EPSILON)
-            return true;
-    return false;
-}
-
 static std::vector<CadenceZone> compute_cadence_zones(const PrintObject &object, const FeatureCadencePlan &plan,
                                                        double first_layer_height, double object_height)
 {
-    if (plan.ratio <= 1 || object.shared_regions() == nullptr || object_height <= EPSILON)
+    if (object.shared_regions() == nullptr || object_height <= EPSILON)
         return {};
 
-    std::vector<std::pair<double, double>> fine_extents;
-    const auto append_extent = [&](const PrintRegion *region, const PrintObjectRegions::BoundingBox *bbox) {
-        if (region == nullptr || bbox == nullptr || !region_uses_fine_cadence(region->config(), plan.base_height))
+    struct Contribution {
+        const PrintRegion                       *region;
+        const PrintObjectRegions::BoundingBox   *bbox;
+        double                                   lo;
+        double                                   hi;
+    };
+    std::vector<Contribution> contributions;
+    const auto append_contribution = [&](const PrintRegion *region, const PrintObjectRegions::BoundingBox *bbox) {
+        if (region == nullptr || bbox == nullptr)
             return;
-        const double lo = std::max(0., double(bbox->min().z()));
-        const double hi = std::min(object_height, double(bbox->max().z()));
+        // PrintApply expands these boxes by EPSILON. Remove that conservative expansion so
+        // touching volume endpoints become one exact geometric zone boundary.
+        const double lo = std::max(0., double(bbox->min().z()) + EPSILON);
+        const double hi = std::min(object_height, double(bbox->max().z()) - EPSILON);
         if (lo + EPSILON < hi)
-            fine_extents.emplace_back(lo, hi);
+            contributions.push_back({region, bbox, lo, hi});
     };
 
     for (const PrintObjectRegions::LayerRangeRegions &layer_range : object.shared_regions()->layer_ranges) {
         for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions)
-            append_extent(volume_region.region, volume_region.bbox);
+            append_contribution(volume_region.region, volume_region.bbox);
         for (const PrintObjectRegions::PaintedRegion &painted_region : layer_range.painted_regions) {
             if (painted_region.parent < 0 || painted_region.parent >= int(layer_range.volume_regions.size()))
                 continue;
             // Painted regions have no independent bbox. Conservatively use the parent volume's full Z extent.
-            append_extent(painted_region.region, layer_range.volume_regions[painted_region.parent].bbox);
+            append_contribution(painted_region.region, layer_range.volume_regions[painted_region.parent].bbox);
         }
     }
-    if (fine_extents.empty())
+    if (contributions.empty())
         return {};
 
-    std::sort(fine_extents.begin(), fine_extents.end());
-    std::vector<std::pair<double, double>> merged;
-    for (const auto &extent : fine_extents) {
-        if (merged.empty() || extent.first > merged.back().second + EPSILON)
-            merged.push_back(extent);
-        else
-            merged.back().second = std::max(merged.back().second, extent.second);
+    static constexpr std::array<FeatureRole, 5> roles{
+        FeatureRole::Wall, FeatureRole::SparseInfill, FeatureRole::InternalSolid,
+        FeatureRole::TopSurface, FeatureRole::BottomSurface,
+    };
+    const PrintConfig &print_config = object.print()->config();
+    DynamicPrintConfig nozzle_config;
+    nozzle_config.set_key_value("nozzle_diameter", print_config.nozzle_diameter.clone());
+    nozzle_config.set_key_value("min_layer_height", print_config.min_layer_height.clone());
+    nozzle_config.set_key_value("max_layer_height", print_config.max_layer_height.clone());
+    const auto append_unique_height = [](std::vector<double> &heights, double height) {
+        if (std::none_of(heights.begin(), heights.end(), [height](double item) { return std::abs(item - height) <= EPSILON; }))
+            heights.push_back(height);
+    };
+    const auto collect_interval = [&](double lo, double hi, std::set<size_t> &tools, std::vector<double> &heights) {
+        for (const Contribution &contribution : contributions) {
+            if (contribution.hi <= lo + EPSILON || contribution.lo >= hi - EPSILON)
+                continue;
+            const PrintRegionConfig &config = contribution.region->config();
+            tools.insert(get_extruder_index_from_filament_id(
+                print_config, std::max(config.outer_wall_filament_id.value, 1)));
+            tools.insert(get_extruder_index_from_filament_id(
+                print_config, std::max(config.inner_wall_filament_id.value, 1)));
+            for (FeatureRole role : roles) {
+                if (role != FeatureRole::Wall)
+                    tools.insert(get_extruder_index_from_filament_id(print_config, filament_for_role(config, role)));
+                append_unique_height(heights, feature_height_for_role(config, role, plan.base_height));
+            }
+        }
+    };
+
+    std::vector<double> geometric_boundaries{0., object_height};
+    geometric_boundaries.reserve(2 + contributions.size() * 2);
+    for (const Contribution &contribution : contributions) {
+        geometric_boundaries.push_back(contribution.lo);
+        geometric_boundaries.push_back(contribution.hi);
+    }
+    std::sort(geometric_boundaries.begin(), geometric_boundaries.end());
+    geometric_boundaries.erase(std::unique(geometric_boundaries.begin(), geometric_boundaries.end(),
+        [](double lhs, double rhs) { return std::abs(lhs - rhs) <= EPSILON; }), geometric_boundaries.end());
+
+    std::vector<std::pair<double, double>> mixed_extents;
+    for (size_t i = 1; i < geometric_boundaries.size(); ++i) {
+        const double lo = geometric_boundaries[i - 1];
+        const double hi = geometric_boundaries[i];
+        if (lo + EPSILON >= hi)
+            continue;
+        std::set<size_t> tools;
+        std::vector<double> heights;
+        collect_interval(lo, hi, tools, heights);
+        // Multiple tools at one common height still use the ordinary uniform grid. A mixed
+        // cadence zone is needed only when distinct heights coexist in the same Z range.
+        if (heights.size() > 1) {
+            if (!mixed_extents.empty() && lo <= mixed_extents.back().second + EPSILON)
+                mixed_extents.back().second = hi;
+            else
+                mixed_extents.emplace_back(lo, hi);
+        }
     }
 
-    const bool whole_object_fine = merged.size() == 1 && merged.front().first <= EPSILON &&
-                                   merged.front().second >= object_height - EPSILON;
-    if (whole_object_fine)
-        return {{0., object_height, true}};
+    const bool whole_object_mixed = mixed_extents.size() == 1 && mixed_extents.front().first <= EPSILON &&
+                                    mixed_extents.front().second >= object_height - EPSILON;
+    if (whole_object_mixed) {
+        std::set<size_t> tools;
+        std::vector<double> heights;
+        collect_interval(0., object_height, tools, heights);
+        const double fine_height = plan.ratio > 1 ? plan.grid_height :
+            *std::min_element(heights.begin(), heights.end());
+        return {{0., object_height, true, plan.base_height, fine_height}};
+    }
 
     std::vector<std::pair<double, double>> snapped;
-    for (const auto &[extent_lo, extent_hi] : merged) {
+    for (const auto &[extent_lo, extent_hi] : mixed_extents) {
         // Bounding boxes are float-valued, so tolerate their representational noise when an
         // extent is already on an exact base-layer boundary.
         constexpr double snap_epsilon_in_steps = 1e-2;
@@ -4423,27 +4478,80 @@ static std::vector<CadenceZone> compute_cadence_zones(const PrintObject &object,
         else
             snapped.emplace_back(lo, hi);
     }
-    if (snapped.empty())
-        return {};
+    std::vector<double> boundaries = geometric_boundaries;
+    for (const auto &[lo, hi] : snapped) {
+        boundaries.push_back(lo);
+        boundaries.push_back(hi);
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end(),
+        [](double lhs, double rhs) { return std::abs(lhs - rhs) <= EPSILON; }), boundaries.end());
+
+    struct ClassifiedZone {
+        CadenceZone zone;
+        size_t      tool = size_t(-1);
+    };
+    std::vector<ClassifiedZone> classified;
+    for (size_t i = 1; i < boundaries.size(); ++i) {
+        const double lo = boundaries[i - 1];
+        const double hi = boundaries[i];
+        if (lo + EPSILON >= hi)
+            continue;
+        const bool mixed = std::any_of(snapped.begin(), snapped.end(), [lo, hi](const auto &extent) {
+            return extent.second > lo + EPSILON && extent.first < hi - EPSILON;
+        });
+        if (mixed) {
+            std::set<size_t> tools;
+            std::vector<double> heights;
+            collect_interval(lo, hi, tools, heights);
+            const double fine_height = plan.ratio > 1 ? plan.grid_height :
+                *std::min_element(heights.begin(), heights.end());
+            classified.push_back({{lo, hi, true, plan.base_height, fine_height}, size_t(-1)});
+            continue;
+        }
+
+        std::set<size_t> tools;
+        std::vector<double> heights;
+        collect_interval(lo, hi, tools, heights);
+        const size_t tool = tools.size() == 1 ? *tools.begin() : size_t(-1);
+        const double requested_height = heights.size() == 1 ? heights.front() : plan.base_height;
+        const double span = hi - std::max(lo, first_layer_height);
+        double fitted_height = requested_height;
+        if (span > EPSILON && tool != size_t(-1)) {
+            const double min_height = Slicing::min_layer_height_from_nozzle(nozzle_config, int(tool + 1));
+            const double max_height = Slicing::max_layer_height_from_nozzle(nozzle_config, int(tool + 1));
+            size_t count = std::max<size_t>(1, size_t(std::llround(span / requested_height)));
+            fitted_height = span / count;
+            if (fitted_height < min_height - EPSILON && count > 1)
+                fitted_height = span / --count;
+            else if (fitted_height > max_height + EPSILON)
+                fitted_height = span / ++count;
+        }
+        classified.push_back({{lo, hi, false, fitted_height, 0.}, tool});
+    }
 
     std::vector<CadenceZone> zones;
-    double cursor = 0.;
-    for (const auto &[lo, hi] : snapped) {
-        if (cursor + EPSILON < lo)
-            zones.push_back({cursor, lo, false});
-        zones.push_back({lo, hi, true});
-        cursor = hi;
+    size_t previous_tool = size_t(-1);
+    for (const ClassifiedZone &item : classified) {
+        if (!zones.empty() && is_approx(zones.back().hi, item.zone.lo) &&
+            zones.back().mixed == item.zone.mixed &&
+            is_approx(zones.back().height, item.zone.height) &&
+            is_approx(zones.back().fine_height, item.zone.fine_height) &&
+            (item.zone.mixed || previous_tool == item.tool)) {
+            zones.back().hi = item.zone.hi;
+        } else {
+            zones.push_back(item.zone);
+        }
+        previous_tool = item.tool;
     }
-    if (cursor + EPSILON < object_height)
-        zones.push_back({cursor, object_height, false});
+    if (zones.size() == 1 && !zones.front().mixed && is_approx(zones.front().height, plan.base_height))
+        return {};
     return zones;
 }
 
 static uint64_t cadence_zone_digest(const std::vector<CadenceZone> &zones)
 {
-    const bool has_base = std::any_of(zones.begin(), zones.end(), [](const CadenceZone &zone) { return !zone.fine; });
-    const bool has_fine = std::any_of(zones.begin(), zones.end(), [](const CadenceZone &zone) { return zone.fine; });
-    if (!has_base || !has_fine)
+    if (zones.size() <= 1)
         return 0;
 
     uint64_t digest = 1469598103934665603ULL;
@@ -4457,7 +4565,9 @@ static uint64_t cadence_zone_digest(const std::vector<CadenceZone> &zones)
     for (const CadenceZone &zone : zones) {
         append(&zone.lo, sizeof(zone.lo));
         append(&zone.hi, sizeof(zone.hi));
-        append(&zone.fine, sizeof(zone.fine));
+        append(&zone.mixed, sizeof(zone.mixed));
+        append(&zone.height, sizeof(zone.height));
+        append(&zone.fine_height, sizeof(zone.fine_height));
     }
     return digest == 0 ? 1 : digest;
 }
@@ -4490,12 +4600,22 @@ void PrintObject::update_slicing_parameters()
         const double first_layer_height = this->print()->config().initial_layer_print_height.value <= 0. ?
             m_config.layer_height.value : this->print()->config().initial_layer_print_height.value;
         m_cadence_zones = compute_cadence_zones(*this, plan, first_layer_height, this->model_object()->max_z());
-        const bool cadence_zones_active =
-            std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [](const CadenceZone &zone) { return zone.fine; }) &&
-            std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [](const CadenceZone &zone) { return !zone.fine; });
+        double min_zone_height = 0.;
+        double max_zone_height = 0.;
+        if (m_cadence_zones.size() > 1) {
+            min_zone_height = std::numeric_limits<double>::max();
+            for (const CadenceZone &zone : m_cadence_zones) {
+                min_zone_height = std::min(min_zone_height, zone.height);
+                max_zone_height = std::max(max_zone_height, zone.height);
+                if (zone.mixed) {
+                    min_zone_height = std::min(min_zone_height, zone.fine_height);
+                    max_zone_height = std::max(max_zone_height, zone.fine_height);
+                }
+            }
+        }
         m_slicing_params = SlicingParameters::create_from_config(
             this->print()->config(), m_config, this->model_object()->max_z(), this->object_extruders(),
-            this->print()->shrinkage_compensation(), &plan, fine_cadence_extruders, cadence_zones_active);
+            this->print()->shrinkage_compensation(), &plan, fine_cadence_extruders, min_zone_height, max_zone_height);
         m_slicing_params.cadence_zone_digest = cadence_zone_digest(m_cadence_zones);
     }
 }
@@ -4505,23 +4625,18 @@ bool PrintObject::layer_z_in_fine_zone(coordf_t print_z) const
     if (m_cadence_zones.empty())
         return m_slicing_params.cadence_ratio > 1;
     return std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [print_z](const CadenceZone &zone) {
-        return zone.fine && print_z > zone.lo + EPSILON && print_z <= zone.hi + EPSILON;
+        return zone.mixed && print_z > zone.lo + EPSILON && print_z <= zone.hi + EPSILON;
     });
 }
 
-bool PrintObject::region_intersects_cadence_zone(const PrintRegion &region, bool fine) const
+bool PrintObject::region_intersects_cadence_zone(const PrintRegion &region, const CadenceZone &zone) const
 {
     const auto bbox_intersects = [&](const PrintObjectRegions::BoundingBox *bbox) {
         if (bbox == nullptr)
             return false;
-        const double lo = bbox->min().z();
-        const double hi = bbox->max().z();
-        return std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [&](const CadenceZone &zone) {
-            // Region bboxes are deliberately expanded by EPSILON in PrintApply. Require
-            // overlap beyond that expansion so touching a zone boundary is not geometry in
-            // both adjacent zones.
-            return zone.fine == fine && hi > zone.lo + 2. * EPSILON && lo < zone.hi - 2. * EPSILON;
-        });
+        // Region bboxes are deliberately expanded by EPSILON in PrintApply. Require overlap
+        // beyond that expansion so touching a zone boundary is not geometry in both zones.
+        return bbox->max().z() > zone.lo + 2. * EPSILON && bbox->min().z() < zone.hi - 2. * EPSILON;
     };
     for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges) {
         for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions)
@@ -4668,7 +4783,7 @@ bool PrintObject::update_layer_height_profile(const ModelObject &model_object, c
             const double lo = std::max(zone.lo, slicing_parameters.first_object_layer_height);
             if (lo + EPSILON >= zone.hi)
                 continue;
-            const double height = zone.fine ? slicing_parameters.layer_height : slicing_parameters.base_layer_height;
+            const double height = zone.mixed ? zone.fine_height : zone.height;
             append(lo, height);
             append(zone.hi, height);
         }

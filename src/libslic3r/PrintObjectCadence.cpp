@@ -108,9 +108,9 @@ float PrintObject::infill_combination_clearance(const LayerRegion &layerm, Infil
 
 void PrintObject::recombine_feature_cadence()
 {
-    // Mixed cadence zones are handled by the thickness-driven groups below; base-height
-    // layers naturally become one-layer groups and take the self-skip path.
-    if (m_slicing_params.cadence_ratio <= 1 || m_layers.size() < 2)
+    // Only mixed zones participate. Independent single-tool zones never need recombination,
+    // including zoned objects whose global cadence ratio remains one.
+    if ((m_slicing_params.cadence_ratio <= 1 && m_slicing_params.cadence_zone_digest == 0) || m_layers.size() < 2)
         return;
 
     const double base_height = m_slicing_params.base_layer_height;
@@ -120,9 +120,14 @@ void PrintObject::recombine_feature_cadence()
     // The first object layer has its own configured height and is never recombined.
     size_t first = 1;
     while (first < m_layers.size()) {
+        if (!layer_z_in_fine_zone(m_layers[first]->print_z)) {
+            ++first;
+            continue;
+        }
         double thickness = 0.;
         size_t last = first;
-        for (; last < m_layers.size() && thickness < base_height - EPSILON; ++last)
+        for (; last < m_layers.size() && layer_z_in_fine_zone(m_layers[last]->print_z) &&
+               thickness < base_height - EPSILON; ++last)
             thickness += m_layers[last]->height;
 
         if (std::abs(thickness - base_height) <= EPSILON) {
@@ -131,6 +136,10 @@ void PrintObject::recombine_feature_cadence()
         } else if (last == m_layers.size()) {
             // A partial group at the object top remains on the fine grid.
             break;
+        } else if (!layer_z_in_fine_zone(m_layers[last]->print_z)) {
+            // A partial group at a zone boundary remains on the fine grid; continue looking
+            // for a later mixed zone.
+            first = last;
         } else {
             // P1.4 produces aligned groups. If that invariant is ever broken, skip rather than
             // combining a geometrically incorrect height.

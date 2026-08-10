@@ -818,7 +818,7 @@ void PrintObject::slice()
 {
     if (! this->set_started(posSlice))
         return;
-    if (m_slicing_params.cadence_ratio > 1) {
+    if (m_slicing_params.cadence_ratio > 1 || m_slicing_params.cadence_zone_digest != 0) {
         const bool has_layer_height_range = std::any_of(
             this->model_object()->layer_config_ranges.begin(), this->model_object()->layer_config_ranges.end(),
             [](const auto &range) { return range.second.has("layer_height"); });
