@@ -39,6 +39,11 @@ DynamicPrintConfig mixed_nozzle_grid_config()
     return mixed_nozzle_config();
 }
 
+DynamicPrintConfig mixed_nozzle_grid_config(std::initializer_list<ConfigBase::SetDeserializeItem> extra)
+{
+    return mixed_nozzle_config(extra);
+}
+
 DynamicPrintConfig filament_delta_test_config()
 {
     DynamicPrintConfig config = mixed_nozzle_config({
@@ -150,6 +155,13 @@ std::string strip_nondeterministic_gcode_lines(const std::string &gcode)
         out += '\n';
     }
     return out;
+}
+
+size_t count_warning_key(const std::vector<StringObjectException> &warnings, const std::string &opt_key)
+{
+    return std::count_if(
+        warnings.begin(), warnings.end(),
+        [&](const StringObjectException &warning) { return warning.opt_key == opt_key; });
 }
 
 std::optional<int> integer_parameter(const std::string &line, char parameter)
@@ -1357,6 +1369,195 @@ TEST_CASE("A non-divisor wall cadence reports nearby valid heights", "[FeatureCa
     CHECK(error.string.find("0.13") != std::string::npos);
     CHECK((error.string.find("0.2") != std::string::npos || error.string.find("0.1") != std::string::npos));
     CHECK(error.opt_key == "wall_layer_height");
+}
+
+TEST_CASE("Interior role finer than base remains role-specific", "[FeatureCadence][Validate][D1C]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"sparse_infill_density", 15.},
+        {"top_surface_process_layer_height", 0.1},
+        {"top_surface_filament_id", 1},
+        {"sparse_infill_filament_id", 2},
+        {"internal_solid_infill_filament_id", 2},
+        {"bottom_surface_filament_id", 2},
+    });
+    const std::string output = slice_with_object_overrides({cube(20.)}, config, {});
+    const std::vector<GCodeExtrusion> extrusions = gcode_extrusions(output);
+    REQUIRE_FALSE(extrusions.empty());
+
+    bool found_top_surface = false;
+    bool found_recombined_interior = false;
+    for (const GCodeExtrusion &extrusion : extrusions) {
+        if (extrusion.role == erTopSolidInfill) {
+            found_top_surface = true;
+            CHECK(extrusion.tool == 0);
+            CHECK_THAT(extrusion.height, Catch::Matchers::WithinAbs(0.1, EPSILON));
+            continue;
+        }
+        if (extrusion.role == erInternalInfill || extrusion.role == erSolidInfill || extrusion.role == erBottomSurface) {
+            if (std::abs(extrusion.height - 0.2) <= EPSILON) {
+                found_recombined_interior = true;
+                CHECK(extrusion.tool == 1);
+            }
+            continue;
+        }
+        if (extrusion.role == erBridgeInfill || extrusion.role == erInternalBridgeInfill)
+            continue;
+    }
+    CHECK(found_top_surface);
+    CHECK(found_recombined_interior);
+}
+
+TEST_CASE("Fine top-surface height keeps shell-layer count", "[FeatureCadence][D1C][Regression]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config();
+    config.set_deserialize_strict({
+        {"sparse_infill_density", 15.},
+        {"top_surface_process_layer_height", 0.1},
+        {"top_surface_filament_id", 1},
+        {"top_shell_layers", 7},
+        {"top_shell_thickness", 0.},
+        {"bottom_shell_layers", 0},
+        {"bottom_shell_thickness", 0.},
+    });
+    Print print;
+    Model model;
+    process_cube_with_overrides(config, {}, print, model);
+    CHECK(shell_layer_z_tenths(*print.objects().front()).size() == 5);
+}
+
+TEST_CASE("Mixed-nozzle validation is ungated without wall cadence", "[FeatureCadence][Validate][D1C]")
+{
+    DynamicPrintConfig mixed = mixed_nozzle_grid_config();
+    Print mixed_print;
+    Model mixed_model;
+    init_print({cube(20.)}, mixed_print, mixed_model, mixed);
+    const StringObjectException mixed_error = mixed_print.validate();
+    CHECK_FALSE(mixed_error.string.empty());
+    CHECK(mixed_error.string.find("Outer wall") != std::string::npos);
+    CHECK(mixed_error.opt_key == "wall_layer_height");
+
+    DynamicPrintConfig uniform = mixed_nozzle_grid_config({
+        {"nozzle_diameter", "0.4,0.4"},
+        {"max_layer_height", "0.3,0.3"},
+    });
+    Print uniform_print;
+    Model uniform_model;
+    init_print({cube(20.)}, uniform_print, uniform_model, uniform);
+    CHECK(uniform_print.validate().string.empty());
+}
+
+TEST_CASE("Non-divisor interior heights are rejected by role", "[FeatureCadence][Validate][D1C]")
+{
+    DynamicPrintConfig fail = mixed_nozzle_grid_config({{"sparse_infill_process_layer_height", 0.13}, {"sparse_infill_filament_id", 1}});
+    fail.set_deserialize_strict({
+        {"outer_wall_filament_id", 2},
+        {"inner_wall_filament_id", 2},
+    });
+    Print fail_print;
+    Model fail_model;
+    init_print({cube(20.)}, fail_print, fail_model, fail);
+    const StringObjectException fail_error = fail_print.validate();
+    REQUIRE_FALSE(fail_error.string.empty());
+    CHECK(fail_error.string.find("Sparse infill") != std::string::npos);
+    CHECK(fail_error.string.find("must divide base layer height") != std::string::npos);
+    CHECK(fail_error.opt_key == "layer_height");
+
+    DynamicPrintConfig pass = mixed_nozzle_grid_config({{"sparse_infill_process_layer_height", 0.1}, {"sparse_infill_filament_id", 1}});
+    pass.set_deserialize_strict({
+        {"outer_wall_filament_id", 2},
+        {"inner_wall_filament_id", 2},
+    });
+    Print pass_print;
+    Model pass_model;
+    init_print({cube(20.)}, pass_print, pass_model, pass);
+    const StringObjectException pass_error = pass_print.validate();
+    const PrintRegion &pass_region = pass_print.objects().front()->all_regions().front().get();
+    CHECK(pass_error.string.empty());
+}
+
+TEST_CASE("Interior heights must stay on endpoints", "[FeatureCadence][Validate][D1C]")
+{
+    DynamicPrintConfig config = mixed_nozzle_grid_config({
+        {"wall_layer_height", 0.05},
+        {"top_surface_process_layer_height", 0.1},
+        {"top_surface_filament_id", 1},
+    });
+    Print print;
+    Model model;
+    init_print({cube(20.)}, print, model, config);
+    const StringObjectException error = print.validate();
+    REQUIRE_FALSE(error.string.empty());
+    CHECK(error.string.find("Top surface") != std::string::npos);
+    CHECK(error.string.find("unsupported when the base layer height is") != std::string::npos);
+}
+
+TEST_CASE("First-layer height warns on mixed nozzles", "[FeatureCadence][Validate][D1C][Regression]")
+{
+    DynamicPrintConfig mixed = mixed_nozzle_grid_config({{"initial_layer_print_height", 0.2}});
+    mixed.set_deserialize_strict({
+        {"outer_wall_filament_id", 2},
+        {"inner_wall_filament_id", 2},
+    });
+    Print mixed_print;
+    Model mixed_model;
+    init_print({cube(20.)}, mixed_print, mixed_model, mixed);
+    std::vector<StringObjectException> mixed_warnings;
+    CHECK(mixed_print.validate(&mixed_warnings).string.empty());
+    CHECK(count_warning_key(mixed_warnings, "initial_layer_print_height") == 1u);
+
+    DynamicPrintConfig uniform = mixed_nozzle_grid_config({
+        {"nozzle_diameter", "0.2,0.2"},
+        {"initial_layer_print_height", 0.2},
+        {"max_layer_height", "0.3,0.3"},
+        {"min_layer_height", "0.1,0.1"},
+    });
+    Print uniform_print;
+    Model uniform_model;
+    init_print({cube(20.)}, uniform_print, uniform_model, uniform);
+    std::vector<StringObjectException> uniform_warnings;
+    CHECK(uniform_print.validate(&uniform_warnings).string.empty());
+    CHECK(count_warning_key(uniform_warnings, "initial_layer_print_height") == 0u);
+}
+
+TEST_CASE("Ratio-one empty filament deltas preserve validation outcome", "[FeatureCadence][FilamentProcess][Validate][Regression][D1C]")
+{
+    DynamicPrintConfig with_empty_deltas = mixed_nozzle_grid_config();
+    with_empty_deltas.option<ConfigOptionStrings>("filament_process_projection", true)->values = {"", ""};
+    Print with_print;
+    Model with_model;
+    init_print({cube(20.)}, with_print, with_model, with_empty_deltas);
+    const StringObjectException with_error = with_print.validate();
+
+    DynamicPrintConfig without_deltas = mixed_nozzle_grid_config();
+    without_deltas.erase("filament_process_projection");
+    Print without_print;
+    Model without_model;
+    init_print({cube(20.)}, without_print, without_model, without_deltas);
+    const StringObjectException without_error = without_print.validate();
+
+    CHECK(with_error.string == without_error.string);
+    CHECK(with_error.opt_key == without_error.opt_key);
+}
+
+TEST_CASE("Walls resolved only through a filament delta pass validation", "[FeatureCadence][Validate][FilamentProcess][Regression]")
+{
+    // No L2 wall_process_projection anywhere: the wall filament's per-filament delta (L1) is the
+    // sole resolution channel and must satisfy the stale-wall guard.
+    DynamicPrintConfig config = filament_delta_test_config();
+    // Map the base filament onto the coarse tool so slot 1's 0.2 mm delta is physically valid;
+    // walls ride filament 2 on the fine tool with only its L1 delta as resolution.
+    config.set_deserialize_strict("filament_map", "2,1");
+    config.set_deserialize_strict("outer_wall_filament_id", "2");
+    config.set_deserialize_strict("inner_wall_filament_id", "2");
+    Print print;
+    Model model;
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config);
+
+    const StringObjectException error = print.validate();
+    INFO(error.string);
+    CHECK(error.string.empty());
 }
 
 TEST_CASE("Wall cadence rejects an extrusion taller than its wall nozzle", "[FeatureCadence][Validate]")

@@ -4,6 +4,7 @@
 #include "Layer.hpp"
 #include "PrintConfig.hpp"
 #include "SurfaceCollection.hpp"
+#include "Slicing.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -63,6 +64,21 @@ double feature_height_cap(const PrintConfig &print_config, unsigned int filament
     if (max_height <= 0.)
         max_height = 0.75 * nozzle;
     return std::min({base_height, nozzle, max_height});
+}
+
+double feature_height_target(const PrintConfig &print_config, unsigned int filament_id, double base_height, double requested_height)
+{
+    if (requested_height <= 0.)
+        return feature_height_cap(print_config, filament_id, base_height);
+
+    const size_t tool_id   = get_extruder_index_from_filament_id(print_config, filament_id);
+    DynamicPrintConfig dynamic_print_config;
+    dynamic_print_config.set_key_value("nozzle_diameter", print_config.nozzle_diameter.clone());
+    dynamic_print_config.set_key_value("min_layer_height", print_config.min_layer_height.clone());
+    dynamic_print_config.set_key_value("max_layer_height", print_config.max_layer_height.clone());
+    const double min_height = Slicing::min_layer_height_from_nozzle(dynamic_print_config, int(tool_id + 1));
+    const double cap       = feature_height_cap(print_config, filament_id, base_height);
+    return std::min(std::max(requested_height, min_height), cap);
 }
 
 void consume_internal_solid(LayerRegion &layerm, const ExPolygons &footprint, float clearance_offset)
@@ -133,8 +149,9 @@ void PrintObject::recombine_feature_cadence()
             // Top surfaces remain on their original layer and grow downward through solid infill.
             // Tops and bottoms absorb fine solids BEFORE the interior pass combines the remainder:
             // absorbing from an already-combined surface would flatten its thickness metadata.
-            const double top_cap = feature_height_cap(
-                print_config, region_config.top_surface_filament_id.value, base_height);
+            const double top_cap = feature_height_target(
+                print_config, region_config.top_surface_filament_id.value, base_height,
+                region_config.top_surface_process_layer_height.value);
             for (size_t layer_idx = group.first; layer_idx <= group.last; ++layer_idx) {
                 LayerRegion *top_layerm = m_layers[layer_idx]->regions()[region_id];
                 Surfaces tops = copy_surfaces(top_layerm->fill_surfaces.filter_by_type(stTop));
@@ -178,8 +195,9 @@ void PrintObject::recombine_feature_cadence()
                 layerm->fill_surfaces.remove_type(stBottom);
             }
 
-            const double bottom_cap = feature_height_cap(
-                print_config, region_config.bottom_surface_filament_id.value, base_height);
+            const double bottom_cap = feature_height_target(
+                print_config, region_config.bottom_surface_filament_id.value, base_height,
+                region_config.bottom_surface_process_layer_height.value);
             for (size_t layer_idx = group.first; layer_idx <= group.last; ++layer_idx) {
                 LayerRegion *source = m_layers[layer_idx]->regions()[region_id];
                 for (const Surface &bottom : bottoms[layer_idx - group.first]) {
@@ -221,7 +239,10 @@ void PrintObject::recombine_feature_cadence()
             for (SurfaceType type : {stInternal, stInternalSolid}) {
                 const unsigned int filament_id = type == stInternal ? region_config.sparse_infill_filament_id.value :
                                                                      region_config.internal_solid_filament_id.value;
-                if (group.thickness > feature_height_cap(print_config, filament_id, base_height) + EPSILON)
+                const double requested_height = type == stInternal ? region_config.sparse_infill_process_layer_height.value :
+                                                                     region_config.internal_solid_process_layer_height.value;
+                const double feature_height = feature_height_target(print_config, filament_id, base_height, requested_height);
+                if (group.thickness > feature_height + EPSILON)
                     continue;
 
                 LayerRegion *top_layerm = m_layers[group.last]->regions()[region_id];

@@ -87,10 +87,14 @@ using namespace std::literals;
 
 namespace Slic3r {
 
-static int scaled_shell_layers(int shell_layers, int cadence_ratio)
+static int scaled_shell_layers(int shell_layers, int cadence_ratio, double feature_height, double base_height)
 {
-    return shell_layers > 0 ? shell_layers * cadence_ratio : shell_layers;
+    if (shell_layers <= 0 || cadence_ratio <= 1 || std::abs(feature_height - base_height) > EPSILON)
+        return shell_layers;
+    return shell_layers * cadence_ratio;
 }
+
+static double feature_height_for_role(const PrintRegionConfig &config, FeatureRole role, double base_height);
 
 // Constructor is called from the main thread, therefore all Model / ModelObject / ModelIntance data are valid.
 PrintObject::PrintObject(Print* print, ModelObject* model_object, const Transform3d& trafo, PrintInstances&& instances) :
@@ -2227,8 +2231,11 @@ void PrintObject::discover_vertical_shells()
     };
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
     size_t   num_layers       = spiral_mode ?
-        std::min(size_t(scaled_shell_layers(this->printing_region(0).config().bottom_shell_layers,
-                                            m_slicing_params.cadence_ratio)), m_layers.size()) :
+        std::min(size_t(scaled_shell_layers(this->printing_region(0).config().bottom_shell_layers.value,
+                                            m_slicing_params.cadence_ratio,
+                                            feature_height_for_role(this->printing_region(0).config(), FeatureRole::BottomSurface,
+                                                                  m_slicing_params.base_layer_height),
+                                            m_slicing_params.base_layer_height)), m_layers.size()) :
         m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
     bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value;
@@ -2431,7 +2438,10 @@ void PrintObject::discover_vertical_shells()
                     };
                     static constexpr const bool one_more_layer_below_top_bottom_surfaces = false;
                     if (int n_top_layers = scaled_shell_layers(region_config.top_shell_layers.value,
-                                                                m_slicing_params.cadence_ratio); n_top_layers > 0) {
+                                                               m_slicing_params.cadence_ratio,
+                                                               feature_height_for_role(region_config, FeatureRole::TopSurface,
+                                                                                     m_slicing_params.base_layer_height),
+                                                               m_slicing_params.base_layer_height); n_top_layers > 0) {
                         // Gather top regions projected to this layer.
                         coordf_t print_z = layer->print_z;
                         int i = int(idx_layer) + 1;
@@ -2461,7 +2471,10 @@ void PrintObject::discover_vertical_shells()
                                 combine_holes(cache_top_botom_regions[i].holes);
                     }
                     if (int n_bottom_layers = scaled_shell_layers(region_config.bottom_shell_layers.value,
-                                                                   m_slicing_params.cadence_ratio); n_bottom_layers > 0) {
+                                                                  m_slicing_params.cadence_ratio,
+                                                                  feature_height_for_role(region_config, FeatureRole::BottomSurface,
+                                                                                     m_slicing_params.base_layer_height),
+                                                                  m_slicing_params.base_layer_height); n_bottom_layers > 0) {
                         // Gather bottom regions projected to this layer.
                         coordf_t bottom_z = layer->bottom_z();
                         int i = int(idx_layer) - 1;
@@ -4084,6 +4097,21 @@ static unsigned int filament_for_role(const PrintRegionConfig &config, FeatureRo
     }
 }
 
+static double feature_height_for_role(const PrintRegionConfig &config, FeatureRole role, double base_height)
+{
+    const auto resolve_height = [base_height](double role_height) {
+        return role_height > EPSILON ? role_height : base_height;
+    };
+    switch (role) {
+    case FeatureRole::Wall:          return resolve_height(config.wall_layer_height.value);
+    case FeatureRole::SparseInfill:  return resolve_height(config.sparse_infill_process_layer_height.value);
+    case FeatureRole::InternalSolid: return resolve_height(config.internal_solid_process_layer_height.value);
+    case FeatureRole::TopSurface:    return resolve_height(config.top_surface_process_layer_height.value);
+    case FeatureRole::BottomSurface: return resolve_height(config.bottom_surface_process_layer_height.value);
+    default:                         return base_height;
+    }
+}
+
 static const char *height_key_for_role(FeatureRole role)
 {
     switch (role) {
@@ -4093,6 +4121,18 @@ static const char *height_key_for_role(FeatureRole role)
     case FeatureRole::TopSurface:    return "top_surface_process_layer_height";
     case FeatureRole::BottomSurface: return "bottom_surface_process_layer_height";
     default:                         return nullptr;
+    }
+}
+
+static const char *feature_name_for_role(FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return "Wall";
+    case FeatureRole::SparseInfill:  return "Sparse infill";
+    case FeatureRole::InternalSolid: return "Internal solid infill";
+    case FeatureRole::TopSurface:    return "Top surface";
+    case FeatureRole::BottomSurface: return "Bottom surface";
+    default:                         return "Feature";
     }
 }
 
@@ -4250,39 +4290,67 @@ struct POProfiler
 
 static bool update_feature_cadence_plan(FeatureCadencePlan &plan, const PrintRegionConfig &region_config)
 {
-    const double wall_height = region_config.wall_layer_height.value;
-    if (wall_height <= 0. || wall_height >= plan.base_height - EPSILON)
-        return false;
+    static const FeatureRole roles[] = {
+        FeatureRole::Wall,
+        FeatureRole::SparseInfill,
+        FeatureRole::InternalSolid,
+        FeatureRole::TopSurface,
+        FeatureRole::BottomSurface,
+    };
+    bool updated = false;
+    for (FeatureRole role : roles) {
+        const char *name = feature_name_for_role(role);
+        const double role_height = feature_height_for_role(region_config, role, plan.base_height);
+        if (role_height <= 0. || role_height >= plan.base_height - EPSILON)
+            continue;
 
-    const int region_ratio = feature_cadence_ratio(plan.base_height, wall_height);
-    if (region_ratio <= 1) {
-        BOOST_LOG_TRIVIAL(debug) << "Ignoring non-divisor wall layer height " << wall_height
-                                 << " for base layer height " << plan.base_height;
-        return false;
+        const int region_ratio = feature_cadence_ratio(plan.base_height, role_height);
+        if (region_ratio <= 1) {
+            BOOST_LOG_TRIVIAL(debug) << "Ignoring non-divisor " << name << " layer height " << role_height
+                                     << " for base layer height " << plan.base_height;
+            continue;
+        }
+
+        const long long ratio = static_cast<long long>(plan.ratio / std::gcd(plan.ratio, region_ratio)) * region_ratio;
+        if (ratio > std::numeric_limits<int>::max()) {
+            BOOST_LOG_TRIVIAL(debug) << "Ignoring " << name << " cadence whose combined ratio exceeds the supported integer range";
+            continue;
+        }
+        if (ratio != plan.ratio)
+            updated = true;
+        plan.ratio       = static_cast<int>(ratio);
+        plan.grid_height = plan.base_height / plan.ratio;
     }
 
-    const long long ratio = static_cast<long long>(plan.ratio / std::gcd(plan.ratio, region_ratio)) * region_ratio;
-    if (ratio > std::numeric_limits<int>::max()) {
-        BOOST_LOG_TRIVIAL(debug) << "Ignoring wall cadence whose combined ratio exceeds the supported integer range";
-        return false;
-    }
-    plan.ratio       = static_cast<int>(ratio);
-    plan.grid_height = plan.base_height / plan.ratio;
-    return true;
+    return updated;
 }
 
-static void append_fine_wall_extruders(const PrintConfig &print_config, const PrintRegionConfig &region_config,
-                                       const FeatureCadencePlan &plan, std::vector<unsigned int> &extruders)
+static void append_fine_cadence_extruders(const PrintConfig &print_config, const PrintRegionConfig &region_config,
+                                          const FeatureCadencePlan &plan, std::vector<unsigned int> &extruders)
 {
-    const double wall_height = region_config.wall_layer_height.value;
-    if (wall_height <= 0. || wall_height >= plan.base_height - EPSILON ||
-        feature_cadence_ratio(plan.base_height, wall_height) <= 1)
-        return;
+    static const FeatureRole roles[] = {
+        FeatureRole::Wall,
+        FeatureRole::SparseInfill,
+        FeatureRole::InternalSolid,
+        FeatureRole::TopSurface,
+        FeatureRole::BottomSurface,
+    };
+    for (FeatureRole role : roles) {
+        const double role_height = feature_height_for_role(region_config, role, plan.base_height);
+        if (role_height >= plan.base_height - EPSILON)
+            continue;
 
-    extruders.emplace_back(static_cast<unsigned int>(
-        get_extruder_index_from_filament_id(print_config, region_config.outer_wall_filament_id.value)));
-    extruders.emplace_back(static_cast<unsigned int>(
-        get_extruder_index_from_filament_id(print_config, region_config.inner_wall_filament_id.value)));
+        if (role == FeatureRole::Wall) {
+            extruders.emplace_back(static_cast<unsigned int>(
+                get_extruder_index_from_filament_id(print_config, region_config.outer_wall_filament_id.value)));
+            extruders.emplace_back(static_cast<unsigned int>(
+                get_extruder_index_from_filament_id(print_config, region_config.inner_wall_filament_id.value)));
+            continue;
+        }
+
+        extruders.emplace_back(static_cast<unsigned int>(
+            get_extruder_index_from_filament_id(print_config, filament_for_role(region_config, role))));
+    }
 }
 
 void PrintObject::generate_support_preview()
@@ -4307,7 +4375,7 @@ void PrintObject::update_slicing_parameters()
         std::vector<unsigned int> fine_cadence_extruders;
         if (plan.ratio > 1) {
             for (const PrintRegion &region : this->all_regions())
-                append_fine_wall_extruders(this->print()->config(), region.config(), plan, fine_cadence_extruders);
+                append_fine_cadence_extruders(this->print()->config(), region.config(), plan, fine_cadence_extruders);
             sort_remove_duplicates(fine_cadence_extruders);
         }
         m_slicing_params = SlicingParameters::create_from_config(
@@ -4355,7 +4423,7 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
                 object_config.brim_type != btNoBrim && object_config.brim_width > 0.,
 				object_extruders);
 			update_feature_cadence_plan(cadence_plan, region_config);
-			append_fine_wall_extruders(print_config, region_config, cadence_plan, fine_cadence_extruders);
+			append_fine_cadence_extruders(print_config, region_config, cadence_plan, fine_cadence_extruders);
 			for (const std::pair<const t_layer_height_range, ModelConfig> &range_and_config : model_object.layer_config_ranges)
 				if (range_and_config.second.has("outer_wall_filament_id") ||
 					range_and_config.second.has("inner_wall_filament_id") ||
@@ -4583,7 +4651,11 @@ void PrintObject::discover_horizontal_shells()
                 SurfaceType type = (idx_surface_type == 0) ? stTop : (idx_surface_type == 1) ? stBottom : stBottomBridge;
                 int num_solid_layers = scaled_shell_layers(
                     (type == stTop) ? region_config.top_shell_layers.value : region_config.bottom_shell_layers.value,
-                    m_slicing_params.cadence_ratio);
+                    m_slicing_params.cadence_ratio,
+                    feature_height_for_role(region_config,
+                                          type == stTop ? FeatureRole::TopSurface : FeatureRole::BottomSurface,
+                                          m_slicing_params.base_layer_height),
+                    m_slicing_params.base_layer_height);
                 if (type != stTop && i == 0 && m_slicing_params.cadence_ratio > 1 && num_solid_layers > 0)
                     // The initial layer is already one full base-cadence group, not one fine-grid layer.
                     num_solid_layers -= m_slicing_params.cadence_ratio - 1;

@@ -1530,8 +1530,19 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     slicing_params0.gap_support_object != slicing_params.gap_support_object)
                     return {L("The prime tower is only supported for multiple objects if they are printed with the same support_top_z_distance."), object};
 #endif
-                if (!equal_layering(slicing_params, slicing_params0))
-                    return  { L("A prime tower requires that all objects are sliced with the same layer height."), object };
+                if (!equal_layering(slicing_params, slicing_params0)) {
+                    const auto object_name = [](const PrintObject *obj, size_t idx) -> std::string {
+                        const std::string &name = obj->model_object()->name;
+                        if (!name.empty())
+                            return name;
+                        return Slic3r::format("Object %1%", idx + 1);
+                    };
+                    const std::string first_name = object_name(m_objects.front(), 0);
+                    return {Slic3r::format(
+                        L("Objects '%1%' (%2% mm) and '%3%' (%4% mm) must use the same layer height for a prime tower, or disable the prime tower."),
+                        first_name, slicing_params0.base_layer_height, object_name(object, i), slicing_params.base_layer_height),
+                        object, "layer_height"};
+                }
                 if (has_custom_layering) {
                     auto &lh         = layer_height_profile(i);
                     auto &lh_tallest = layer_height_profile(tallest_object_idx);
@@ -1638,15 +1649,25 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             }
             return {};
         };
-        auto invalid_wall_divisor = [this, &dynamic_print_config](const PrintObject *object, const PrintRegion &region,
-                                                                  double base_height) -> StringObjectException {
-            const double wall_height = region.config().wall_layer_height.value;
-            if (wall_height <= 0. || wall_height >= base_height - EPSILON ||
-                feature_cadence_ratio(base_height, wall_height) != 0)
+        auto feature_height_for_role = [](const PrintRegionConfig &region_config, double base_height, FeatureRole role) -> double {
+            const auto resolve_height = [base_height](double height) { return height > EPSILON ? height : base_height; };
+            switch (role) {
+            case FeatureRole::Wall:          return region_config.wall_layer_height.value;
+            case FeatureRole::SparseInfill:  return resolve_height(region_config.sparse_infill_process_layer_height.value);
+            case FeatureRole::InternalSolid: return resolve_height(region_config.internal_solid_process_layer_height.value);
+            case FeatureRole::TopSurface:    return resolve_height(region_config.top_surface_process_layer_height.value);
+            case FeatureRole::BottomSurface: return resolve_height(region_config.bottom_surface_process_layer_height.value);
+            default:                         return base_height;
+            }
+        };
+        auto invalid_feature_divisor = [this, &dynamic_print_config](const PrintObject *object, const std::string &feature_name,
+                                                                   const char *opt_key, double base_height,
+                                                                   double feature_height, int filament_id) -> StringObjectException {
+            if (feature_height <= 0. || feature_height >= base_height - EPSILON ||
+                feature_cadence_ratio(base_height, feature_height) != 0)
                 return {};
 
-            const size_t tool_id = get_extruder_index_from_filament_id(
-                m_config, region.config().outer_wall_filament_id.value);
+            const size_t tool_id = get_extruder_index_from_filament_id(m_config, filament_id);
             const double min_layer_height = Slicing::min_layer_height_from_nozzle(dynamic_print_config, int(tool_id + 1));
             const double max_layer_height = Slicing::max_layer_height_from_nozzle(dynamic_print_config, int(tool_id + 1));
             std::vector<double> valid_heights;
@@ -1656,26 +1677,25 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                     valid_heights.push_back(height);
             }
 
-            const std::string feature_name = L("Walls");
             std::string message;
             if (valid_heights.empty()) {
                 message = Slic3r::format(
-                    L("%1% layer height %2% mm must divide base layer height %3% mm exactly, but no divisor from ratios 1 through 5 is within the wall tool's layer-height range."),
-                    feature_name, wall_height, base_height);
+                    L("%1% layer height %2% mm must divide base layer height %3% mm exactly, but no divisor from ratios 1 through 5 is within the %4% mm nozzle's layer-height range."),
+                    feature_name, feature_height, base_height, m_config.nozzle_diameter.get_at(tool_id));
             } else if (valid_heights.size() == 1) {
                 message = Slic3r::format(
-                    L("%1% layer height %2% mm must divide base layer height %3% mm exactly. Valid nearby height: %4% mm."),
-                    feature_name, wall_height, base_height, valid_heights[0]);
+                    L("%1% layer height %2% mm must divide base layer height %3% mm exactly. Valid nearby heights: %4% mm."),
+                    feature_name, feature_height, base_height, valid_heights[0]);
             } else if (valid_heights.size() == 2) {
                 message = Slic3r::format(
                     L("%1% layer height %2% mm must divide base layer height %3% mm exactly. Valid nearby heights: %4% mm, %5% mm."),
-                    feature_name, wall_height, base_height, valid_heights[0], valid_heights[1]);
+                    feature_name, feature_height, base_height, valid_heights[0], valid_heights[1]);
             } else {
                 message = Slic3r::format(
                     L("%1% layer height %2% mm must divide base layer height %3% mm exactly. Valid nearby heights: %4% mm, %5% mm, %6% mm."),
-                    feature_name, wall_height, base_height, valid_heights[0], valid_heights[1], valid_heights[2]);
+                    feature_name, feature_height, base_height, valid_heights[0], valid_heights[1], valid_heights[2]);
             }
-            return {std::move(message), object, "wall_layer_height"};
+            return {std::move(message), object, opt_key};
         };
         for (PrintObject *object : m_objects) {
             if (object->has_support_material()) {
@@ -1747,7 +1767,8 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                 }
             }
 
-            double initial_layer_print_height = m_config.initial_layer_print_height.value;
+            const double initial_layer_print_height = m_config.initial_layer_print_height.value;
+            const bool mixed_nozzle_diameters = max_nozzle_diameter - min_nozzle_diameter > EPSILON;
             double first_layer_min_nozzle_diameter;
             if (object->has_raft()) {
                 // if we have raft layers, only support material extruder is used on first layer
@@ -1763,19 +1784,114 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
             }
             if (initial_layer_print_height > first_layer_min_nozzle_diameter)
                 return {L("Layer height cannot exceed nozzle diameter."), object, "initial_layer_print_height"};
+            if (mixed_nozzle_diameters) {
+                // The first layer is a global setting shared by every tool that prints it; find the
+                // tightest applicable tool: the raft tool if rafted, else the smallest first-layer nozzle.
+                size_t first_layer_tool;
+                if (object->has_raft()) {
+                    const int raft_filament = object->config().raft_layers == 1 ?
+                        object->config().support_interface_filament.value : object->config().support_filament.value;
+                    first_layer_tool = get_extruder_index_from_filament_id(m_config, std::max(raft_filament, 1));
+                } else {
+                    first_layer_tool = 0;
+                    for (size_t tool = 1; tool < m_config.nozzle_diameter.size(); ++tool)
+                        if (m_config.nozzle_diameter.get_at(tool) < m_config.nozzle_diameter.get_at(first_layer_tool))
+                            first_layer_tool = tool;
+                }
+                const double first_layer_max_height = Slicing::max_layer_height_from_nozzle(dynamic_print_config, int(first_layer_tool + 1));
+                if (initial_layer_print_height > first_layer_max_height + EPSILON)
+                    warn(Slic3r::format(L("First layer height %1% mm exceeds the %2% mm nozzle's %3% mm layer-height limit; first layer height is a global setting."),
+                                        initial_layer_print_height, m_config.nozzle_diameter.get_at(first_layer_tool), first_layer_max_height),
+                         "initial_layer_print_height");
+            }
 
             // validate layer_height
             double layer_height = object->config().layer_height.value;
             const SlicingParameters &slicing_params = object->slicing_parameters();
             const double base_layer_height = slicing_params.base_layer_height > 0. ?
                                                  slicing_params.base_layer_height : layer_height;
-            for (const PrintRegion &region : object->all_regions()) {
-                if (StringObjectException error = invalid_wall_divisor(object, region, base_layer_height);
-                    !error.string.empty())
-                    return error;
+            const double grid_layer_height = slicing_params.layer_height;
+            if (mixed_nozzle_diameters) {
+                std::vector<double> resolved_feature_heights;
+                auto add_resolved_height = [&](double height) {
+                    for (double known_height : resolved_feature_heights) {
+                        if (std::abs(height - known_height) <= 0.0005)
+                            return;
+                    }
+                    resolved_feature_heights.push_back(height);
+                };
+                if (grid_layer_height < base_layer_height - EPSILON)
+                    add_resolved_height(grid_layer_height);
+                auto between_endpoint_error = [&](const std::string &feature_name, double height) -> StringObjectException {
+                    return {Slic3r::format(
+                                L("%1% layer height %2% mm is unsupported when the base layer height is %3% mm; supported heights are %4% mm and %5% mm."),
+                                feature_name, height, base_layer_height, grid_layer_height, base_layer_height), object, "layer_height"};
+                };
+                for (const PrintRegion &region : object->all_regions()) {
+                    const PrintRegionConfig &cfg = region.config();
+                    const double wall_feature_height = cfg.wall_layer_height.value > EPSILON ? cfg.wall_layer_height.value : base_layer_height;
+                    for (StringObjectException error : {
+                             validate_feature_height(object, L("Outer wall"), wall_feature_height,
+                                                    cfg.outer_wall_filament_id.value, "wall_layer_height"),
+                             validate_feature_height(object, L("Inner wall"), wall_feature_height,
+                                                    cfg.inner_wall_filament_id.value, "wall_layer_height"),
+                         }) {
+                        if (!error.string.empty())
+                            return error;
+                    }
+                    if (StringObjectException error = invalid_feature_divisor(object, L("Outer wall"), "wall_layer_height",
+                                                                            base_layer_height, wall_feature_height,
+                                                                            cfg.outer_wall_filament_id.value);
+                        !error.string.empty())
+                        return error;
+                    if (StringObjectException error = invalid_feature_divisor(object, L("Inner wall"), "wall_layer_height",
+                                                                            base_layer_height, wall_feature_height,
+                                                                            cfg.inner_wall_filament_id.value);
+                        !error.string.empty())
+                        return error;
+
+                    struct RoleCheck {
+                        FeatureRole role;
+                        std::string name;
+                        int         filament_id;
+                    };
+                    for (const RoleCheck &check : {
+                             RoleCheck{FeatureRole::SparseInfill, L("Sparse infill"), cfg.sparse_infill_filament_id.value},
+                             RoleCheck{FeatureRole::InternalSolid, L("Internal solid infill"), cfg.internal_solid_filament_id.value},
+                             RoleCheck{FeatureRole::TopSurface, L("Top surface"), cfg.top_surface_filament_id.value},
+                             RoleCheck{FeatureRole::BottomSurface, L("Bottom surface"), cfg.bottom_surface_filament_id.value},
+                         }) {
+                        const double role_height = feature_height_for_role(cfg, base_layer_height, check.role);
+                        if (StringObjectException error = validate_feature_height(object, check.name, role_height,
+                                                                                  check.filament_id, "layer_height");
+                            !error.string.empty())
+                            return error;
+                        if (role_height >= base_layer_height - EPSILON)
+                            continue;
+                        add_resolved_height(role_height);
+                        if (grid_layer_height + EPSILON < base_layer_height - EPSILON &&
+                            std::abs(role_height - grid_layer_height) > EPSILON &&
+                            std::abs(role_height - base_layer_height) > EPSILON)
+                            return between_endpoint_error(check.name, role_height);
+                        if (StringObjectException error = invalid_feature_divisor(object, check.name, "layer_height",
+                                                                                  base_layer_height, role_height,
+                                                                                  check.filament_id);
+                            !error.string.empty())
+                            return error;
+                    }
+                }
+                if (resolved_feature_heights.size() > 2) {
+                    std::ostringstream message_stream;
+                    for (size_t i = 0; i < resolved_feature_heights.size(); ++i) {
+                        if (i > 0)
+                            message_stream << ", ";
+                        message_stream << resolved_feature_heights[i];
+                    }
+                    return {Slic3r::format(L("Features resolve to more than two layer heights (%1%); pin processes so at most two heights remain, or disable per-filament processes."),
+                                           message_stream.str()), object, "layer_height"};
+                }
             }
 
-            const bool mixed_nozzle_diameters = max_nozzle_diameter - min_nozzle_diameter > EPSILON;
             if (mixed_nozzle_diameters && is_auto_filament_map_mode(m_config.filament_map_mode.value)) {
                 const auto process_is_active = [](FeatureProcessPolicy policy, const std::string &preset, double height) {
                     return policy != FeatureProcessPolicy::AutoNozzleVariant || !preset.empty() || height > 0.;
@@ -1844,6 +1960,13 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
 
                 for (const PrintRegion &region : object->all_regions()) {
                     const PrintRegionConfig &region_config = region.config();
+                    const double sparse_feature_height = feature_height_for_role(region_config, base_layer_height,
+                                                                              FeatureRole::SparseInfill);
+                    const double internal_solid_feature_height = feature_height_for_role(region_config, base_layer_height,
+                                                                                       FeatureRole::InternalSolid);
+                    const double top_feature_height = feature_height_for_role(region_config, base_layer_height, FeatureRole::TopSurface);
+                    const double bottom_feature_height = feature_height_for_role(region_config, base_layer_height,
+                                                                                FeatureRole::BottomSurface);
                     const size_t outer_tool = get_extruder_index_from_filament_id(
                         m_config, region_config.outer_wall_filament_id.value);
                     const size_t inner_tool = get_extruder_index_from_filament_id(
@@ -1855,8 +1978,19 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                                 object, "inner_wall_filament_id"};
                     }
 
-                    if (region_config.wall_process_policy.value != FeatureProcessPolicy::SameAsObject &&
-                        region_config.wall_process_projection.value.empty() && region_config.wall_layer_height.value == 0. &&
+                    // Walls on a different-nozzle tool must have been resolved through SOME channel:
+                    // the per-role projection (L2) or the wall filament's per-filament delta (L1).
+                    const auto l1_delta_empty = [this](int filament_id) {
+                        const auto &deltas = m_config.filament_process_projection.values;
+                        const size_t index = size_t(std::max(filament_id, 1)) - 1;
+                        return index >= deltas.size() || deltas[index].empty();
+                    };
+                    if (region_config.wall_layer_height.value > EPSILON &&
+                        region_config.wall_layer_height.value < base_layer_height - EPSILON &&
+                        region_config.wall_process_policy.value != FeatureProcessPolicy::SameAsObject &&
+                        region_config.wall_process_projection.value.empty() &&
+                        l1_delta_empty(region_config.outer_wall_filament_id.value) &&
+                        l1_delta_empty(region_config.inner_wall_filament_id.value) &&
                         (std::abs(outer_nozzle - object_nozzle) > EPSILON ||
                          std::abs(inner_nozzle - object_nozzle) > EPSILON)) {
                         const double wall_nozzle = std::abs(outer_nozzle - object_nozzle) > EPSILON ? outer_nozzle : inner_nozzle;
@@ -1871,13 +2005,13 @@ StringObjectException Print::validate(std::vector<StringObjectException> *warnin
                                                      region_config.outer_wall_filament_id.value, "wall_layer_height"),
                              validate_feature_height(object, L("Inner wall"), slicing_params.layer_height,
                                                      region_config.inner_wall_filament_id.value, "wall_layer_height"),
-                             validate_feature_height(object, L("Sparse infill"), base_layer_height,
+                             validate_feature_height(object, L("Sparse infill"), sparse_feature_height,
                                                      region_config.sparse_infill_filament_id.value, "layer_height"),
-                             validate_feature_height(object, L("Internal solid infill"), base_layer_height,
+                             validate_feature_height(object, L("Internal solid infill"), internal_solid_feature_height,
                                                      region_config.internal_solid_filament_id.value, "layer_height"),
-                             validate_feature_height(object, L("Top surface"), base_layer_height,
+                             validate_feature_height(object, L("Top surface"), top_feature_height,
                                                      region_config.top_surface_filament_id.value, "layer_height"),
-                             validate_feature_height(object, L("Bottom surface"), base_layer_height,
+                             validate_feature_height(object, L("Bottom surface"), bottom_feature_height,
                                                      region_config.bottom_surface_filament_id.value, "layer_height"),
                          }) {
                         if (!error.string.empty())
