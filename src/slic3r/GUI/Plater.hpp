@@ -597,6 +597,7 @@ public:
     // feature process depends on it. Self-extinguishing (no-op once the mode is manual and
     // nothing changed). Safe to call from update_background_process.
     bool pin_feature_filament_map_for_active_features();
+    bool clear_auto_feature_process_state_for_filament(unsigned int filament_id);
     bool filament_process_hint_registered_for_smoke(unsigned int filament_id) const;
     std::vector<int> get_global_filament_map() const;
     std::vector<int> get_global_filament_volume_map() const;

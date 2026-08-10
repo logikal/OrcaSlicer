@@ -19153,6 +19153,27 @@ void Plater::notify_filament_process_resolutions(const DynamicPrintConfig &full_
     }
 }
 
+bool Plater::clear_auto_feature_process_state_for_filament(unsigned int filament_id)
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr || !Slic3r::clear_auto_feature_process_state_for_filament(
+                                 p->model, filament_id, bundle->full_config()))
+        return false;
+
+    set_plater_dirty(true);
+    schedule_background_process();
+    const std::string state = "cleared-auto-feature|" + std::to_string(filament_id);
+    if (m_filament_process_hint_states.insert(state).second) {
+        const wxString message = format_wxstr(
+            _L("Cleared the fine wall settings that filament %1%'s process had applied."), filament_id);
+        get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::HintNotificationLevel,
+            message.utf8_string());
+    }
+    return true;
+}
+
 bool Plater::filament_process_hint_registered_for_smoke(unsigned int filament_id) const
 {
     const std::string prefix = std::to_string(filament_id) + "|";

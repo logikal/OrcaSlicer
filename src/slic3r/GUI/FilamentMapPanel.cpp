@@ -127,6 +127,7 @@ bool set_filament_process_selection(size_t filament_index, FilamentProcessPolicy
     presets->values.resize(size, "");
     projections->values.resize(size, "");
 
+    const FilamentProcessPolicy previous_policy = filament_process_policy_at(project_config, filament_index);
     const std::string stored_preset = policy == FilamentProcessPolicy::Pinned ? preset_name : std::string();
     const bool changed = policies->values[filament_index] != int(policy) ||
                          presets->values[filament_index] != stored_preset;
@@ -134,8 +135,12 @@ bool set_filament_process_selection(size_t filament_index, FilamentProcessPolicy
         policies->values[filament_index] = int(policy);
         presets->values[filament_index] = stored_preset;
         projections->values[filament_index].clear();
-        if (Plater *plater = wxGetApp().plater(); plater != nullptr)
+        if (Plater *plater = wxGetApp().plater(); plater != nullptr) {
             plater->update_project_dirty_from_presets();
+            if (policy == FilamentProcessPolicy::GlobalProcess &&
+                previous_policy != FilamentProcessPolicy::GlobalProcess)
+                plater->clear_auto_feature_process_state_for_filament(unsigned(filament_index + 1));
+        }
     }
     if (Plater *plater = wxGetApp().plater(); plater != nullptr)
         plater->schedule_background_process();

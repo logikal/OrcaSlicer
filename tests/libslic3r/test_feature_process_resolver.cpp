@@ -5,6 +5,7 @@
 #include "libslic3r/PresetBundle.hpp"
 
 #include <algorithm>
+#include <array>
 #include <set>
 #include <string>
 
@@ -178,12 +179,28 @@ TEST_CASE("Pinned feature process projects only the wall whitelist", "[FeaturePr
         CHECK(whitelist.count(key) == 1);
     CHECK(result.projection.option("nozzle_temperature") == nullptr);
     CHECK(result.projection.option("layer_height") == nullptr);
+    CHECK(result.projection.option("wall_layer_height") == nullptr);
     CHECK(result.projection.option("wall_loops") == nullptr);
 
     const auto *speed = result.projection.option<ConfigOptionFloats>("outer_wall_speed");
     REQUIRE(speed != nullptr);
     REQUIRE(speed->values.size() == 1);
     CHECK_THAT(speed->values.front(), Catch::Matchers::WithinAbs(42., 1e-9));
+}
+
+TEST_CASE("Feature process projection whitelists carry each resolved role height", "[FeatureProcessResolver]")
+{
+    const std::array<std::pair<FeatureRole, std::string>, 5> role_heights{{
+        {FeatureRole::Wall, "wall_layer_height"},
+        {FeatureRole::SparseInfill, "sparse_infill_process_layer_height"},
+        {FeatureRole::InternalSolid, "internal_solid_process_layer_height"},
+        {FeatureRole::TopSurface, "top_surface_process_layer_height"},
+        {FeatureRole::BottomSurface, "bottom_surface_process_layer_height"},
+    }};
+    for (const auto &[role, height_key] : role_heights) {
+        const std::vector<std::string> &keys = feature_projection_keys(role);
+        CHECK(std::find(keys.begin(), keys.end(), height_key) != keys.end());
+    }
 }
 
 TEST_CASE("Pinned incompatible and missing feature processes preserve their identity", "[FeatureProcessResolver]")
@@ -304,11 +321,17 @@ TEST_CASE("Feature process projection updater refreshes model scopes without cha
     REQUIRE(projection != nullptr);
     CHECK(projection->value.find("outer_wall_speed=") != std::string::npos);
     CHECK(projection->value.find("nozzle_temperature") == std::string::npos);
-    CHECK(projection->value.find("layer_height=") == std::string::npos);
-    const auto *height = dynamic_cast<const ConfigOptionFloat *>(object->config.option("wall_layer_height"));
-    REQUIRE(height != nullptr);
-    CHECK_THAT(height->value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+    CHECK(projection->value.find("wall_layer_height=0.1") != std::string::npos);
+    CHECK_FALSE(object->config.has("wall_layer_height"));
     CHECK_FALSE(update_feature_process_projections(model, fixture.bundle, full_config));
+
+    full_config.option<ConfigOptionFloats>("nozzle_diameter")->values = {0.4, 0.4};
+    REQUIRE(update_feature_process_projections(model, fixture.bundle, full_config));
+    CHECK_FALSE(object->config.has("wall_process_projection"));
+    CHECK_FALSE(object->config.has("wall_layer_height"));
+
+    full_config.option<ConfigOptionFloats>("nozzle_diameter")->values = {0.4, 0.2};
+    REQUIRE(update_feature_process_projections(model, fixture.bundle, full_config));
 
     object->config.set_key_value("wall_process_policy", new ConfigOptionEnum<FeatureProcessPolicy>(FeatureProcessPolicy::Pinned));
     object->config.set("wall_process_preset", std::string("Missing process"));
@@ -318,6 +341,116 @@ TEST_CASE("Feature process projection updater refreshes model scopes without cha
     REQUIRE(policy != nullptr);
     CHECK(policy->value == FeatureProcessPolicy::Pinned);
     CHECK(object->config.opt_serialize("wall_process_preset") == "Missing process");
+}
+
+TEST_CASE("User-set feature height survives resolution and nozzle re-resolution",
+          "[FeatureProcessResolver][Regression]")
+{
+    ResolverFixture fixture;
+    DynamicPrintConfig full_config = DynamicPrintConfig::full_print_config();
+    full_config.apply(fixture.printer_config);
+    full_config.option<ConfigOptionFloat>("layer_height", true)->value = 0.2;
+    full_config.option<ConfigOptionInt>("extruder", true)->value = 1;
+    full_config.option<ConfigOptionString>("print_settings_id", true)->value = ResolverFixture::standard_04;
+    full_config.option<ConfigOptionInt>("wall_loops", true)->value = 2;
+
+    Model model;
+    ModelObject *object = model.add_object("cube", "", make_cube(20., 20., 20.));
+    object->add_instance();
+    object->config.set("outer_wall_filament_id", 2);
+    object->config.set("wall_layer_height", 0.05);
+
+    REQUIRE(update_feature_process_projections(model, fixture.bundle, full_config));
+    CHECK_THAT(object->config.opt_float("wall_layer_height"), Catch::Matchers::WithinAbs(0.05, 1e-9));
+    const auto *projection = dynamic_cast<const ConfigOptionString *>(object->config.option("wall_process_projection"));
+    REQUIRE(projection != nullptr);
+    CHECK(projection->value.find("wall_layer_height=") == std::string::npos);
+    CHECK_FALSE(update_feature_process_projections(model, fixture.bundle, full_config));
+    CHECK_THAT(object->config.opt_float("wall_layer_height"), Catch::Matchers::WithinAbs(0.05, 1e-9));
+
+    full_config.option<ConfigOptionFloats>("nozzle_diameter")->values = {0.4, 0.4};
+    REQUIRE(update_feature_process_projections(model, fixture.bundle, full_config));
+    CHECK_THAT(object->config.opt_float("wall_layer_height"), Catch::Matchers::WithinAbs(0.05, 1e-9));
+    CHECK_FALSE(object->config.has("wall_process_projection"));
+}
+
+TEST_CASE("Legacy derived feature height migrates into its projection", "[FeatureProcessResolver][Regression]")
+{
+    ResolverFixture fixture;
+    DynamicPrintConfig full_config = DynamicPrintConfig::full_print_config();
+    full_config.apply(fixture.printer_config);
+    full_config.option<ConfigOptionFloat>("layer_height", true)->value = 0.2;
+    full_config.option<ConfigOptionInt>("extruder", true)->value = 1;
+    full_config.option<ConfigOptionString>("print_settings_id", true)->value = ResolverFixture::standard_04;
+    full_config.option<ConfigOptionInt>("wall_loops", true)->value = 2;
+
+    Model model;
+    ModelObject *object = model.add_object("cube", "", make_cube(20., 20., 20.));
+    object->add_instance();
+    object->config.set("outer_wall_filament_id", 2);
+    object->config.set("wall_process_projection", std::string("outer_wall_speed=42"));
+    object->config.set("wall_layer_height", 0.1);
+
+    ModelObject *explicit_object = model.add_object("explicit cube", "", make_cube(20., 20., 20.));
+    explicit_object->add_instance();
+    explicit_object->config.set("outer_wall_filament_id", 2);
+    explicit_object->config.set("wall_process_projection", std::string("outer_wall_speed=42"));
+    explicit_object->config.set("wall_layer_height", 0.2);
+
+    REQUIRE(update_feature_process_projections(model, fixture.bundle, full_config));
+    CHECK_FALSE(object->config.has("wall_layer_height"));
+    const auto *projection = dynamic_cast<const ConfigOptionString *>(object->config.option("wall_process_projection"));
+    REQUIRE(projection != nullptr);
+    CHECK(projection->value.find("wall_layer_height=0.1") != std::string::npos);
+    CHECK_THAT(explicit_object->config.opt_float("wall_layer_height"), Catch::Matchers::WithinAbs(0.2, 1e-9));
+    const auto *explicit_projection = dynamic_cast<const ConfigOptionString *>(
+        explicit_object->config.option("wall_process_projection"));
+    REQUIRE(explicit_projection != nullptr);
+    CHECK(explicit_projection->value.find("wall_layer_height=") == std::string::npos);
+    CHECK_FALSE(update_feature_process_projections(model, fixture.bundle, full_config));
+}
+
+TEST_CASE("Global filament action clears only matching automatic feature state",
+          "[FeatureProcessResolver][Regression]")
+{
+    DynamicPrintConfig full_config = DynamicPrintConfig::full_print_config();
+    full_config.option<ConfigOptionInt>("extruder", true)->value = 1;
+    full_config.option<ConfigOptionInt>("outer_wall_filament_id", true)->value = 0;
+
+    Model model;
+    const auto add_scope = [&model](const std::string &name, int filament, FeatureProcessPolicy policy) {
+        ModelObject *object = model.add_object(name.c_str(), "", make_cube(20., 20., 20.));
+        object->add_instance();
+        object->config.set("outer_wall_filament_id", filament);
+        object->config.set_key_value("wall_process_policy", new ConfigOptionEnum<FeatureProcessPolicy>(policy));
+        object->config.set("wall_process_projection", std::string("outer_wall_speed=42"));
+        object->config.set("wall_layer_height", 0.1);
+        return object;
+    };
+
+    ModelObject *automatic = add_scope("automatic", 2, FeatureProcessPolicy::AutoNozzleVariant);
+    ModelObject *pinned = add_scope("pinned", 2, FeatureProcessPolicy::Pinned);
+    ModelObject *different = add_scope("different", 1, FeatureProcessPolicy::AutoNozzleVariant);
+    ModelObject *same_as_object = add_scope("same", 2, FeatureProcessPolicy::SameAsObject);
+
+    ModelObject *volume_object = model.add_object("volume", "", make_cube(20., 20., 20.));
+    volume_object->add_instance();
+    volume_object->config.set("extruder", 2);
+    ModelVolume *volume = volume_object->volumes.front();
+    volume->config.set("wall_process_projection", std::string("outer_wall_speed=42"));
+    volume->config.set("wall_layer_height", 0.1);
+
+    REQUIRE(clear_auto_feature_process_state_for_filament(model, 2, full_config));
+    CHECK_FALSE(automatic->config.has("wall_process_projection"));
+    CHECK_FALSE(automatic->config.has("wall_layer_height"));
+    CHECK_FALSE(volume->config.has("wall_process_projection"));
+    CHECK_FALSE(volume->config.has("wall_layer_height"));
+
+    for (const ModelObject *preserved : {pinned, different, same_as_object}) {
+        CHECK(preserved->config.has("wall_process_projection"));
+        CHECK(preserved->config.has("wall_layer_height"));
+    }
+    CHECK_FALSE(clear_auto_feature_process_state_for_filament(model, 2, full_config));
 }
 
 TEST_CASE("Projection updater distinguishes default and feature tools through either mixed-nozzle map",
@@ -346,6 +479,7 @@ TEST_CASE("Projection updater distinguishes default and feature tools through ei
         const auto *projection = dynamic_cast<const ConfigOptionString *>(object->config.option("wall_process_projection"));
         REQUIRE(projection != nullptr);
         CHECK_FALSE(projection->value.empty());
-        CHECK_THAT(object->config.opt_float("wall_layer_height"), Catch::Matchers::WithinAbs(0.1, 1e-9));
+        CHECK(projection->value.find("wall_layer_height=0.1") != std::string::npos);
+        CHECK_FALSE(object->config.has("wall_layer_height"));
     }
 }

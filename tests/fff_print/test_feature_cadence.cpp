@@ -3,8 +3,10 @@
 #include "libslic3r/ClipperUtils.hpp"
 #include "libslic3r/ExtrusionEntity.hpp"
 #include "libslic3r/ExtrusionEntityCollection.hpp"
+#include "libslic3r/FeatureProcessResolver.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TriangleSelector.hpp"
 #include "test_helpers.hpp"
 
@@ -60,6 +62,44 @@ DynamicPrintConfig filament_delta_test_config()
     };
     return config;
 }
+
+class DerivedHeightResolverFixture
+{
+public:
+    static constexpr const char *standard_04 = "0.20mm Standard @TestPrinter 0.4 nozzle";
+
+    PresetBundle bundle;
+
+    DerivedHeightResolverFixture()
+    {
+        add_printer("TestPrinter 0.2 nozzle", 0.2, false);
+        add_printer("TestPrinter 0.4 nozzle", 0.4, true);
+        add_process(standard_04, 0.2, "TestPrinter 0.4 nozzle");
+        add_process("0.10mm Standard @TestPrinter 0.2 nozzle", 0.1, "TestPrinter 0.2 nozzle");
+        bundle.filament_presets = {"Filament 1", "Filament 2"};
+    }
+
+private:
+    void add_printer(const std::string &name, double nozzle, bool select)
+    {
+        DynamicPrintConfig config(bundle.printers.default_preset().config);
+        config.option<ConfigOptionString>("printer_model", true)->value = "TestPrinter";
+        config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {nozzle};
+        config.option<ConfigOptionFloats>("min_layer_height", true)->values = {nozzle == 0.2 ? 0.05 : 0.1};
+        config.option<ConfigOptionFloats>("max_layer_height", true)->values = {nozzle == 0.2 ? 0.15 : 0.3};
+        Preset &preset = bundle.printers.load_preset({}, name, std::move(config), select);
+        preset.is_system = true;
+    }
+
+    void add_process(const std::string &name, double height, const std::string &compatible_printer)
+    {
+        DynamicPrintConfig config(bundle.prints.default_preset().config);
+        config.option<ConfigOptionFloat>("layer_height", true)->value = height;
+        config.option<ConfigOptionStrings>("compatible_printers", true)->values = {compatible_printer};
+        Preset &preset = bundle.prints.load_preset({}, name, std::move(config), false);
+        preset.is_system = true;
+    }
+};
 
 const PrintRegionConfig *region_with_outer_width(const PrintObject &object, double width)
 {
@@ -553,6 +593,7 @@ TEST_CASE("Role filament deltas stay within their partitions and populate cadenc
           "[FeatureCadence][FilamentProcess]")
 {
     DynamicPrintConfig config = filament_delta_test_config();
+    config.option<ConfigOptionFloat>("layer_height")->value = 0.3;
     config.option<ConfigOptionStrings>("filament_process_projection")->values[0] += ";wall_loops=3";
     Print print;
     Model model;
@@ -562,12 +603,68 @@ TEST_CASE("Role filament deltas stay within their partitions and populate cadenc
     }};
     init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
 
+    CHECK_FALSE(model.objects.front()->config.has("layer_height"));
+    CHECK_FALSE(model.objects.front()->config.has("wall_layer_height"));
+    CHECK_THAT(print.objects().front()->config().layer_height.value, Catch::Matchers::WithinAbs(0.2, 1e-9));
     const PrintRegionConfig &region = print.objects().front()->printing_region(0).config();
     CHECK_THAT(region.outer_wall_line_width.value, Catch::Matchers::WithinAbs(0.22, 1e-9));
     CHECK(region.wall_loops.value == 4);
     CHECK_THAT(region.sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.45, 1e-9));
     CHECK_THAT(region.wall_layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
     CHECK_THAT(region.sparse_infill_process_layer_height.value, Catch::Matchers::WithinAbs(0., 1e-9));
+}
+
+TEST_CASE("Global-process action clears a projection-less stale wall height before uniform-nozzle slicing",
+          "[FeatureCadence][FeatureProcess][FilamentProcess][Regression]")
+{
+    DerivedHeightResolverFixture fixture;
+    DynamicPrintConfig config = mixed_nozzle_grid_config({
+        {"nozzle_diameter", "0.4,0.2"},
+        {"min_layer_height", "0.1,0.05"},
+        {"max_layer_height", "0.3,0.15"},
+        {"outer_wall_filament_id", 1},
+        {"inner_wall_filament_id", 1},
+        {"sparse_infill_filament_id", 1},
+        {"internal_solid_filament_id", 1},
+        {"top_surface_filament_id", 1},
+        {"bottom_surface_filament_id", 1},
+    });
+    config.option<ConfigOptionString>("printer_model", true)->value = "TestPrinter";
+    config.option<ConfigOptionString>("print_settings_id", true)->value = DerivedHeightResolverFixture::standard_04;
+
+    Model model;
+    ModelObject *object = model.add_object("cube", "", make_cube(20., 20., 20.));
+    object->add_instance();
+    object->ensure_on_bed();
+    object->config.set("extruder", 1);
+    object->config.set("outer_wall_filament_id", 2);
+    object->config.set("inner_wall_filament_id", 2);
+    object->config.set("wall_layer_height", 0.1);
+
+    config.option<ConfigOptionEnumsGeneric>("filament_process_policy", true)->values = {
+        int(FilamentProcessPolicy::GlobalProcess), int(FilamentProcessPolicy::GlobalProcess)};
+    REQUIRE(clear_auto_feature_process_state_for_filament(model, 2, config));
+    CHECK_FALSE(object->config.has("wall_process_projection"));
+    CHECK_FALSE(object->config.has("wall_layer_height"));
+    REQUIRE(update_filament_process_projections(fixture.bundle, config));
+    config.option<ConfigOptionFloats>("nozzle_diameter")->values = {0.4, 0.4};
+    config.option<ConfigOptionFloats>("min_layer_height")->values = {0.1, 0.1};
+    config.option<ConfigOptionFloats>("max_layer_height")->values = {0.3, 0.3};
+    CHECK_FALSE(update_feature_process_projections(model, fixture.bundle, config));
+    CHECK_FALSE(object->config.has("wall_process_projection"));
+    CHECK_FALSE(object->config.has("wall_layer_height"));
+
+    Print print;
+    print.apply(model, config);
+    const StringObjectException validation = print.validate();
+    INFO(validation.string);
+    REQUIRE(validation.string.empty());
+    print.set_status_silent();
+    REQUIRE_NOTHROW(print.process());
+    const ConstLayerPtrsAdaptor layers = print.objects().front()->layers();
+    REQUIRE(layers.size() == 100);
+    for (size_t index = 1; index < layers.size(); ++index)
+        CHECK_THAT(layers[index]->height, Catch::Matchers::WithinAbs(0.2, EPSILON));
 }
 
 TEST_CASE("Explicit object and region process values win over filament deltas",
@@ -721,6 +818,46 @@ TEST_CASE("Wall process projections apply before explicit object overrides", "[F
         {cube(20.)}, config,
         {{{"wall_process_projection", "outer_wall_line_width=0.25"}, {"outer_wall_line_width", 0.3}}});
     CHECK(overridden.find("; external perimeters extrusion width = 0.30mm") != std::string::npos);
+}
+
+TEST_CASE("Projected feature heights populate every role config", "[FeatureCadence][FeatureProcess]")
+{
+    const DynamicPrintConfig config = mixed_nozzle_grid_config();
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{
+        {"wall_process_projection", "wall_layer_height=0.1"},
+        {"sparse_infill_process_projection", "sparse_infill_process_layer_height=0.1"},
+        {"internal_solid_process_projection", "internal_solid_process_layer_height=0.1"},
+        {"top_surface_process_projection", "top_surface_process_layer_height=0.1"},
+        {"bottom_surface_process_projection", "bottom_surface_process_layer_height=0.1"},
+    }};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    const PrintRegionConfig &region = print.objects().front()->printing_region(0).config();
+    CHECK_THAT(region.wall_layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+    CHECK_THAT(region.sparse_infill_process_layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+    CHECK_THAT(region.internal_solid_process_layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+    CHECK_THAT(region.top_surface_process_layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+    CHECK_THAT(region.bottom_surface_process_layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+}
+
+TEST_CASE("Projected wall height refines cadence without a plain model height",
+          "[FeatureCadence][FeatureProcess][Regression]")
+{
+    const DynamicPrintConfig config = mixed_nozzle_grid_config();
+    Print print;
+    Model model;
+    process_cube_with_overrides(config, {{"wall_process_projection", "wall_layer_height=0.1"}}, print, model);
+
+    REQUIRE_FALSE(model.objects.empty());
+    CHECK_FALSE(model.objects.front()->config.has("wall_layer_height"));
+    CHECK_THAT(print.objects().front()->printing_region(0).config().wall_layer_height.value,
+               Catch::Matchers::WithinAbs(0.1, 1e-9));
+    const ConstLayerPtrsAdaptor layers = print.objects().front()->layers();
+    REQUIRE(layers.size() == 199);
+    for (size_t index = 1; index < layers.size(); ++index)
+        CHECK_THAT(layers[index]->height, Catch::Matchers::WithinAbs(0.1, EPSILON));
 }
 
 TEST_CASE("Wall process projection consumption enforces its whitelist", "[FeatureCadence]")

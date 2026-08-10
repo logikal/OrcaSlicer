@@ -3949,29 +3949,57 @@ static void apply_filament_process_object_delta(PrintObjectConfig &config, const
             apply_delta_key(config, interface_delta, key, interface_tool, {});
 }
 
-static unsigned int effective_wall_filament(const PrintRegionConfig &out, const DynamicPrintConfig &in,
-                                            const FeatureFilamentOverrideMask &feature_overrides)
+static bool feature_filament_overridden(const FeatureFilamentOverrideMask &overrides, FeatureRole role)
 {
-    const auto *feature = in.option<ConfigOptionInt>("outer_wall_filament_id");
+    switch (role) {
+    case FeatureRole::Wall:          return overrides.outer_wall_filament_id;
+    case FeatureRole::SparseInfill:  return overrides.sparse_infill_filament_id;
+    case FeatureRole::InternalSolid: return overrides.internal_solid_filament_id;
+    case FeatureRole::TopSurface:    return overrides.top_surface_filament_id;
+    case FeatureRole::BottomSurface: return overrides.bottom_surface_filament_id;
+    default:                         return false;
+    }
+}
+
+static unsigned int configured_feature_filament(const PrintRegionConfig &config, FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return unsigned(std::max(config.outer_wall_filament_id.value, 0));
+    case FeatureRole::SparseInfill:  return unsigned(std::max(config.sparse_infill_filament_id.value, 0));
+    case FeatureRole::InternalSolid: return unsigned(std::max(config.internal_solid_filament_id.value, 0));
+    case FeatureRole::TopSurface:    return unsigned(std::max(config.top_surface_filament_id.value, 0));
+    case FeatureRole::BottomSurface: return unsigned(std::max(config.bottom_surface_filament_id.value, 0));
+    default:                         return 0;
+    }
+}
+
+static unsigned int effective_feature_filament(const PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                               const FeatureFilamentOverrideMask &feature_overrides,
+                                               FeatureRole role, const char *filament_key)
+{
+    const auto *feature = in.option<ConfigOptionInt>(filament_key);
     if (feature != nullptr && feature->value > 0)
         return unsigned(feature->value);
     const auto *base = in.option<ConfigOptionInt>(key_extruder);
-    if (base != nullptr && base->value > 0 && (feature == nullptr ? !feature_overrides.outer_wall_filament_id : feature->value == 0))
+    if (base != nullptr && base->value > 0 &&
+        (feature == nullptr ? !feature_filament_overridden(feature_overrides, role) : feature->value == 0))
         return unsigned(base->value);
-    return unsigned(std::max(out.outer_wall_filament_id.value, 0));
+    return configured_feature_filament(out, role);
 }
 
-static void apply_feature_process_projection(PrintRegionConfig &out, const DynamicPrintConfig &in,
-                                             const FeatureFilamentOverrideMask &feature_overrides,
-                                             const PrintConfig &print_config, t_config_option_keys *explicit_keys)
+static void apply_feature_process_projection_for_role(PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                                      const FeatureFilamentOverrideMask &feature_overrides,
+                                                      const PrintConfig &print_config, t_config_option_keys *explicit_keys,
+                                                      FeatureRole role, const char *projection_key,
+                                                      const char *filament_key)
 {
-    const auto *serialized = in.option<ConfigOptionString>("wall_process_projection");
+    const auto *serialized = in.option<ConfigOptionString>(projection_key);
     if (serialized == nullptr || serialized->value.empty())
         return;
 
-    const std::vector<std::string> &allowed = feature_projection_keys(FeatureRole::Wall);
+    const std::vector<std::string> &allowed = feature_projection_keys(role);
     const size_t tool_id = get_extruder_index_from_filament_id(
-        print_config, effective_wall_filament(out, in, feature_overrides));
+        print_config, effective_feature_filament(out, in, feature_overrides, role, filament_key));
     for (size_t begin = 0; begin <= serialized->value.size();) {
         const size_t end = serialized->value.find(';', begin);
         const std::string_view entry(serialized->value.data() + begin,
@@ -4005,6 +4033,22 @@ static void apply_feature_process_projection(PrintRegionConfig &out, const Dynam
     }
 }
 
+static void apply_feature_process_projections(PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                              const FeatureFilamentOverrideMask &feature_overrides,
+                                              const PrintConfig &print_config, t_config_option_keys *explicit_keys)
+{
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::Wall, "wall_process_projection", "outer_wall_filament_id");
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::SparseInfill, "sparse_infill_process_projection", "sparse_infill_filament_id");
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::InternalSolid, "internal_solid_process_projection", "internal_solid_filament_id");
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::TopSurface, "top_surface_process_projection", "top_surface_filament_id");
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::BottomSurface, "bottom_surface_process_projection", "bottom_surface_filament_id");
+}
+
 static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPrintConfig &in,
                                          FeatureFilamentOverrideMask &feature_overrides,
                                          std::vector<int>& variant_index, const PrintConfig &print_config,
@@ -4012,7 +4056,7 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
 {
     // Derived process values are the first pass. The explicit loop below is intentionally
     // second so a user override in this same scope always wins.
-    apply_feature_process_projection(out, in, feature_overrides, print_config, explicit_keys);
+    apply_feature_process_projections(out, in, feature_overrides, print_config, explicit_keys);
 
     // 1) Explicit feature filament values take precedence over base extruder fallback.
     auto *opt_extruder = in.opt<ConfigOptionInt>(key_extruder);

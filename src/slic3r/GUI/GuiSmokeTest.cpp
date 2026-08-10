@@ -447,6 +447,10 @@ GuiSmokeTest::Progress GuiSmokeTest::detail_nozzle_control()
         m_app.model().objects.front()->config.option("wall_process_projection"));
     if (projection == nullptr || projection->value.empty())
         throw std::runtime_error("fine nozzle control left wall_process_projection empty");
+    if (projection->value.find("wall_layer_height=") == std::string::npos)
+        throw std::runtime_error("fine nozzle control projection lacks its derived wall layer height");
+    if (m_app.model().objects.front()->config.has("wall_layer_height"))
+        throw std::runtime_error("fine nozzle control persisted its derived wall layer height as a plain key");
 
     const size_t object_tool = map->values.front() > 0 ? size_t(map->values.front() - 1) : 0;
     const size_t wall_tool = outer > 0 && size_t(outer) <= map->values.size() ? size_t(map->values[outer - 1] - 1) : 0;
@@ -521,12 +525,14 @@ GuiSmokeTest::Progress GuiSmokeTest::filament_process_auto()
         return Progress::Pending;
     }
 
-    if (fine_slot >= projections->values.size() || projections->values[fine_slot].empty()) {
+    if (m_filament_process_stage <= 2 &&
+        (fine_slot >= projections->values.size() || projections->values[fine_slot].empty())) {
         if (timed_out())
             throw std::runtime_error("fine-slot filament_process_projection did not sync back to project_config");
         return Progress::Pending;
     }
-    if (projections->values[fine_slot].find("layer_height=") == std::string::npos)
+    if (m_filament_process_stage <= 2 &&
+        projections->values[fine_slot].find("layer_height=") == std::string::npos)
         throw std::runtime_error("fine-slot filament_process_projection lacks layer_height");
 
     if (m_filament_process_stage == 1) {
@@ -559,19 +565,31 @@ GuiSmokeTest::Progress GuiSmokeTest::filament_process_auto()
         const StringObjectException validity = m_app.plater()->fff_print().validate();
         if (!validity.string.empty())
             throw std::runtime_error("pinned filament process left an invalid reslice state: " + validity.string);
-        set_filament_process_selection(fine_slot, FilamentProcessPolicy::AutoNozzleVariant, {});
+        if (m_app.model().objects.empty())
+            throw std::runtime_error("filament process cleanup check has no model object");
+        ModelObject *object = m_app.model().objects.front();
+        object->config.set("outer_wall_filament_id", int(fine_slot + 1));
+        object->config.set("inner_wall_filament_id", int(fine_slot + 1));
+        object->config.set_key_value("wall_process_policy",
+            new ConfigOptionEnum<FeatureProcessPolicy>(FeatureProcessPolicy::AutoNozzleVariant));
+        object->config.set("wall_process_projection", std::string("outer_wall_speed=42"));
+        object->config.set("wall_layer_height", 0.1);
+        set_filament_process_selection(fine_slot, FilamentProcessPolicy::GlobalProcess, {});
         m_filament_process_start = std::chrono::steady_clock::now();
         ++m_filament_process_stage;
         return Progress::Pending;
     }
 
     if (fine_slot >= policies->values.size() || fine_slot >= presets->values.size() ||
-        policies->values[fine_slot] != int(FilamentProcessPolicy::AutoNozzleVariant) ||
+        policies->values[fine_slot] != int(FilamentProcessPolicy::GlobalProcess) ||
         !presets->values[fine_slot].empty()) {
         if (timed_out())
-            throw std::runtime_error("automatic filament process intent was not restored");
+            throw std::runtime_error("global filament process intent was not retained");
         return Progress::Pending;
     }
+    const ModelConfig &object_config = m_app.model().objects.front()->config;
+    if (object_config.has("wall_layer_height") || object_config.has("wall_process_projection"))
+        throw std::runtime_error("global filament process action left stale fine wall settings on the object");
     return Progress::Done;
 }
 

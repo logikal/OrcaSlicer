@@ -112,4 +112,9 @@ int feature_cadence_ratio(double base_layer_height, double feature_layer_height)
 bool update_feature_process_projections(Model &model, const PresetBundle &bundle,
                                         const DynamicPrintConfig &full_config);
 
+// Explicitly discard Auto feature-process state associated with a filament slot. This is used
+// when the user switches that filament to the global process; it is never an implicit load heal.
+bool clear_auto_feature_process_state_for_filament(Model &model, unsigned int filament_id,
+                                                   const DynamicPrintConfig &full_config);
+
 } // namespace Slic3r
