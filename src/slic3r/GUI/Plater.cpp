@@ -19051,6 +19051,25 @@ bool Plater::pin_feature_filament_map_for_active_features()
 void Plater::notify_filament_process_resolutions(const DynamicPrintConfig &full_config,
                                                  const PresetBundle &bundle)
 {
+    for (const FilamentValueOverlayNote &note : bundle.filament_value_overlay_notes()) {
+        const std::string state = "filament-value|" + std::to_string(note.slot + 1) + "|" +
+                                  nozzle_number(note.tool_nozzle).ToStdString() + "|" +
+                                  note.source_preset_name + "|" + nozzle_number(note.limited_speed).ToStdString();
+        if (!m_filament_process_hint_states.insert(state).second)
+            continue;
+
+        const wxString suffix = note.source_preset_name.empty() ?
+            format_wxstr(_L("estimated — no %1% mm preset for this filament"), nozzle_number(note.tool_nozzle)) :
+            format_wxstr(_L("from %1%"), from_u8(note.source_preset_name));
+        const wxString message = format_wxstr(
+            _L("Filament %1% flow limited to %2% mm³/s for the %3% mm nozzle (%4%)."),
+            note.slot + 1, nozzle_number(note.limited_speed), nozzle_number(note.tool_nozzle), suffix);
+        get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::HintNotificationLevel,
+            message.utf8_string());
+    }
+
     const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
     const auto *policies = full_config.option<ConfigOptionEnumsGeneric>("filament_process_policy");
     const auto *presets = full_config.option<ConfigOptionStrings>("filament_process_preset");

@@ -19,6 +19,7 @@
 #include <boost/filesystem.hpp>
 #include <boost/algorithm/clamp.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/nowide/cstdio.hpp>
 #include <boost/nowide/fstream.hpp>
@@ -55,6 +56,89 @@ const ConfigOption *inherited_option(const Preset &preset, const PresetCollectio
         current = collection.get_preset_parent(*current);
     }
     return nullptr;
+}
+
+const Preset *inheritance_root(const Preset &preset, const PresetCollection &collection)
+{
+    const Preset          *current = &preset;
+    const Preset          *root    = current;
+    std::set<const Preset *> visited;
+    while (current != nullptr && visited.insert(current).second) {
+        root    = current;
+        current = collection.get_preset_parent(*current);
+    }
+    return root;
+}
+
+std::string filament_name_stem(const std::string &name)
+{
+    std::string stem = name.substr(0, name.rfind('@'));
+    boost::algorithm::trim(stem);
+    return stem;
+}
+
+struct FilamentNativeNozzles
+{
+    bool   found {false};
+    double maximum {0.};
+    bool   matches(double diameter) const
+        { return std::any_of(values.begin(), values.end(), [diameter](double value) { return std::abs(value - diameter) <= 1e-6; }); }
+
+    std::vector<double> values;
+};
+
+FilamentNativeNozzles filament_native_nozzles(const Preset &filament, const PresetBundle &bundle)
+{
+    FilamentNativeNozzles result;
+    const auto *compatible_printers = dynamic_cast<const ConfigOptionStrings *>(
+        inherited_option(filament, bundle.filaments, "compatible_printers"));
+    if (compatible_printers == nullptr)
+        return result;
+
+    for (const std::string &printer_name : compatible_printers->values) {
+        const Preset *printer = bundle.printers.find_preset(printer_name, false);
+        if (printer == nullptr)
+            continue;
+        const auto *diameters = dynamic_cast<const ConfigOptionFloats *>(
+            inherited_option(*printer, bundle.printers, "nozzle_diameter"));
+        if (diameters == nullptr || diameters->values.empty())
+            continue;
+        const double diameter = diameters->get_at(0);
+        result.values.push_back(diameter);
+        result.maximum = result.found ? std::max(result.maximum, diameter) : diameter;
+        result.found   = true;
+    }
+    return result;
+}
+
+bool filament_targets_model_nozzle(const Preset &filament, const PresetBundle &bundle,
+                                   const std::string &printer_model, double diameter)
+{
+    const auto *compatible_printers = dynamic_cast<const ConfigOptionStrings *>(
+        inherited_option(filament, bundle.filaments, "compatible_printers"));
+    if (compatible_printers == nullptr)
+        return false;
+
+    for (const std::string &printer_name : compatible_printers->values) {
+        const Preset *printer = bundle.printers.find_preset(printer_name, false);
+        if (printer == nullptr)
+            continue;
+        const auto *model = dynamic_cast<const ConfigOptionString *>(
+            inherited_option(*printer, bundle.printers, "printer_model"));
+        const auto *diameters = dynamic_cast<const ConfigOptionFloats *>(
+            inherited_option(*printer, bundle.printers, "nozzle_diameter"));
+        if (model != nullptr && model->value == printer_model && diameters != nullptr && !diameters->values.empty() &&
+            std::abs(diameters->get_at(0) - diameter) <= 1e-6)
+            return true;
+    }
+    return false;
+}
+
+const Preset *selected_filament_preset(const PresetBundle &bundle, size_t filament_index)
+{
+    if (filament_index >= bundle.filament_presets.size())
+        return nullptr;
+    return bundle.filaments.find_preset(bundle.filament_presets[filament_index], false);
 }
 
 } // namespace
@@ -4041,6 +4125,144 @@ const Preset *PresetBundle::sibling_printer_preset_for_diameter(double diameter)
     return fallback;
 }
 
+const Preset *PresetBundle::sibling_filament_preset_for_nozzle(size_t filament_index, double tool_diameter) const
+{
+    const Preset *selected_filament = selected_filament_preset(*this, filament_index);
+    if (selected_filament == nullptr)
+        return nullptr;
+
+    const FilamentNativeNozzles native_nozzles = filament_native_nozzles(*selected_filament, *this);
+    if (native_nozzles.matches(tool_diameter))
+        return nullptr;
+
+    const Preset &selected_printer = this->printers.get_selected_preset();
+    const auto *printer_model = dynamic_cast<const ConfigOptionString *>(
+        inherited_option(selected_printer, this->printers, "printer_model"));
+    if (printer_model == nullptr || printer_model->value.empty())
+        return nullptr;
+
+    const Preset *selected_root = inheritance_root(*selected_filament, this->filaments);
+    const std::string selected_stem = filament_name_stem(selected_filament->name);
+    const Preset *best = nullptr;
+    int best_rank = -1;
+    for (const Preset &candidate : this->filaments) {
+        if (&candidate == selected_filament ||
+            !filament_targets_model_nozzle(candidate, *this, printer_model->value, tool_diameter))
+            continue;
+
+        const bool same_root = selected_root != nullptr && inheritance_root(candidate, this->filaments) == selected_root;
+        const bool same_stem = !selected_stem.empty() && filament_name_stem(candidate.name) == selected_stem;
+        if (!same_root && !same_stem)
+            continue;
+
+        const int rank = (same_root ? 2 : 0) + (candidate.is_system ? 1 : 0);
+        if (rank > best_rank) {
+            best      = &candidate;
+            best_rank = rank;
+        }
+    }
+    return best;
+}
+
+std::vector<FilamentValueOverlayNote> apply_filament_nozzle_value_overlay(
+    DynamicPrintConfig &out, const PresetBundle &bundle)
+{
+    std::vector<FilamentValueOverlayNote> notes;
+    const auto *project_diameters = out.option<ConfigOptionFloats>("project_nozzle_diameter");
+    const auto *tool_diameters = out.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto *filament_map = out.option<ConfigOptionInts>("filament_map");
+    if (project_diameters == nullptr || project_diameters->values.empty() || tool_diameters == nullptr ||
+        tool_diameters->values.empty() || filament_map == nullptr)
+        return notes;
+
+    const auto diameter_range = std::minmax_element(tool_diameters->values.begin(), tool_diameters->values.end());
+    if (*diameter_range.second - *diameter_range.first <= 1e-6)
+        return notes;
+
+    static constexpr const char *overlay_keys[] = {
+        "filament_retraction_length",
+        "filament_z_hop",
+        "filament_z_hop_types",
+        "filament_wipe",
+        "filament_wipe_distance",
+        "filament_retraction_speed",
+        "filament_deretraction_speed",
+    };
+
+    auto *speeds = out.option<ConfigOptionFloats>("filament_max_volumetric_speed");
+    if (speeds == nullptr)
+        return notes;
+
+    const auto *self_indices = out.option<ConfigOptionInts>("filament_self_index");
+    const auto *variant_names = out.option<ConfigOptionStrings>("filament_extruder_variant");
+    const bool expanded_layout = self_indices != nullptr && self_indices->values.size() == speeds->values.size();
+
+    const size_t slot_count = std::min(bundle.filament_presets.size(), filament_map->values.size());
+    for (size_t slot = 0; slot < slot_count; ++slot) {
+        const int mapped_tool = filament_map->values[slot] - 1;
+        if (mapped_tool < 0 || size_t(mapped_tool) >= tool_diameters->values.size())
+            continue;
+
+        std::vector<size_t> columns;
+        if (expanded_layout) {
+            for (size_t column = 0; column < self_indices->values.size(); ++column)
+                if (self_indices->values[column] == int(slot + 1))
+                    columns.push_back(column);
+        } else if (slot < speeds->values.size()) {
+            columns.push_back(slot);
+        }
+        if (columns.empty())
+            continue;
+
+        const Preset *selected = selected_filament_preset(bundle, slot);
+        if (selected == nullptr)
+            continue;
+        const double tool_diameter = tool_diameters->values[size_t(mapped_tool)];
+        const FilamentNativeNozzles native_nozzles = filament_native_nozzles(*selected, bundle);
+        if (!native_nozzles.found || native_nozzles.matches(tool_diameter))
+            continue;
+
+        const Preset *sibling = bundle.sibling_filament_preset_for_nozzle(slot, tool_diameter);
+        if (sibling != nullptr) {
+            const auto *sibling_speed = dynamic_cast<const ConfigOptionFloats *>(
+                inherited_option(*sibling, bundle.filaments, "filament_max_volumetric_speed"));
+            if (sibling_speed == nullptr || sibling_speed->values.empty())
+                continue;
+
+            const auto *sibling_variants = dynamic_cast<const ConfigOptionStrings *>(
+                inherited_option(*sibling, bundle.filaments, "filament_extruder_variant"));
+            const auto sibling_variant_index = [variant_names, sibling_variants](size_t column) {
+                if (variant_names == nullptr || column >= variant_names->values.size() || sibling_variants == nullptr)
+                    return size_t(0);
+                const auto it = std::find(sibling_variants->values.begin(), sibling_variants->values.end(),
+                                          variant_names->values[column]);
+                return it == sibling_variants->values.end() ? size_t(0) :
+                    size_t(std::distance(sibling_variants->values.begin(), it));
+            };
+
+            for (size_t column : columns)
+                speeds->values[column] = sibling_speed->get_at(sibling_variant_index(column));
+
+            for (const char *key : overlay_keys) {
+                const ConfigOption *source = inherited_option(*sibling, bundle.filaments, key);
+                auto *destination = dynamic_cast<ConfigOptionVectorBase *>(out.option(key));
+                if (source != nullptr && source->is_vector() && !static_cast<const ConfigOptionVectorBase *>(source)->empty() &&
+                    destination != nullptr && destination->nullable()) {
+                    for (size_t column : columns)
+                        destination->set_at(source, column, sibling_variant_index(column));
+                }
+            }
+            notes.push_back({slot, tool_diameter, sibling->name, speeds->values[columns.front()]});
+        } else if (tool_diameter < native_nozzles.maximum - 1e-6) {
+            const double ratio = tool_diameter / native_nozzles.maximum;
+            for (size_t column : columns)
+                speeds->values[column] *= ratio * ratio;
+            notes.push_back({slot, tool_diameter, {}, speeds->values[columns.front()]});
+        }
+    }
+    return notes;
+}
+
 std::vector<std::vector<std::vector<float>>> PresetBundle::get_full_flush_matrix(bool with_multiplier) const
 {
     auto full_config = this->full_config();
@@ -4406,6 +4628,8 @@ DynamicPrintConfig PresetBundle::full_fff_config(bool apply_extruder, std::optio
         }
         return &materialized;
     });
+
+    m_filament_value_overlay_notes = apply_filament_nozzle_value_overlay(out, *this);
 	out.option<ConfigOptionEnumGeneric>("printer_technology", true)->value = ptFFF;
     return out;
 }
