@@ -4,6 +4,7 @@
 #include "GUI.hpp"
 #include "GUI_App.hpp"
 #include "GUI_ObjectList.hpp"
+#include "FilamentMapPanel.hpp"
 #include "MainFrame.hpp"
 #include "ParamsPanel.hpp"
 #include "Plater.hpp"
@@ -11,6 +12,7 @@
 #include "Widgets/ComboBox.hpp"
 
 #include "libslic3r/Model.hpp"
+#include "libslic3r/FeatureProcessResolver.hpp"
 #include "libslic3r/PresetBundle.hpp"
 #include "libslic3r/TriangleMesh.hpp"
 
@@ -120,6 +122,7 @@ void GuiSmokeTest::build_steps(const std::string &step_filter)
     add("two_filaments", Requirement::Required, "select_multitool_printer", [this] { return two_filaments(); });
     add("add_cube_and_object_settings", Requirement::Required, "select_multitool_printer", [this] { return add_cube_and_object_settings(); });
     add("mixed_diameter_overlay", Requirement::Required, "select_multitool_printer", [this] { return mixed_diameter_overlay(); });
+    add("filament-process-auto", Requirement::Required, "mixed_diameter_overlay", [this] { return filament_process_auto(); });
     add("feature_filament_each", Requirement::Required, "select_multitool_printer", [this] { return feature_filament_each(); });
     add("detail_nozzle_control", Requirement::Required, "feature_filament_each", [this] { return detail_nozzle_control(); });
     add("wall_policy_cycle", Requirement::Required, "select_multitool_printer", [this] { return wall_policy_cycle(); });
@@ -484,6 +487,91 @@ GuiSmokeTest::Progress GuiSmokeTest::mixed_diameter_overlay()
     if (diameters == nullptr || diameters->values.size() < 2 ||
         std::abs(diameters->values[0] - 0.4) > 1e-6 || std::abs(diameters->values[1] - 0.2) > 1e-6)
         throw std::runtime_error("full config did not expose the 0.4/0.2 overlay");
+    return Progress::Done;
+}
+
+GuiSmokeTest::Progress GuiSmokeTest::filament_process_auto()
+{
+    PresetBundle &bundle = *m_app.preset_bundle;
+    const DynamicPrintConfig full_config = bundle.full_config();
+    const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto *map = full_config.option<ConfigOptionInts>("filament_map");
+    if (diameters == nullptr || diameters->values.size() < 2 || map == nullptr || map->values.empty())
+        throw std::runtime_error("filament process smoke lacks a concrete mixed-nozzle map");
+    const size_t fine_tool = size_t(std::distance(
+        diameters->values.begin(), std::min_element(diameters->values.begin(), diameters->values.end())));
+    const auto fine_slot_it = std::find(map->values.begin(), map->values.end(), int(fine_tool + 1));
+    if (fine_slot_it == map->values.end())
+        throw std::runtime_error("filament process smoke has no filament on the fine nozzle");
+    const size_t fine_slot = size_t(std::distance(map->values.begin(), fine_slot_it));
+
+    const auto timed_out = [this] {
+        return std::chrono::steady_clock::now() - m_filament_process_start > std::chrono::seconds(15);
+    };
+    auto *policies = bundle.project_config.option<ConfigOptionEnumsGeneric>("filament_process_policy");
+    auto *presets = bundle.project_config.option<ConfigOptionStrings>("filament_process_preset");
+    auto *projections = bundle.project_config.option<ConfigOptionStrings>("filament_process_projection");
+    if (policies == nullptr || presets == nullptr || projections == nullptr)
+        throw std::runtime_error("filament process project vectors are unavailable");
+
+    if (m_filament_process_stage == 0) {
+        set_filament_process_selection(fine_slot, FilamentProcessPolicy::AutoNozzleVariant, {});
+        m_filament_process_start = std::chrono::steady_clock::now();
+        ++m_filament_process_stage;
+        return Progress::Pending;
+    }
+
+    if (fine_slot >= projections->values.size() || projections->values[fine_slot].empty()) {
+        if (timed_out())
+            throw std::runtime_error("fine-slot filament_process_projection did not sync back to project_config");
+        return Progress::Pending;
+    }
+    if (projections->values[fine_slot].find("layer_height=") == std::string::npos)
+        throw std::runtime_error("fine-slot filament_process_projection lacks layer_height");
+
+    if (m_filament_process_stage == 1) {
+        if (!m_app.plater()->filament_process_hint_registered_for_smoke(unsigned(fine_slot + 1))) {
+            if (timed_out())
+                throw std::runtime_error("filament process notification state was not registered");
+            return Progress::Pending;
+        }
+        FilamentProcessRequest request;
+        request.filament_id = unsigned(fine_slot + 1);
+        request.policy = FilamentProcessPolicy::AutoNozzleVariant;
+        request.bundle = &bundle;
+        request.full_config = &full_config;
+        const FilamentProcessResolution automatic = resolve_filament_process(request);
+        if (!automatic.ok || automatic.resolved_preset.empty())
+            throw std::runtime_error("automatic filament process did not resolve a pin-able fine-nozzle preset");
+        set_filament_process_selection(fine_slot, FilamentProcessPolicy::Pinned, automatic.resolved_preset);
+        m_filament_process_start = std::chrono::steady_clock::now();
+        ++m_filament_process_stage;
+        return Progress::Pending;
+    }
+
+    if (m_filament_process_stage == 2) {
+        if (fine_slot >= policies->values.size() || fine_slot >= presets->values.size() ||
+            policies->values[fine_slot] != int(FilamentProcessPolicy::Pinned) || presets->values[fine_slot].empty()) {
+            if (timed_out())
+                throw std::runtime_error("pinned filament process intent was not retained");
+            return Progress::Pending;
+        }
+        const StringObjectException validity = m_app.plater()->fff_print().validate();
+        if (!validity.string.empty())
+            throw std::runtime_error("pinned filament process left an invalid reslice state: " + validity.string);
+        set_filament_process_selection(fine_slot, FilamentProcessPolicy::AutoNozzleVariant, {});
+        m_filament_process_start = std::chrono::steady_clock::now();
+        ++m_filament_process_stage;
+        return Progress::Pending;
+    }
+
+    if (fine_slot >= policies->values.size() || fine_slot >= presets->values.size() ||
+        policies->values[fine_slot] != int(FilamentProcessPolicy::AutoNozzleVariant) ||
+        !presets->values[fine_slot].empty()) {
+        if (timed_out())
+            throw std::runtime_error("automatic filament process intent was not restored");
+        return Progress::Pending;
+    }
     return Progress::Done;
 }
 

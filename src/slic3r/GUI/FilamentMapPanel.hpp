@@ -7,11 +7,39 @@
 #include "wxExtensions.hpp"
 #include "Widgets/Label.hpp"
 
+#include <memory>
+
+namespace Slic3r {
+enum class FeatureProcessRejection;
+enum class FilamentProcessPolicy;
+}
+
 namespace Slic3r { namespace GUI {
 
 // Fired by the manual panel's validation timer: the event int is 1 when the current manual
 // grouping is printable with the installed nozzles, 0 when some zone has no matching nozzle.
 wxDECLARE_EVENT(wxEVT_INVALID_MANUAL_MAP, wxCommandEvent);
+
+wxString feature_process_rejection_text(FeatureProcessRejection rejection, double preset_nozzle = 0.);
+
+// Shared by the mapping dialog and GUI smoke harness. Writes the persisted user intent and
+// schedules the projection refresh; the derived projection itself is healed by Plater.
+bool set_filament_process_selection(size_t filament_index, FilamentProcessPolicy policy,
+                                    const std::string &preset_name);
+
+class FilamentProcessPanel : public wxPanel
+{
+public:
+    FilamentProcessPanel(wxWindow *parent, const std::vector<int> &filaments);
+    ~FilamentProcessPanel() override;
+
+    void Rebuild(const std::vector<int> &filament_map = {},
+                 const std::vector<int> &filament_volume_map = {});
+
+private:
+    struct priv;
+    std::unique_ptr<priv> p;
+};
 
 class FilamentMapManualPanel : public wxPanel
 {

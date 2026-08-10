@@ -56,6 +56,7 @@ class BackgroundSlicingProcess;
 enum SLAPrintObjectStep : unsigned int;
 enum class ConversionType : int;
 class DevAms;
+enum class FilamentProcessPolicy;
 
 using ModelInstancePtrs = std::vector<ModelInstance*>;
 
@@ -596,6 +597,7 @@ public:
     // feature process depends on it. Self-extinguishing (no-op once the mode is manual and
     // nothing changed). Safe to call from update_background_process.
     bool pin_feature_filament_map_for_active_features();
+    bool filament_process_hint_registered_for_smoke(unsigned int filament_id) const;
     std::vector<int> get_global_filament_map() const;
     std::vector<int> get_global_filament_volume_map() const;
     FilamentMapMode get_global_filament_map_mode() const;
@@ -974,6 +976,8 @@ private:
     std::string           m_3mf_path;
     // One-shot wall intent hints, keyed by hint type and the physical binding that caused it.
     std::set<std::string> m_wall_intent_hint_states;
+    // One-shot per-filament process hints, keyed by slot, tool/nozzles, resolution and policy.
+    std::set<std::string> m_filament_process_hint_states;
     // Set true during PopupMenu() tracking to suppress immediate error message boxes.
     // The error messages are collected to m_tracking_popup_menu_error_message instead and these error messages
     // are shown after the pop-up dialog closes.
@@ -994,6 +998,8 @@ private:
 
     void suppress_snapshots();
     void allow_snapshots();
+    void notify_filament_process_resolutions(const DynamicPrintConfig &full_config,
+                                             const PresetBundle &bundle);
     // BBS: single snapshot
     void single_snapshots_enter(SingleSnapshot *single);
     void single_snapshots_leave(SingleSnapshot *single);

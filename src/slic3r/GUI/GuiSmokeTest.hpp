@@ -53,6 +53,7 @@ private:
     Progress detail_nozzle_control();
     Progress wall_policy_cycle();
     Progress mixed_diameter_overlay();
+    Progress filament_process_auto();
     Progress reset_uniform_diameters();
     Progress add_cube_and_object_settings();
     Progress slice_cube();
@@ -71,6 +72,7 @@ private:
     size_t m_feature_stage { 0 };
     size_t m_detail_nozzle_stage { 0 };
     size_t m_policy_stage { 0 };
+    size_t m_filament_process_stage { 0 };
     size_t m_switch_stage { 0 };
     bool m_slice_started { false };
     bool m_slice_was_running { false };
@@ -84,6 +86,7 @@ private:
     bool m_step_skipped { false };
     bool m_required_step_skipped { false };
     std::chrono::steady_clock::time_point m_slice_start;
+    std::chrono::steady_clock::time_point m_filament_process_start;
 
     static std::atomic<int> s_exit_code;
 };

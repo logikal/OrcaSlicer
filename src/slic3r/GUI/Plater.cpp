@@ -78,6 +78,7 @@
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Slicing.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -1236,33 +1237,6 @@ wxString feature_process_number(double value)
     return wxNumberFormatter::ToString(value, 3, wxNumberFormatter::Style_NoTrailingZeroes);
 }
 
-wxString feature_process_rejection_text(FeatureProcessRejection rejection, double preset_nozzle = 0.)
-{
-    switch (rejection) {
-    case FeatureProcessRejection::None:
-        return {};
-    case FeatureProcessRejection::PresetMissing:
-        return _L("preset is missing");
-    case FeatureProcessRejection::PrinterModelMismatch:
-        return _L("for a different printer model");
-    case FeatureProcessRejection::NozzleMismatch:
-        return preset_nozzle > 0. ?
-                   format_wxstr(_L("needs %1% mm nozzle"), feature_process_number(preset_nozzle)) :
-                   _L("needs a different nozzle");
-    case FeatureProcessRejection::LayerHeightNotDivisor:
-        return _L("layer height does not divide the object layer height");
-    case FeatureProcessRejection::LayerHeightOutOfToolRange:
-        return _L("layer height is outside the tool range");
-    case FeatureProcessRejection::NoVariantFound:
-        return _L("no compatible process preset found");
-    case FeatureProcessRejection::PolicyRequiresMatchingNozzle:
-        return _L("object process requires a matching nozzle");
-    case FeatureProcessRejection::NoBundle:
-        return _L("process presets are unavailable");
-    }
-    return _L("incompatible");
-}
-
 FeatureProcessPolicy wall_process_policy(const DynamicPrintConfig &config)
 {
     const auto *policy = config.option<ConfigOptionEnum<FeatureProcessPolicy>>("wall_process_policy");
@@ -1325,6 +1299,29 @@ wxString feature_process_readout_text(const FeatureProcessRequest &request,
     }
     return format_wxstr(_L("Resolves to: %1% — %2% mm nozzle — same layer cadence"), target,
                         feature_process_number(resolution.nozzle_diameter));
+}
+
+bool refresh_and_sync_filament_process_projections(PresetBundle &bundle, DynamicPrintConfig &full_config)
+{
+    update_filament_process_projections(bundle, full_config);
+    bool changed = false;
+    static const std::array<const char *, 3> keys{{
+        "filament_process_policy", "filament_process_preset", "filament_process_projection",
+    }};
+    for (const char *key : keys) {
+        const ConfigOption *source = full_config.option(key);
+        if (source == nullptr)
+            continue;
+        ConfigOption *target = bundle.project_config.option(key);
+        if (target == nullptr) {
+            bundle.project_config.set_key_value(key, source->clone());
+            changed = true;
+        } else if (*target != *source) {
+            target->set(source);
+            changed = true;
+        }
+    }
+    return changed;
 }
 
 } // namespace
@@ -9661,7 +9658,10 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
     else
         full_config = preset_bundle->full_config(false);
 
+    if (refresh_and_sync_filament_process_projections(*preset_bundle, full_config))
+        q->update_project_dirty_from_presets();
     update_feature_process_projections(this->model, *preset_bundle, full_config);
+    q->notify_filament_process_resolutions(full_config, *preset_bundle);
     dynamic_process_preset_list.update(&full_config);
     detail_nozzle_controls.update(&full_config);
     invalidated = background_process.apply(this->model, full_config);
@@ -18965,7 +18965,10 @@ bool Plater::pin_feature_filament_map_for_active_features()
         plate->set_filament_map_mode(FilamentMapMode::fmmManual);
         full_config = bundle.full_config(false, filament_map, filament_volume_map);
     }
+    if (refresh_and_sync_filament_process_projections(bundle, full_config))
+        update_project_dirty_from_presets();
     update_feature_process_projections(p->model, bundle, full_config);
+    notify_filament_process_resolutions(full_config, bundle);
     detail_nozzle_controls.update(&full_config);
     if (switched_to_manual) {
         update_project_dirty_from_presets();
@@ -19043,6 +19046,99 @@ bool Plater::pin_feature_filament_map_for_active_features()
         }
     }
     return switched_to_manual;
+}
+
+void Plater::notify_filament_process_resolutions(const DynamicPrintConfig &full_config,
+                                                 const PresetBundle &bundle)
+{
+    const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto *policies = full_config.option<ConfigOptionEnumsGeneric>("filament_process_policy");
+    const auto *presets = full_config.option<ConfigOptionStrings>("filament_process_preset");
+    if (diameters == nullptr || policies == nullptr)
+        return;
+
+    const auto open_mapping = [](wxEvtHandler *) {
+        wxGetApp().CallAfter([] {
+            if (Plater *plater = wxGetApp().plater(); plater != nullptr) {
+                wxCommandEvent event;
+                plater->open_filament_map_setting_dialog(event);
+            }
+        });
+        return true;
+    };
+    const auto diameter_range = std::minmax_element(diameters->values.begin(), diameters->values.end());
+    const bool mixed_nozzles = diameter_range.first != diameters->values.end() &&
+                               *diameter_range.second - *diameter_range.first > EPSILON;
+    for (size_t index = 0; index < policies->values.size(); ++index) {
+        FilamentProcessPolicy policy = FilamentProcessPolicy::AutoNozzleVariant;
+        if (policies->values[index] == int(FilamentProcessPolicy::Pinned))
+            policy = FilamentProcessPolicy::Pinned;
+        else if (policies->values[index] == int(FilamentProcessPolicy::GlobalProcess))
+            policy = FilamentProcessPolicy::GlobalProcess;
+
+        FilamentProcessRequest request;
+        request.filament_id = unsigned(index + 1);
+        request.policy = policy;
+        if (presets != nullptr && index < presets->values.size())
+            request.pinned_preset_name = presets->values[index];
+        request.bundle = &bundle;
+        request.full_config = &full_config;
+        const FilamentProcessResolution resolution = resolve_filament_process(request);
+        const std::string resolved_name = !resolution.resolved_preset.empty() ? resolution.resolved_preset :
+                                          !request.pinned_preset_name.empty() ? request.pinned_preset_name : std::string();
+        const std::string state = std::to_string(index + 1) + "|" + std::to_string(resolution.tool_id) + "|" +
+                                  nozzle_number(resolution.tool_nozzle).ToStdString() + "/" +
+                                  nozzle_number(resolution.reference_nozzle).ToStdString() + "|" + resolved_name + "|" +
+                                  std::to_string(int(policy));
+
+        if (!resolution.ok && policy != FilamentProcessPolicy::GlobalProcess && resolution.tool_nozzle > 0.) {
+            if (m_filament_process_hint_states.insert(state).second) {
+                const wxString message = format_wxstr(
+                    _L("No process matches the %1% mm nozzle for Filament %2% — pick one in Filament mapping."),
+                    nozzle_number(resolution.tool_nozzle), index + 1);
+                get_notification_manager()->push_notification(
+                    NotificationType::CustomNotification,
+                    NotificationManager::NotificationLevel::WarningNotificationLevel,
+                    message.utf8_string(), _u8L("Change"), open_mapping);
+            }
+        } else if (!resolved_name.empty() && policy != FilamentProcessPolicy::GlobalProcess) {
+            if (m_filament_process_hint_states.insert(state).second) {
+                const wxString message = format_wxstr(
+                    _L("Filament %1% is on the %2% mm nozzle — using %3% for everything it prints."),
+                    index + 1, nozzle_number(resolution.tool_nozzle), from_u8(resolved_name));
+                get_notification_manager()->push_notification(
+                    NotificationType::CustomNotification,
+                    NotificationManager::NotificationLevel::HintNotificationLevel,
+                    message.utf8_string(), _u8L("Change"), open_mapping);
+            }
+        }
+
+    }
+
+    const auto *initial_height = full_config.option<ConfigOptionFloat>("initial_layer_print_height");
+    if (mixed_nozzles && initial_height != nullptr) {
+        const size_t first_layer_tool = size_t(std::distance(diameters->values.begin(), diameter_range.first));
+        const double max_height = Slicing::max_layer_height_from_nozzle(full_config, int(first_layer_tool + 1));
+        const std::string first_layer_state = "first-layer|" + std::to_string(first_layer_tool) + "|" +
+                                              nozzle_number(initial_height->value).ToStdString();
+        if (initial_height->value > max_height + EPSILON &&
+            m_filament_process_hint_states.insert(first_layer_state).second) {
+            const wxString message = format_wxstr(
+                _L("First layer stays at %1% mm (a global setting)."),
+                nozzle_number(initial_height->value));
+            get_notification_manager()->push_notification(
+                NotificationType::CustomNotification,
+                NotificationManager::NotificationLevel::HintNotificationLevel,
+                message.utf8_string(), _u8L("Change"), open_mapping);
+        }
+    }
+}
+
+bool Plater::filament_process_hint_registered_for_smoke(unsigned int filament_id) const
+{
+    const std::string prefix = std::to_string(filament_id) + "|";
+    return std::any_of(m_filament_process_hint_states.begin(), m_filament_process_hint_states.end(),
+                       [&prefix](const std::string &state) { return state.compare(0, prefix.size(), prefix) == 0; });
 }
 
 std::vector<int> Plater::get_global_filament_map() const
