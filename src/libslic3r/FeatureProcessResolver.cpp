@@ -59,6 +59,22 @@ const ConfigOptionString *string_option(const Preset &preset, const PresetCollec
     return dynamic_cast<const ConfigOptionString *>(inherited_option(preset, collection, key));
 }
 
+DynamicPrintConfig materialized_preset_config(const Preset &preset, const PresetCollection &collection)
+{
+    std::vector<const Preset *> chain;
+    const Preset               *current = &preset;
+    std::set<const Preset *>    visited;
+    while (current != nullptr && visited.insert(current).second) {
+        chain.push_back(current);
+        current = collection.get_preset_parent(*current);
+    }
+
+    DynamicPrintConfig result;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+        result.apply((*it)->config);
+    return result;
+}
+
 double preset_layer_height(const Preset &preset, const PresetCollection &prints)
 {
     const auto *option = dynamic_cast<const ConfigOptionFloat *>(inherited_option(preset, prints, "layer_height"));
@@ -156,6 +172,52 @@ std::string serialize_projection(const DynamicPrintConfig &projection)
         stream << key << '=' << projection.opt_serialize(key);
     }
     return stream.str();
+}
+
+bool starts_with(const std::string &value, const char *prefix)
+{
+    return value.compare(0, std::char_traits<char>::length(prefix), prefix) == 0;
+}
+
+bool ends_with(const std::string &value, const char *suffix)
+{
+    const size_t length = std::char_traits<char>::length(suffix);
+    return value.size() >= length && value.compare(value.size() - length, length, suffix) == 0;
+}
+
+const std::set<std::string> &filament_delta_excluded_keys()
+{
+    // Plate-global settings and L2 feature-process controls never ride the L1 filament delta.
+    static const std::set<std::string> keys = [] {
+        std::set<std::string> result{
+            "print_extruder_id", "print_extruder_variant", "wall_layer_height", "farthest_point_timelapse",
+            "outer_wall_filament_id", "inner_wall_filament_id", "sparse_infill_filament_id",
+            "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id",
+        };
+        for (const std::string &key : print_config_def.keys()) {
+            if (starts_with(key, "initial_layer_") || starts_with(key, "prime_tower_") ||
+                starts_with(key, "wipe_tower_") || starts_with(key, "skirt_") || starts_with(key, "brim_") ||
+                starts_with(key, "travel_") || starts_with(key, "raft_") || starts_with(key, "timelapse_") ||
+                ends_with(key, "_process_policy") || ends_with(key, "_process_preset") ||
+                ends_with(key, "_process_projection") || ends_with(key, "_process_layer_height") ||
+                ends_with(key, "_gcode"))
+                result.insert(key);
+        }
+        return result;
+    }();
+    return keys;
+}
+
+bool filament_delta_key_allowed(const std::string &key)
+{
+    static const std::set<std::string> region_keys(PrintRegionConfig::defaults().keys_ref().begin(),
+                                                    PrintRegionConfig::defaults().keys_ref().end());
+    static const std::set<std::string> object_keys{
+        "layer_height", "support_line_width", "support_speed", "support_interface_speed",
+        "support_top_z_distance", "support_bottom_z_distance",
+    };
+    return filament_delta_excluded_keys().count(key) == 0 &&
+           (region_keys.count(key) != 0 || object_keys.count(key) != 0);
 }
 
 bool set_model_config_string(ModelConfig &config, const char *key, const std::string &value)
@@ -454,6 +516,24 @@ void build_projection(FeatureProcessResolution &resolution, FeatureRole role, co
     }
 }
 
+void build_filament_delta(FilamentProcessResolution &resolution, const Preset &preset, const PresetCollection &prints)
+{
+    const DynamicPrintConfig materialized = materialized_preset_config(preset, prints);
+    for (const std::string &key : materialized.keys()) {
+        if (!filament_delta_key_allowed(key))
+            continue;
+        ConfigOption *copy = materialized.option(key)->clone();
+        if (auto *vector = dynamic_cast<ConfigOptionVectorBase *>(copy); vector != nullptr) {
+            if (vector->empty()) {
+                delete copy;
+                continue;
+            }
+            vector->resize(1);
+        }
+        resolution.delta.set_key_value(key, copy);
+    }
+}
+
 FeatureProcessResolution resolve_feature_process_impl(const FeatureProcessRequest &request)
 {
     FeatureProcessResolution resolution;
@@ -576,6 +656,118 @@ FeatureProcessResolution resolve_feature_process_impl(const FeatureProcessReques
     return resolution;
 }
 
+const Preset *global_process_preset(const FilamentProcessRequest &request)
+{
+    if (request.bundle == nullptr)
+        return nullptr;
+    std::string name;
+    if (request.full_config != nullptr)
+        name = option_string(*request.full_config, "print_settings_id");
+    if (name.empty())
+        name = request.bundle->prints.get_selected_preset_name();
+    return request.bundle->prints.find_preset(name, false);
+}
+
+FilamentProcessResolution resolve_filament_process_impl(const FilamentProcessRequest &request)
+{
+    FilamentProcessResolution resolution;
+    const DynamicPrintConfig  full_config = materialized_printer_config(request.full_config);
+    const GCodeConfig         gcode_config = gcode_config_from(&full_config);
+
+    resolution.tool_id = unsigned(get_extruder_index_from_filament_id(gcode_config, request.filament_id));
+    resolution.tool_nozzle = full_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(resolution.tool_id);
+
+    const Preset *global_process = global_process_preset(request);
+    resolution.reference_nozzle = global_process == nullptr || request.bundle == nullptr ?
+                                      resolution.tool_nozzle :
+                                      inferred_preset_nozzle(*global_process, *request.bundle, resolution.tool_nozzle);
+
+    if (request.policy == FilamentProcessPolicy::GlobalProcess) {
+        resolution.ok = true;
+        resolution.display_label = "Use the global process";
+        return resolution;
+    }
+    if (request.bundle == nullptr) {
+        resolution.rejection = FeatureProcessRejection::NoBundle;
+        return resolution;
+    }
+    if (request.policy == FilamentProcessPolicy::AutoNozzleVariant &&
+        std::abs(resolution.tool_nozzle - resolution.reference_nozzle) <= NOZZLE_EPSILON) {
+        resolution.ok = true;
+        resolution.display_label = "Automatic: use the global process";
+        return resolution;
+    }
+
+    const Preset *resolved = nullptr;
+    if (request.policy == FilamentProcessPolicy::Pinned) {
+        resolution.resolved_preset = request.pinned_preset_name;
+        resolved = request.bundle->prints.find_preset(request.pinned_preset_name, false);
+        if (resolved == nullptr) {
+            resolution.rejection = FeatureProcessRejection::PresetMissing;
+            resolution.display_label = request.pinned_preset_name + " (missing)";
+            return resolution;
+        }
+    } else {
+        const std::string global_family = global_process == nullptr ? std::string() :
+                                              process_family(*global_process, request.bundle->prints);
+        // Rank by preserved height-to-nozzle ratio, not absolute height: a 0.10 mm process on a
+        // 0.2 nozzle (ratio 0.5) maps to 0.20 mm on a 0.4 nozzle even though 0.16 is nearer to 0.10.
+        const double reference_height = option_float_or_default(request.full_config, "layer_height");
+        const double reference_ratio = resolution.reference_nozzle > EPSILON ?
+                                           reference_height / resolution.reference_nozzle : 0.5;
+        const double tool_nozzle = std::max(resolution.tool_nozzle, EPSILON);
+        struct RankedPreset {
+            const Preset *preset;
+            bool          same_family;
+            double        height;
+        };
+        std::vector<RankedPreset> ranked;
+        for (const Preset &candidate : request.bundle->prints) {
+            if (candidate.is_default || !candidate.is_visible)
+                continue;
+            try {
+                if (preset_compatible_with_tool_impl(candidate, *request.bundle, resolution.tool_nozzle,
+                                                     full_config, resolution.tool_id) != FeatureProcessRejection::None)
+                    continue;
+                const std::string family = process_family(candidate, request.bundle->prints);
+                ranked.push_back({&candidate, !global_family.empty() && family == global_family,
+                                  preset_layer_height(candidate, request.bundle->prints)});
+            } catch (...) {
+                // A malformed preset must not hide otherwise usable automatic candidates.
+            }
+        }
+        std::sort(ranked.begin(), ranked.end(), [reference_ratio, tool_nozzle](const RankedPreset &left, const RankedPreset &right) {
+            if (left.same_family != right.same_family)
+                return left.same_family > right.same_family;
+            const double left_distance = std::abs(left.height / tool_nozzle - reference_ratio);
+            const double right_distance = std::abs(right.height / tool_nozzle - reference_ratio);
+            if (std::abs(left_distance - right_distance) > NOZZLE_EPSILON)
+                return left_distance < right_distance;
+            return left.preset->name < right.preset->name;
+        });
+        if (ranked.empty()) {
+            resolution.rejection = FeatureProcessRejection::NoVariantFound;
+            return resolution;
+        }
+        resolved = ranked.front().preset;
+        resolution.resolved_preset = resolved->name;
+    }
+
+    resolution.layer_height = preset_layer_height(*resolved, request.bundle->prints);
+    resolution.display_label = request.policy == FilamentProcessPolicy::Pinned ?
+                                   format("Pinned: %1%", resolved->name) : format("Automatic: %1%", resolved->name);
+    const FeatureProcessRejection compatibility = preset_compatible_with_tool_impl(
+        *resolved, *request.bundle, resolution.tool_nozzle, full_config, resolution.tool_id);
+    if (compatibility != FeatureProcessRejection::None) {
+        resolution.rejection = compatibility;
+        return resolution;
+    }
+
+    build_filament_delta(resolution, *resolved, request.bundle->prints);
+    resolution.ok = true;
+    return resolution;
+}
+
 } // namespace
 
 FeatureProcessResolution resolve_feature_process(const FeatureProcessRequest &request)
@@ -587,6 +779,113 @@ FeatureProcessResolution resolve_feature_process(const FeatureProcessRequest &re
         resolution.rejection = request.bundle == nullptr ? FeatureProcessRejection::NoBundle : FeatureProcessRejection::NoVariantFound;
         return resolution;
     }
+}
+
+FilamentProcessResolution resolve_filament_process(const FilamentProcessRequest &request)
+{
+    try {
+        return resolve_filament_process_impl(request);
+    } catch (...) {
+        FilamentProcessResolution resolution;
+        resolution.rejection = request.bundle == nullptr ? FeatureProcessRejection::NoBundle : FeatureProcessRejection::NoVariantFound;
+        return resolution;
+    }
+}
+
+std::vector<FeatureProcessCandidate> enumerate_filament_process_candidates(const FilamentProcessRequest &request)
+{
+    std::vector<FeatureProcessCandidate> result;
+    if (request.bundle == nullptr)
+        return result;
+    try {
+        const DynamicPrintConfig full_config = materialized_printer_config(request.full_config);
+        const GCodeConfig gcode_config = gcode_config_from(&full_config);
+        const unsigned int tool_id = unsigned(get_extruder_index_from_filament_id(gcode_config, request.filament_id));
+        const double tool_nozzle = full_config.option<ConfigOptionFloats>("nozzle_diameter")->get_at(tool_id);
+
+        for (const Preset &preset : request.bundle->prints) {
+            if (preset.is_default || !preset.is_visible)
+                continue;
+            FeatureProcessCandidate candidate;
+            candidate.preset_name = preset.name;
+            try {
+                candidate.preset_layer_height = preset_layer_height(preset, request.bundle->prints);
+                candidate.preset_nozzle = inferred_preset_nozzle(preset, *request.bundle, tool_nozzle);
+                candidate.why_not = preset_compatible_with_tool_impl(
+                    preset, *request.bundle, tool_nozzle, full_config, tool_id);
+            } catch (...) {
+                candidate.why_not = FeatureProcessRejection::NoVariantFound;
+            }
+            candidate.compatible = candidate.why_not == FeatureProcessRejection::None;
+            candidate.label = format("%1% — %2% mm, %3% mm nozzle", candidate.preset_name,
+                                     format_number(candidate.preset_layer_height), format_number(candidate.preset_nozzle));
+            result.push_back(std::move(candidate));
+        }
+    } catch (...) {
+        // Candidate enumeration is advisory UI data; never let malformed presets escape.
+    }
+    return result;
+}
+
+bool update_filament_process_projections(const PresetBundle &bundle, DynamicPrintConfig &full_config)
+{
+    bool changed = false;
+    try {
+        size_t filament_count = bundle.filament_presets.size();
+        if (filament_count == 0) {
+            if (const auto *ids = full_config.option<ConfigOptionStrings>("filament_settings_id");
+                ids != nullptr && !ids->values.empty())
+                filament_count = ids->values.size();
+            else if (const auto *map = full_config.option<ConfigOptionInts>("filament_map"); map != nullptr)
+                filament_count = map->values.size();
+        }
+
+        const bool had_policy = full_config.has("filament_process_policy");
+        const bool had_preset = full_config.has("filament_process_preset");
+        const bool had_projection = full_config.has("filament_process_projection");
+        auto *policies = full_config.option<ConfigOptionEnumsGeneric>("filament_process_policy", true);
+        auto *presets = full_config.option<ConfigOptionStrings>("filament_process_preset", true);
+        auto *projections = full_config.option<ConfigOptionStrings>("filament_process_projection", true);
+        changed = !had_policy || !had_preset || !had_projection;
+        if (policies->values.size() != filament_count) {
+            policies->values.resize(filament_count, int(FilamentProcessPolicy::AutoNozzleVariant));
+            changed = true;
+        }
+        if (presets->values.size() != filament_count) {
+            presets->values.resize(filament_count, "");
+            changed = true;
+        }
+        if (projections->values.size() != filament_count) {
+            projections->values.resize(filament_count, "");
+            changed = true;
+        }
+
+        for (size_t index = 0; index < filament_count; ++index) {
+            FilamentProcessPolicy policy = FilamentProcessPolicy::AutoNozzleVariant;
+            if (policies->values[index] == int(FilamentProcessPolicy::Pinned))
+                policy = FilamentProcessPolicy::Pinned;
+            else if (policies->values[index] == int(FilamentProcessPolicy::GlobalProcess))
+                policy = FilamentProcessPolicy::GlobalProcess;
+
+            FilamentProcessRequest request;
+            request.filament_id = unsigned(index + 1);
+            request.policy = policy;
+            request.pinned_preset_name = presets->values[index];
+            request.bundle = &bundle;
+            request.full_config = &full_config;
+            const FilamentProcessResolution resolution = resolve_filament_process(request);
+            const std::string serialized = resolution.ok ? serialize_projection(resolution.delta) : std::string();
+            if (projections->values[index] != serialized) {
+                projections->values[index] = serialized;
+                changed = true;
+            }
+        }
+    } catch (const std::exception &error) {
+        BOOST_LOG_TRIVIAL(warning) << "Filament process projection refresh failed: " << error.what();
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(warning) << "Filament process projection refresh failed with an unknown error";
+    }
+    return changed;
 }
 
 bool update_feature_process_projections(Model &model, const PresetBundle &bundle,

@@ -58,6 +58,9 @@ static std::vector<std::string> s_project_options {
     "nozzle_volume_type",
     "filament_map_mode",
     "filament_map",
+    "filament_process_policy",
+    "filament_process_preset",
+    "filament_process_projection",
     // Physically installed per-extruder diameters; project-level so device state survives
     // printer-preset switches without dirtying the selected preset.
     "project_nozzle_diameter",
@@ -73,6 +76,14 @@ static std::vector<std::string> s_project_options {
     "has_filament_switcher",
     "enable_filament_dynamic_map"
 };
+
+static void resize_filament_process_vectors(DynamicPrintConfig &config, size_t count)
+{
+    config.option<ConfigOptionEnumsGeneric>("filament_process_policy", true)->values.resize(
+        count, int(FilamentProcessPolicy::AutoNozzleVariant));
+    config.option<ConfigOptionStrings>("filament_process_preset", true)->values.resize(count, "");
+    config.option<ConfigOptionStrings>("filament_process_projection", true)->values.resize(count, "");
+}
 
 //Orca: add custom as default
 const char *PresetBundle::ORCA_DEFAULT_BUNDLE = "Custom";
@@ -121,6 +132,7 @@ DynamicPrintConfig PresetBundle::construct_full_config(
     if (filament_volume_maps.size() != num_filaments) {
         filament_volume_maps.resize(num_filaments, nvtStandard);
     }
+    resize_filament_process_vectors(out, num_filaments);
 
     auto *extruder_diameter = dynamic_cast<const ConfigOptionFloats *>(out.option("nozzle_diameter"));
     // Collect the "compatible_printers_condition" and "inherits" values over all presets (print, filaments, printers) into a single vector.
@@ -3069,6 +3081,7 @@ void PresetBundle::set_num_filaments(unsigned int n, std::vector<std::string> ne
     filament_map->values.resize(n, 1);
     filament_nozzle_map->values.resize(n, 0);
     filament_volume_map->values.resize(n, static_cast<int>(NozzleVolumeType::nvtStandard));
+    resize_filament_process_vectors(project_config, n);
     ams_multi_color_filment.resize(n);
 
     // BBS set new filament color to new_color
@@ -3109,6 +3122,7 @@ void PresetBundle::set_num_filaments(unsigned int n, std::string new_color)
     filament_map->values.resize(n, 1);
     filament_nozzle_map->values.resize(n, 0);
     filament_volume_map->values.resize(n, static_cast<int>(NozzleVolumeType::nvtStandard));
+    resize_filament_process_vectors(project_config, n);
     ams_multi_color_filment.resize(n);
 
     //BBS set new filament color to new_color
@@ -3129,6 +3143,7 @@ void PresetBundle::update_num_filaments(unsigned int to_del_flament_id)
 {
     unsigned old_filament_count = this->filament_presets.size();
     assert(to_del_flament_id < old_filament_count);
+    resize_filament_process_vectors(project_config, old_filament_count);
     filament_presets.erase(filament_presets.begin() + to_del_flament_id);
 
     // update edited_preset
@@ -3151,6 +3166,9 @@ void PresetBundle::update_num_filaments(unsigned int to_del_flament_id)
     ConfigOptionInts* filament_map = project_config.option<ConfigOptionInts>("filament_map");
     ConfigOptionInts* filament_nozzle_map = project_config.option<ConfigOptionInts>("filament_nozzle_map");
     ConfigOptionInts* filament_volume_map = project_config.option<ConfigOptionInts>("filament_volume_map");
+    ConfigOptionEnumsGeneric *filament_process_policy = project_config.option<ConfigOptionEnumsGeneric>("filament_process_policy");
+    ConfigOptionStrings *filament_process_preset = project_config.option<ConfigOptionStrings>("filament_process_preset");
+    ConfigOptionStrings *filament_process_projection = project_config.option<ConfigOptionStrings>("filament_process_projection");
     if (filament_color->values.size() > to_del_flament_id) {
         filament_color->values.erase(filament_color->values.begin() + to_del_flament_id);
         if (filament_map->values.size() > to_del_flament_id) {
@@ -3181,6 +3199,9 @@ void PresetBundle::update_num_filaments(unsigned int to_del_flament_id)
 
     erase_or_resize(filament_multi_color->values);
     erase_or_resize(filament_color_type->values);
+    erase_or_resize(filament_process_policy->values);
+    erase_or_resize(filament_process_preset->values);
+    erase_or_resize(filament_process_projection->values);
     erase_or_resize(ams_multi_color_filment);
 
     update_multi_material_filament_presets(to_del_flament_id);
@@ -3646,6 +3667,7 @@ unsigned int PresetBundle::sync_ams_list(std::vector<std::pair<DynamicPrintConfi
         if (support_interface_filament_opt->value > filament_color_type->values.size())
             support_interface_filament_opt->value = 0;
     }
+    resize_filament_process_vectors(project_config, this->filament_presets.size());
     // Update ams_multi_color_filment
     update_filament_multi_color();
     update_multi_material_filament_presets();
@@ -4050,6 +4072,7 @@ DynamicPrintConfig PresetBundle::full_fff_config(bool apply_extruder, std::optio
     if (filament_volume_maps.size() != num_filaments) {
         filament_volume_maps.resize(num_filaments, nvtStandard);
     }
+    resize_filament_process_vectors(out, num_filaments);
 
     auto* extruder_diameter = dynamic_cast<const ConfigOptionFloats*>(out.option("nozzle_diameter"));
     // Collect the "compatible_printers_condition" and "inherits" values over all presets (print, filaments, printers) into a single vector.

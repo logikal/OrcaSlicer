@@ -652,6 +652,13 @@ static const t_config_enum_values s_keys_map_FeatureProcessPolicy = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FeatureProcessPolicy)
 
+static const t_config_enum_values s_keys_map_FilamentProcessPolicy = {
+    { "auto_nozzle_variant", int(FilamentProcessPolicy::AutoNozzleVariant) },
+    { "pinned",              int(FilamentProcessPolicy::Pinned) },
+    { "global_process",      int(FilamentProcessPolicy::GlobalProcess) },
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FilamentProcessPolicy)
+
 // PrimeVolumeMode. Serialized string keys must stay stable; they round-trip through .3mf.
 static const t_config_enum_values s_keys_map_PrimeVolumeMode = {
     { "Default", pvmDefault },
@@ -2919,6 +2926,27 @@ void PrintConfigDef::init_fff_params()
                      "When set, these values override the nozzle diameters from the printer preset for this project.");
     def->mode = comDevelop;
     def->set_default_value(new ConfigOptionFloats{});
+
+    def = this->add("filament_process_policy", coEnums);
+    def->label = L("Filament process policy");
+    def->tooltip = L("Selects how the process preset is resolved for each filament slot.");
+    def->enum_keys_map = &ConfigOptionEnum<FilamentProcessPolicy>::get_enum_values();
+    def->enum_values = {"auto_nozzle_variant", "pinned", "global_process"};
+    def->enum_labels = {L("Automatic nozzle-matched variant"), L("Pinned preset"), L("Use the global process")};
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnumsGeneric{int(FilamentProcessPolicy::AutoNozzleVariant)});
+
+    def = this->add("filament_process_preset", coStrings);
+    def->label = L("Filament process preset");
+    def->tooltip = L("Process preset name used when the filament process policy is Pinned preset.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionStrings{""});
+
+    def = this->add("filament_process_projection", coStrings);
+    def->label = L("Filament process projection");
+    def->tooltip = L("Derived process settings for each filament slot.");
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionStrings{""});
 
     def = this->add("filament_map_mode", coEnum);
     // internal use only, don't need translation

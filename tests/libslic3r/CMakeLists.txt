@@ -14,6 +14,7 @@ add_executable(${_TEST_NAME}_tests
     test_config.cpp
     test_feature_process_config.cpp
     test_feature_process_resolver.cpp
+    test_filament_process_resolver.cpp
     test_config_variant_expansion.cpp
     test_toolordering_nozzle_group.cpp
     test_preset_bundle_loading.cpp

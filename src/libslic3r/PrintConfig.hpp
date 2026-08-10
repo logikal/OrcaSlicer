@@ -513,6 +513,12 @@ enum class FeatureProcessPolicy {
     SameAsObject,
 };
 
+enum class FilamentProcessPolicy {
+    AutoNozzleVariant = 0,
+    Pinned,
+    GlobalProcess,
+};
+
 // All auto modes are ordered before fmmManual (see the enum ordering note above).
 inline bool is_auto_filament_map_mode(FilamentMapMode mode) {
     return mode < fmmManual;
@@ -679,6 +685,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ToolChangeOrderingType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PowerLossRecoveryMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SurfaceFillOrder)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FeatureProcessPolicy)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FilamentProcessPolicy)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 
@@ -1572,6 +1579,9 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionEnum<BedTempFormula>, bed_temperature_formula))
     ((ConfigOptionInts,                physical_extruder_map))
     ((ConfigOptionFloats,              project_nozzle_diameter))
+    ((ConfigOptionEnumsGeneric,        filament_process_policy))
+    ((ConfigOptionStrings,             filament_process_preset))
+    ((ConfigOptionStrings,             filament_process_projection))
     ((ConfigOptionIntsNullable,        nozzle_flush_dataset))
     ((ConfigOptionFloatsNullable,      filament_flush_volumetric_speed))
     ((ConfigOptionIntsNullable,        filament_flush_temp))

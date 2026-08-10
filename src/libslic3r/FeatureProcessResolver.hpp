@@ -75,6 +75,30 @@ struct FeatureProcessCandidate {
 
 std::vector<FeatureProcessCandidate> enumerate_feature_process_candidates(const FeatureProcessRequest &request);
 
+struct FilamentProcessRequest {
+    unsigned int              filament_id = 0;
+    FilamentProcessPolicy     policy = FilamentProcessPolicy::AutoNozzleVariant;
+    std::string               pinned_preset_name;
+    const PresetBundle       *bundle = nullptr;
+    const DynamicPrintConfig *full_config = nullptr;
+};
+
+struct FilamentProcessResolution {
+    bool                    ok = false;
+    FeatureProcessRejection rejection = FeatureProcessRejection::None;
+    std::string             resolved_preset;
+    unsigned int            tool_id = 0;
+    double                  tool_nozzle = 0.;
+    double                  reference_nozzle = 0.;
+    double                  layer_height = 0.;
+    DynamicPrintConfig      delta;
+    std::string             display_label;
+};
+
+FilamentProcessResolution resolve_filament_process(const FilamentProcessRequest &request);
+std::vector<FeatureProcessCandidate> enumerate_filament_process_candidates(const FilamentProcessRequest &request);
+bool update_filament_process_projections(const PresetBundle &bundle, DynamicPrintConfig &full_config);
+
 FeatureProcessRejection preset_compatible_with_tool(const Preset       &process_preset,
                                                     const PresetBundle &bundle,
                                                     double              tool_nozzle_diameter);
