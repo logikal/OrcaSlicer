@@ -295,6 +295,7 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         } else if (
                opt_key == "slicing_pipeline_plugin"
             || opt_key == "print_plugin_config_overrides"
+            || opt_key == "filament_process_projection"
             || opt_key == "initial_layer_print_height"
             || opt_key == "nozzle_diameter"
             || opt_key == "filament_shrink"

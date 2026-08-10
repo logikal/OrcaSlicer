@@ -32,6 +32,7 @@
 #include <float.h>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -3776,7 +3777,12 @@ static void clamp_feature_filament_to_valid(ConfigOptionInt &opt, size_t num_ext
         opt.value = 1;
 }
 
-PrintObjectConfig PrintObject::object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object, size_t num_extruders, std::vector<int>& variant_index)
+static void apply_filament_process_object_delta(PrintObjectConfig &config, const ModelObject &object,
+                                                const PrintConfig &print_config);
+
+PrintObjectConfig PrintObject::object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object,
+                                                               size_t num_extruders, std::vector<int>& variant_index,
+                                                               const PrintConfig &print_config)
 {
     PrintObjectConfig config = default_object_config;
     {
@@ -3784,6 +3790,7 @@ PrintObjectConfig PrintObject::object_config_from_model_object(const PrintObject
         src_normalized.normalize_fdm();
         update_static_print_config_from_dynamic(config, src_normalized, variant_index, print_options_with_variant, 1);
     }
+    apply_filament_process_object_delta(config, object, print_config);
     // Clamp invalid extruders to the default extruder (with index 1).
     clamp_exturder_to_default(config.support_filament,           num_extruders);
     clamp_exturder_to_default(config.support_interface_filament, num_extruders);
@@ -3819,6 +3826,114 @@ static std::string_view trim_projection_token(std::string_view token)
     return token;
 }
 
+static bool contains_key(const t_config_option_keys &keys, const std::string &key)
+{
+    return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
+static void append_key(t_config_option_keys &keys, const std::string &key)
+{
+    if (!contains_key(keys, key))
+        keys.push_back(key);
+}
+
+static DynamicPrintConfig parse_filament_process_delta(const std::string &serialized)
+{
+    DynamicPrintConfig parsed;
+    for (size_t begin = 0; begin <= serialized.size();) {
+        const size_t end = serialized.find(';', begin);
+        const std::string_view entry(serialized.data() + begin,
+                                     (end == std::string::npos ? serialized.size() : end) - begin);
+        const size_t equals = entry.find('=');
+        const std::string key(trim_projection_token(entry.substr(0, equals)));
+        if (!key.empty()) {
+            if (equals == std::string_view::npos || print_config_def.get(key) == nullptr) {
+                BOOST_LOG_TRIVIAL(warning) << "Ignoring unknown filament process delta key: " << key;
+            } else {
+                try {
+                    parsed.set_deserialize_strict(key, std::string(trim_projection_token(entry.substr(equals + 1))));
+                } catch (...) {
+                    BOOST_LOG_TRIVIAL(warning) << "Ignoring malformed filament process delta key: " << key;
+                }
+            }
+        }
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+    return parsed;
+}
+
+using FilamentDeltaCache = std::map<unsigned int, DynamicPrintConfig>;
+
+static const DynamicPrintConfig &filament_process_delta(const PrintConfig &print_config, unsigned int filament,
+                                                        FilamentDeltaCache &cache)
+{
+    auto [it, inserted] = cache.try_emplace(filament);
+    if (inserted && filament > 0 && filament <= print_config.filament_process_projection.values.size()) {
+        const std::string &serialized = print_config.filament_process_projection.values[filament - 1];
+        if (!serialized.empty())
+            it->second = parse_filament_process_delta(serialized);
+    }
+    return it->second;
+}
+
+static void apply_delta_key(ConfigBase &target_config, const DynamicPrintConfig &delta, const std::string &key,
+                            size_t tool_id, const t_config_option_keys &explicit_keys)
+{
+    if (contains_key(explicit_keys, key))
+        return;
+    const ConfigOption *source = delta.option(key);
+    if (source == nullptr)
+        return;
+    ConfigOption *target = target_config.option(key, false);
+    if (target == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << "Ignoring unsupported filament process delta key: " << key;
+        return;
+    }
+    try {
+        if (auto *target_vector = dynamic_cast<ConfigOptionVectorBase *>(target); target_vector != nullptr)
+            target_vector->set_at(source, tool_id, 0);
+        else
+            target->set(source);
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(warning) << "Ignoring malformed filament process delta key: " << key;
+    }
+}
+
+static unsigned int effective_object_filament(const ModelObject &object)
+{
+    const auto *extruder = object.config.get().option<ConfigOptionInt>(key_extruder);
+    return extruder == nullptr || extruder->value <= 0 ? 1u : unsigned(extruder->value);
+}
+
+static void apply_filament_process_object_delta(PrintObjectConfig &config, const ModelObject &object,
+                                                const PrintConfig &print_config)
+{
+    FilamentDeltaCache cache;
+    const unsigned int base_filament = effective_object_filament(object);
+    const DynamicPrintConfig &base_delta = filament_process_delta(print_config, base_filament, cache);
+    if (!object.config.has("layer_height"))
+        apply_delta_key(config, base_delta, "layer_height",
+                        get_extruder_index_from_filament_id(print_config, base_filament), {});
+
+    const unsigned int support_filament = config.support_filament.value > 0 ?
+        unsigned(config.support_filament.value) : base_filament;
+    const DynamicPrintConfig &support_delta = filament_process_delta(print_config, support_filament, cache);
+    const size_t support_tool = get_extruder_index_from_filament_id(print_config, support_filament);
+    for (const char *key : {"support_line_width", "support_speed"})
+        if (!object.config.has(key))
+            apply_delta_key(config, support_delta, key, support_tool, {});
+
+    const unsigned int interface_filament = config.support_interface_filament.value > 0 ?
+        unsigned(config.support_interface_filament.value) : base_filament;
+    const DynamicPrintConfig &interface_delta = filament_process_delta(print_config, interface_filament, cache);
+    const size_t interface_tool = get_extruder_index_from_filament_id(print_config, interface_filament);
+    for (const char *key : {"support_interface_speed", "support_top_z_distance", "support_bottom_z_distance"})
+        if (!object.config.has(key))
+            apply_delta_key(config, interface_delta, key, interface_tool, {});
+}
+
 static unsigned int effective_wall_filament(const PrintRegionConfig &out, const DynamicPrintConfig &in,
                                             const FeatureFilamentOverrideMask &feature_overrides)
 {
@@ -3833,7 +3948,7 @@ static unsigned int effective_wall_filament(const PrintRegionConfig &out, const 
 
 static void apply_feature_process_projection(PrintRegionConfig &out, const DynamicPrintConfig &in,
                                              const FeatureFilamentOverrideMask &feature_overrides,
-                                             const PrintConfig &print_config)
+                                             const PrintConfig &print_config, t_config_option_keys *explicit_keys)
 {
     const auto *serialized = in.option<ConfigOptionString>("wall_process_projection");
     if (serialized == nullptr || serialized->value.empty())
@@ -3860,6 +3975,8 @@ static void apply_feature_process_projection(PrintRegionConfig &out, const Dynam
                         target_vector->set_at(source, tool_id, 0);
                     else
                         target->set(source);
+                    if (explicit_keys != nullptr)
+                        append_key(*explicit_keys, key);
                 } catch (...) {
                     BOOST_LOG_TRIVIAL(warning) << "Ignoring malformed feature process projection key: " << key;
                 }
@@ -3875,11 +3992,12 @@ static void apply_feature_process_projection(PrintRegionConfig &out, const Dynam
 
 static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPrintConfig &in,
                                          FeatureFilamentOverrideMask &feature_overrides,
-                                         std::vector<int>& variant_index, const PrintConfig &print_config)
+                                         std::vector<int>& variant_index, const PrintConfig &print_config,
+                                         t_config_option_keys *explicit_keys, unsigned int &base_filament)
 {
     // Derived process values are the first pass. The explicit loop below is intentionally
     // second so a user override in this same scope always wins.
-    apply_feature_process_projection(out, in, feature_overrides, print_config);
+    apply_feature_process_projection(out, in, feature_overrides, print_config, explicit_keys);
 
     // 1) Explicit feature filament values take precedence over base extruder fallback.
     auto *opt_extruder = in.opt<ConfigOptionInt>(key_extruder);
@@ -3889,6 +4007,8 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
     for (auto it = in.cbegin(); it != in.cend(); ++ it)
         if (it->first != key_extruder)
             if (ConfigOption* my_opt = out.option(it->first, false); my_opt != nullptr) {
+                if (explicit_keys != nullptr)
+                    append_key(*explicit_keys, it->first);
                 if (one_of(it->first, keys_extruders)) {
                     // "Default" (0) clears explicit override for this scope and lets fallback apply.
                     int extruder = static_cast<const ConfigOptionInt*>(it->second.get())->value;
@@ -3936,6 +4056,7 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
 
     // 3) Apply base extruder only to features that were not explicitly overridden.
     if (base_extruder > 0) {
+        base_filament = unsigned(base_extruder);
         if (!feature_overrides.sparse_infill_filament_id)
             out.sparse_infill_filament_id.value = base_extruder;
         if (!feature_overrides.internal_solid_filament_id)
@@ -3951,13 +4072,123 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
     }
 }
 
+static unsigned int filament_for_role(const PrintRegionConfig &config, FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return unsigned(std::max(config.outer_wall_filament_id.value, 1));
+    case FeatureRole::SparseInfill:  return unsigned(std::max(config.sparse_infill_filament_id.value, 1));
+    case FeatureRole::InternalSolid: return unsigned(std::max(config.internal_solid_filament_id.value, 1));
+    case FeatureRole::TopSurface:    return unsigned(std::max(config.top_surface_filament_id.value, 1));
+    case FeatureRole::BottomSurface: return unsigned(std::max(config.bottom_surface_filament_id.value, 1));
+    default:                         return 1;
+    }
+}
+
+static const char *height_key_for_role(FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return "wall_layer_height";
+    case FeatureRole::SparseInfill:  return "sparse_infill_process_layer_height";
+    case FeatureRole::InternalSolid: return "internal_solid_process_layer_height";
+    case FeatureRole::TopSurface:    return "top_surface_process_layer_height";
+    case FeatureRole::BottomSurface: return "bottom_surface_process_layer_height";
+    default:                         return nullptr;
+    }
+}
+
+void apply_filament_process_delta(PrintRegionConfig &config, const PrintConfig &print_config,
+                                  const PrintRegionConfig &global_region_defaults,
+                                  unsigned int base_filament, double object_layer_height,
+                                  const t_config_option_keys &explicit_keys)
+{
+    static const std::array<FeatureRole, 5> roles{
+        FeatureRole::Wall, FeatureRole::SparseInfill, FeatureRole::InternalSolid,
+        FeatureRole::TopSurface, FeatureRole::BottomSurface,
+    };
+    static const std::set<std::string> role_keys = [] {
+        std::set<std::string> result;
+        for (FeatureRole role : roles) {
+            const std::vector<std::string> &keys = filament_delta_keys_for_role(role);
+            result.insert(keys.begin(), keys.end());
+        }
+        return result;
+    }();
+
+    FilamentDeltaCache cache;
+    std::set<std::string> projected_keys;
+    for (size_t index = 0; index < print_config.filament_process_projection.values.size(); ++index) {
+        const DynamicPrintConfig &delta = filament_process_delta(print_config, unsigned(index + 1), cache);
+        const std::vector<std::string> keys = delta.keys();
+        projected_keys.insert(keys.begin(), keys.end());
+    }
+
+    // A modifier or painted region starts from its parent's already projected config. Restore
+    // every L1-capable region key first so an empty or sparser child delta cannot retain parent L1.
+    // The restore source must be the global process values, NOT compiled defaults — a preset that
+    // overrides e.g. wall_loops must survive when the region's own filament carries no delta.
+    const PrintRegionConfig &baseline = global_region_defaults;
+    for (const std::string &key : projected_keys) {
+        if (contains_key(explicit_keys, key))
+            continue;
+        ConfigOption *target = config.option(key, false);
+        const ConfigOption *source = baseline.option(key);
+        if (target != nullptr && source != nullptr)
+            target->set(source);
+    }
+    if (projected_keys.count("layer_height") != 0) {
+        for (FeatureRole role : roles) {
+            const char *height_key = height_key_for_role(role);
+            if (height_key != nullptr && !contains_key(explicit_keys, height_key))
+                config.option(height_key)->set(baseline.option(height_key));
+        }
+    }
+
+    base_filament = std::max(base_filament, 1u);
+    const DynamicPrintConfig &base_delta = filament_process_delta(print_config, base_filament, cache);
+    const size_t base_tool = get_extruder_index_from_filament_id(print_config, base_filament);
+    for (const std::string &key : base_delta.keys()) {
+        if (role_keys.count(key) != 0 || key == "layer_height" || key == "wall_layer_height" ||
+            key.find("_process_") != std::string::npos ||
+            std::any_of(keys_extruders.begin(), keys_extruders.end(), [&key](std::string_view item) { return item == key; }))
+            continue;
+        if (config.option(key, false) != nullptr)
+            apply_delta_key(config, base_delta, key, base_tool, explicit_keys);
+    }
+
+    if (object_layer_height <= 0.) {
+        if (const auto *height = base_delta.option<ConfigOptionFloat>("layer_height"); height != nullptr)
+            object_layer_height = height->value;
+    }
+    for (FeatureRole role : roles) {
+        const unsigned int filament = filament_for_role(config, role);
+        const DynamicPrintConfig &delta = filament_process_delta(print_config, filament, cache);
+        const size_t tool_id = get_extruder_index_from_filament_id(print_config, filament);
+        for (const std::string &key : filament_delta_keys_for_role(role))
+            apply_delta_key(config, delta, key, tool_id, explicit_keys);
+
+        const auto *height = delta.option<ConfigOptionFloat>("layer_height");
+        const char *height_key = height_key_for_role(role);
+        if (height != nullptr && height_key != nullptr && !contains_key(explicit_keys, height_key) &&
+            (object_layer_height <= 0. || std::abs(height->value - object_layer_height) > EPSILON))
+            config.option<ConfigOptionFloat>(height_key)->value = height->value;
+    }
+}
+
 PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &default_or_parent_region_config,
+                                                  const PrintRegionConfig &global_region_defaults,
                                                   const DynamicPrintConfig *layer_range_config,
                                                   const ModelVolume &volume, size_t num_extruders,
-                                                  std::vector<int>& variant_index, const PrintConfig &print_config)
+                                                  std::vector<int>& variant_index, const PrintConfig &print_config,
+                                                  unsigned int inherited_base_filament, double object_layer_height,
+                                                  const t_config_option_keys *inherited_explicit_keys,
+                                                  unsigned int *resolved_base_filament,
+                                                  t_config_option_keys *resolved_explicit_keys)
 {
     PrintRegionConfig config = default_or_parent_region_config;
     FeatureFilamentOverrideMask feature_overrides;
+    t_config_option_keys explicit_keys = inherited_explicit_keys == nullptr ?
+        t_config_option_keys{} : *inherited_explicit_keys;
+    unsigned int base_filament = std::max(inherited_base_filament, 1u);
 
     // For model parts, non-zero values coming from the print defaults should stay explicit.
     if (volume.is_model_part()) {
@@ -3972,18 +4203,27 @@ PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &defau
     if (volume.is_model_part()) {
         // default_or_parent_region_config contains the Print's PrintRegionConfig.
         // Override with ModelObject's PrintRegionConfig values.
-        apply_to_print_region_config(config, volume.get_object()->config.get(), feature_overrides, variant_index, print_config);
+        apply_to_print_region_config(config, volume.get_object()->config.get(), feature_overrides, variant_index, print_config,
+                                     &explicit_keys, base_filament);
     } else {
         // default_or_parent_region_config contains parent PrintRegion config, which already contains ModelVolume's config.
     }
-    apply_to_print_region_config(config, volume.config.get(), feature_overrides, variant_index, print_config);
+    apply_to_print_region_config(config, volume.config.get(), feature_overrides, variant_index, print_config,
+                                 &explicit_keys, base_filament);
     if (! volume.material_id().empty())
-        apply_to_print_region_config(config, volume.material()->config.get(), feature_overrides, variant_index, print_config);
+        apply_to_print_region_config(config, volume.material()->config.get(), feature_overrides, variant_index, print_config,
+                                     &explicit_keys, base_filament);
     if (layer_range_config != nullptr) {
         // Not applicable to modifiers.
         assert(volume.is_model_part());
-        apply_to_print_region_config(config, *layer_range_config, feature_overrides, variant_index, print_config);
+        apply_to_print_region_config(config, *layer_range_config, feature_overrides, variant_index, print_config,
+                                     &explicit_keys, base_filament);
     }
+    apply_filament_process_delta(config, print_config, global_region_defaults, base_filament, object_layer_height, explicit_keys);
+    if (resolved_base_filament != nullptr)
+        *resolved_base_filament = base_filament;
+    if (resolved_explicit_keys != nullptr)
+        *resolved_explicit_keys = explicit_keys;
     // Resolve feature defaults and clamp invalid extruders to index 1.
     clamp_feature_filament_to_valid(config.sparse_infill_filament_id, num_extruders);
     clamp_feature_filament_to_valid(config.outer_wall_filament_id, num_extruders);
@@ -4097,7 +4337,7 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 	default_region_config.apply(full_config, true);
     // BBS
 	size_t              filament_extruders = print_config.filament_diameter.size();
-	object_config = object_config_from_model_object(object_config, model_object, filament_extruders, variant_index);
+	object_config = object_config_from_model_object(object_config, model_object, filament_extruders, variant_index, print_config);
 
 	std::vector<unsigned int> object_extruders;
 	std::vector<unsigned int> fine_cadence_extruders;
@@ -4107,7 +4347,8 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 	for (const ModelVolume* model_volume : model_object.volumes)
 		if (model_volume->is_model_part()) {
 			const PrintRegionConfig region_config = region_config_from_model_volume(
-				default_region_config, nullptr, *model_volume, filament_extruders, variant_index, print_config);
+				default_region_config, default_region_config, nullptr, *model_volume, filament_extruders, variant_index, print_config,
+                1, object_config.layer_height.value, nullptr, nullptr, nullptr);
 			PrintRegion::collect_object_printing_extruders(
 				print_config,
 				region_config,
@@ -4124,7 +4365,8 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 					range_and_config.second.has("bottom_surface_filament_id"))
 					PrintRegion::collect_object_printing_extruders(
 						print_config,
-						region_config_from_model_volume(default_region_config, &range_and_config.second.get(), *model_volume, filament_extruders, variant_index, print_config),
+						region_config_from_model_volume(default_region_config, default_region_config, &range_and_config.second.get(), *model_volume, filament_extruders, variant_index,
+                                                        print_config, 1, object_config.layer_height.value, nullptr, nullptr, nullptr),
                         object_config.brim_type != btNoBrim && object_config.brim_width > 0.,
 						object_extruders);
 		}

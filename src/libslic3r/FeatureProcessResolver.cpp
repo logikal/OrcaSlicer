@@ -1011,6 +1011,43 @@ const std::vector<std::string> &feature_projection_keys(FeatureRole role)
     return role == FeatureRole::Wall ? wall_keys : empty;
 }
 
+const std::vector<std::string> &filament_delta_keys_for_role(FeatureRole role)
+{
+    static const std::vector<std::string> wall_keys = [] {
+        std::vector<std::string> result = feature_projection_keys(FeatureRole::Wall);
+        result.push_back("wall_loops");
+        return result;
+    }();
+    static const std::vector<std::string> sparse_infill_keys{
+        "sparse_infill_line_width", "sparse_infill_density", "sparse_infill_pattern",
+        "sparse_infill_speed", "sparse_infill_acceleration", "infill_jerk", "gap_infill_speed",
+        "sparse_infill_anchor", "sparse_infill_anchor_max", "infill_anchor", "infill_anchor_max",
+    };
+    static const std::vector<std::string> internal_solid_keys{
+        "internal_solid_infill_line_width", "internal_solid_infill_speed",
+        "internal_solid_infill_acceleration", "top_bottom_infill_wall_overlap", "bridge_speed",
+        "internal_bridge_speed", "bridge_flow", "internal_bridge_flow",
+    };
+    static const std::vector<std::string> top_surface_keys{
+        "top_surface_line_width", "top_surface_speed", "top_surface_acceleration", "top_surface_jerk",
+        "top_shell_layers", "top_shell_thickness", "top_color_penetration_layers", "ironing_flow",
+        "ironing_spacing", "ironing_inset", "ironing_speed", "ironing_type", "ironing_pattern",
+    };
+    static const std::vector<std::string> bottom_surface_keys{
+        "bottom_shell_layers", "bottom_shell_thickness", "bottom_color_penetration_layers",
+    };
+    static const std::vector<std::string> empty;
+
+    switch (role) {
+    case FeatureRole::Wall:          return wall_keys;
+    case FeatureRole::SparseInfill:  return sparse_infill_keys;
+    case FeatureRole::InternalSolid: return internal_solid_keys;
+    case FeatureRole::TopSurface:    return top_surface_keys;
+    case FeatureRole::BottomSurface: return bottom_surface_keys;
+    default:                         return empty;
+    }
+}
+
 int feature_cadence_ratio(double base_layer_height, double feature_layer_height)
 {
     if (!std::isfinite(base_layer_height) || !std::isfinite(feature_layer_height) ||

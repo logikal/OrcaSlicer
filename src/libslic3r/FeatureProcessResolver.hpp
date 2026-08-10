@@ -104,6 +104,7 @@ FeatureProcessRejection preset_compatible_with_tool(const Preset       &process_
                                                     double              tool_nozzle_diameter);
 
 const std::vector<std::string> &feature_projection_keys(FeatureRole role);
+const std::vector<std::string> &filament_delta_keys_for_role(FeatureRole role);
 
 int feature_cadence_ratio(double base_layer_height, double feature_layer_height);
 

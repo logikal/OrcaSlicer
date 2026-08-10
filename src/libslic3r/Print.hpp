@@ -248,6 +248,10 @@ public:
         PrintRegion         *region { nullptr };
         // Pointer to VolumeExtents::bbox.
         const BoundingBox   *bbox { nullptr };
+        // Effective base filament after the object / volume / material / layer-range chain.
+        unsigned int         base_filament { 1 };
+        // L2 projections and L3 model keys accumulated along the same scope chain.
+        t_config_option_keys explicit_keys;
         // To speed up merging of same regions.
         const VolumeRegion  *prev_same_region { nullptr };
     };
@@ -509,7 +513,9 @@ public:
     void                    update_slicing_parameters();
     FeatureCadencePlan      compute_feature_cadence_plan() const;
 
-    static PrintObjectConfig object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object, size_t num_extruders, std::vector<int>& variant_index);
+    static PrintObjectConfig object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object,
+                                                             size_t num_extruders, std::vector<int>& variant_index,
+                                                             const PrintConfig &print_config);
 
 private:
     void make_perimeters();
@@ -611,6 +617,11 @@ private:
     static bool clip_multipart_objects;
     static bool infill_only_where_needed;
 };
+
+void apply_filament_process_delta(PrintRegionConfig &config, const PrintConfig &print_config,
+                                  const PrintRegionConfig &global_region_defaults,
+                                  unsigned int base_filament, double object_layer_height,
+                                  const t_config_option_keys &explicit_keys);
 
 struct FakeWipeTower
 {

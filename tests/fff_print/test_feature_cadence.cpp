@@ -5,6 +5,7 @@
 #include "libslic3r/ExtrusionEntityCollection.hpp"
 #include "libslic3r/GCodeReader.hpp"
 #include "libslic3r/Layer.hpp"
+#include "libslic3r/TriangleSelector.hpp"
 #include "test_helpers.hpp"
 
 #include <cctype>
@@ -36,6 +37,31 @@ DynamicPrintConfig projection_test_config()
 DynamicPrintConfig mixed_nozzle_grid_config()
 {
     return mixed_nozzle_config();
+}
+
+DynamicPrintConfig filament_delta_test_config()
+{
+    DynamicPrintConfig config = mixed_nozzle_config({
+        {"outer_wall_filament_id", 0},
+        {"inner_wall_filament_id", 0},
+        {"sparse_infill_filament_id", 0},
+        {"internal_solid_filament_id", 0},
+        {"top_surface_filament_id", 0},
+        {"bottom_surface_filament_id", 0},
+    });
+    config.option<ConfigOptionStrings>("filament_process_projection", true)->values = {
+        "layer_height=0.2;outer_wall_line_width=0.44;inner_wall_line_width=0.43;wall_loops=2;sparse_infill_line_width=0.45",
+        "layer_height=0.1;outer_wall_line_width=0.22;inner_wall_line_width=0.21;wall_loops=4;sparse_infill_line_width=0.25",
+    };
+    return config;
+}
+
+const PrintRegionConfig *region_with_outer_width(const PrintObject &object, double width)
+{
+    for (const PrintRegion &region : object.all_regions())
+        if (std::abs(region.config().outer_wall_line_width.value - width) <= 1e-9)
+            return &region.config();
+    return nullptr;
 }
 
 void process_cube_with_overrides(const DynamicPrintConfig &config,
@@ -293,6 +319,275 @@ std::set<int> shell_layer_z_tenths(const PrintObject &object)
 }
 
 } // namespace
+
+TEST_CASE("An object's base filament supplies its process delta", "[FeatureCadence][FilamentProcess]")
+{
+    DynamicPrintConfig config = filament_delta_test_config();
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{{"extruder", 2}}};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    const PrintObject &object = *print.objects().front();
+    CHECK_THAT(object.config().layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+    REQUIRE(object.num_printing_regions() == 1);
+    const PrintRegionConfig &region = object.printing_region(0).config();
+    CHECK_THAT(region.outer_wall_line_width.value, Catch::Matchers::WithinAbs(0.22, 1e-9));
+    CHECK_THAT(region.sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.25, 1e-9));
+    CHECK(region.wall_loops.value == 4);
+
+    print.process();
+    config.option<ConfigOptionStrings>("filament_process_projection")->values[1] =
+        "layer_height=0.12;outer_wall_line_width=0.24;sparse_infill_line_width=0.26";
+    CHECK(print.apply(model, config) == PrintBase::APPLY_STATUS_INVALIDATED);
+    CHECK_THAT(print.objects().front()->config().layer_height.value, Catch::Matchers::WithinAbs(0.12, 1e-9));
+}
+
+TEST_CASE("A delta-free filament keeps global process values other slots project", "[FeatureCadence][FilamentProcess][Regression]")
+{
+    // Global process overrides wall_loops to 3; only the OTHER filament's delta carries wall_loops.
+    // The region on the delta-free filament must keep the global 3 — not the compiled default.
+    DynamicPrintConfig config = filament_delta_test_config();
+    config.set_deserialize_strict("wall_loops", "3");
+    config.option<ConfigOptionStrings>("filament_process_projection")->values = {
+        "", "layer_height=0.1;outer_wall_line_width=0.22;wall_loops=4"};
+    Print print;
+    Model model;
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config);
+
+    const PrintObject &object = *print.objects().front();
+    REQUIRE(object.num_printing_regions() == 1);
+    CHECK(object.printing_region(0).config().wall_loops.value == 3);
+}
+
+TEST_CASE("Part, modifier, and layer-range base filaments consume their own deltas",
+          "[FeatureCadence][FilamentProcess]")
+{
+    DYNAMIC_SECTION("part") {
+        const DynamicPrintConfig config = filament_delta_test_config();
+        Model model;
+        ModelObject *object = model.add_object();
+        object->name = "two-parts.stl";
+        ModelVolume *first = object->add_volume(make_cube(10., 10., 10.));
+        first->config.set("extruder", 1);
+        TriangleMesh second_mesh = make_cube(10., 10., 10.);
+        Transform3d shift = Transform3d::Identity();
+        shift.translation().x() = 12.;
+        second_mesh.transform(shift, false);
+        ModelVolume *second = object->add_volume(std::move(second_mesh));
+        second->config.set("extruder", 2);
+        object->add_instance();
+        object->ensure_on_bed();
+
+        Print print;
+        print.apply(model, config);
+        const PrintObject &print_object = *print.objects().front();
+        REQUIRE(region_with_outer_width(print_object, 0.44) != nullptr);
+        const PrintRegionConfig *fine = region_with_outer_width(print_object, 0.22);
+        REQUIRE(fine != nullptr);
+        CHECK_THAT(fine->sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.25, 1e-9));
+    }
+
+    DYNAMIC_SECTION("modifier") {
+        DynamicPrintConfig config = filament_delta_test_config();
+        config.option<ConfigOptionStrings>("filament_process_projection")->values[0] += ";top_shell_layers=7";
+        const int global_top_shell_layers = config.option<ConfigOptionInt>("top_shell_layers")->value;
+        Model model;
+        ModelObject *object = model.add_object();
+        object->name = "modifier.stl";
+        ModelVolume *part = object->add_volume(make_cube(20., 20., 20.));
+        part->config.set("extruder", 1);
+        ModelVolume *modifier = object->add_volume(
+            make_cube(10., 20., 20.), ModelVolumeType::PARAMETER_MODIFIER);
+        modifier->config.set("extruder", 2);
+        object->add_instance();
+        object->ensure_on_bed();
+
+        Print print;
+        print.apply(model, config);
+        const PrintObject &print_object = *print.objects().front();
+        REQUIRE(region_with_outer_width(print_object, 0.44) != nullptr);
+        const PrintRegionConfig *fine = region_with_outer_width(print_object, 0.22);
+        REQUIRE(fine != nullptr);
+        CHECK(fine->top_shell_layers.value == global_top_shell_layers);
+    }
+
+    DYNAMIC_SECTION("layer range") {
+        const DynamicPrintConfig config = filament_delta_test_config();
+        Model model;
+        ModelObject *object = model.add_object();
+        object->name = "layer-range.stl";
+        object->add_volume(make_cube(20., 20., 20.));
+        object->config.set("extruder", 1);
+        ModelConfig range_config;
+        range_config.set("extruder", 2);
+        object->layer_config_ranges[{5., 10.}].assign_config(std::move(range_config));
+        object->add_instance();
+        object->ensure_on_bed();
+
+        Print print;
+        print.apply(model, config);
+        const PrintObject &print_object = *print.objects().front();
+        REQUIRE(region_with_outer_width(print_object, 0.44) != nullptr);
+        REQUIRE(region_with_outer_width(print_object, 0.22) != nullptr);
+    }
+}
+
+TEST_CASE("Role filament deltas stay within their partitions and populate cadence heights",
+          "[FeatureCadence][FilamentProcess]")
+{
+    DynamicPrintConfig config = filament_delta_test_config();
+    config.option<ConfigOptionStrings>("filament_process_projection")->values[0] += ";wall_loops=3";
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{
+        {"extruder", 1}, {"outer_wall_filament_id", 2}, {"inner_wall_filament_id", 2},
+        {"sparse_infill_filament_id", 1},
+    }};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    const PrintRegionConfig &region = print.objects().front()->printing_region(0).config();
+    CHECK_THAT(region.outer_wall_line_width.value, Catch::Matchers::WithinAbs(0.22, 1e-9));
+    CHECK(region.wall_loops.value == 4);
+    CHECK_THAT(region.sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.45, 1e-9));
+    CHECK_THAT(region.wall_layer_height.value, Catch::Matchers::WithinAbs(0.1, 1e-9));
+    CHECK_THAT(region.sparse_infill_process_layer_height.value, Catch::Matchers::WithinAbs(0., 1e-9));
+}
+
+TEST_CASE("Explicit object and region process values win over filament deltas",
+          "[FeatureCadence][FilamentProcess]")
+{
+    DynamicPrintConfig config = filament_delta_test_config();
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{
+        {"extruder", 2}, {"layer_height", 0.3},
+        {"wall_process_projection", "outer_wall_line_width=0.55"},
+    }};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+    CHECK_THAT(print.objects().front()->config().layer_height.value, Catch::Matchers::WithinAbs(0.3, 1e-9));
+    CHECK_THAT(print.objects().front()->printing_region(0).config().outer_wall_line_width.value,
+               Catch::Matchers::WithinAbs(0.55, 1e-9));
+
+    ModelVolume *volume = model.objects.front()->volumes.front();
+    volume->config.set("outer_wall_line_width", 0.5);
+    print.apply(model, config);
+    CHECK_THAT(print.objects().front()->printing_region(0).config().outer_wall_line_width.value,
+               Catch::Matchers::WithinAbs(0.5, 1e-9));
+
+    ModelVolume *modifier = model.objects.front()->add_volume(
+        make_cube(10., 20., 20.), ModelVolumeType::PARAMETER_MODIFIER);
+    modifier->config.set("extruder", 1);
+    print.apply(model, config);
+    const PrintObject &print_object = *print.objects().front();
+    REQUIRE(print_object.num_printing_regions() >= 2);
+    for (size_t region_id = 0; region_id < print_object.num_printing_regions(); ++region_id)
+        CHECK_THAT(print_object.printing_region(region_id).config().outer_wall_line_width.value,
+                   Catch::Matchers::WithinAbs(0.5, 1e-9));
+}
+
+TEST_CASE("Support and interface filaments supply their object-scope partitions",
+          "[FeatureCadence][FilamentProcess][Support]")
+{
+    DynamicPrintConfig config = filament_delta_test_config();
+    config.option<ConfigOptionStrings>("filament_process_projection")->values[1] +=
+        ";support_line_width=0.23;support_speed=33;support_interface_speed=22"
+        ";support_top_z_distance=0.05;support_bottom_z_distance=0.06";
+    Print print;
+    Model model;
+    const std::vector<std::vector<ConfigBase::SetDeserializeItem>> overrides{{
+        {"extruder", 1}, {"support_filament", 2}, {"support_interface_filament", 2},
+    }};
+    init_print(std::vector<TriangleMesh>{cube(20.)}, print, model, config, &overrides);
+
+    const PrintObjectConfig &object = print.objects().front()->config();
+    CHECK_THAT(object.support_line_width.value, Catch::Matchers::WithinAbs(0.23, 1e-9));
+    CHECK_THAT(object.support_speed.get_at(1), Catch::Matchers::WithinAbs(33., 1e-9));
+    CHECK_THAT(object.support_interface_speed.get_at(1), Catch::Matchers::WithinAbs(22., 1e-9));
+    CHECK_THAT(object.support_top_z_distance.value, Catch::Matchers::WithinAbs(0.05, 1e-9));
+    CHECK_THAT(object.support_bottom_z_distance.value, Catch::Matchers::WithinAbs(0.06, 1e-9));
+}
+
+TEST_CASE("Painted regions consume their filament delta identically on create and verify",
+          "[FeatureCadence][FilamentProcess][Painted]")
+{
+    DynamicPrintConfig config = filament_delta_test_config();
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = "painted.stl";
+    ModelVolume *volume = object->add_volume(make_cube(20., 20., 20.));
+    object->config.set("extruder", 1);
+    TriangleSelector selector(volume->mesh());
+    selector.set_facet(0, EnforcerBlockerType::Extruder2);
+    REQUIRE(volume->mmu_segmentation_facets.set(selector));
+    object->add_instance();
+    object->ensure_on_bed();
+
+    Print print;
+    print.apply(model, config);
+    const PrintObject &print_object = *print.objects().front();
+    const PrintRegionConfig *painted = region_with_outer_width(print_object, 0.22);
+    REQUIRE(painted != nullptr);
+    CHECK_THAT(painted->sparse_infill_line_width.value, Catch::Matchers::WithinAbs(0.25, 1e-9));
+    const size_t region_count = print_object.num_printing_regions();
+    const std::vector<size_t> hashes_before = [&] {
+        std::vector<size_t> result;
+        for (const PrintRegion &region : print_object.all_regions())
+            result.push_back(region.config_hash());
+        return result;
+    }();
+
+    CHECK(print.apply(model, config) == PrintBase::APPLY_STATUS_UNCHANGED);
+    CHECK(print.objects().front()->num_printing_regions() == region_count);
+    std::vector<size_t> hashes_after;
+    for (const PrintRegion &region : print.objects().front()->all_regions())
+        hashes_after.push_back(region.config_hash());
+    CHECK(hashes_after == hashes_before);
+}
+
+TEST_CASE("Empty filament process projections preserve region and object configs",
+          "[FeatureCadence][FilamentProcess][Regression]")
+{
+    DynamicPrintConfig baseline_config = mixed_nozzle_config();
+    baseline_config.erase("filament_process_projection");
+    DynamicPrintConfig empty_config = mixed_nozzle_config();
+    empty_config.option<ConfigOptionStrings>("filament_process_projection", true)->values = {"", ""};
+
+    Print baseline_print;
+    Model baseline_model;
+    init_print({cube(20.)}, baseline_print, baseline_model, baseline_config);
+    Print empty_print;
+    Model empty_model;
+    init_print({cube(20.)}, empty_print, empty_model, empty_config);
+
+    CHECK(empty_print.objects().front()->config() == baseline_print.objects().front()->config());
+    CHECK(empty_print.objects().front()->printing_region(0).config() ==
+          baseline_print.objects().front()->printing_region(0).config());
+}
+
+TEST_CASE("A base-filament layer-height delta drives single-tool G-code cadence",
+          "[FeatureCadence][FilamentProcess][GCode]")
+{
+    DynamicPrintConfig config = filament_delta_test_config();
+    config.set("infill_combination", false);
+    const std::string output = slice_with_object_overrides(
+        {cube(20.)}, config, {{{"extruder", 2}}});
+    const std::vector<GCodeExtrusion> extrusions = gcode_extrusions(output);
+    REQUIRE_FALSE(extrusions.empty());
+    bool found_non_initial = false;
+    std::set<int> wall_z_tenths;
+    for (const GCodeExtrusion &extrusion : extrusions) {
+        CHECK(extrusion.tool == 1);
+        if (extrusion.z > 0.2 + EPSILON && is_wall_role(extrusion.role)) {
+            found_non_initial = true;
+            wall_z_tenths.insert(int(std::lround(extrusion.z * 10.)));
+            CHECK_THAT(extrusion.height, Catch::Matchers::WithinAbs(0.1, 1e-4));
+        }
+    }
+    CHECK(found_non_initial);
+    for (int z_tenth = 3; z_tenth <= 200; ++z_tenth)
+        CHECK(wall_z_tenths.count(z_tenth) == 1);
+}
 
 TEST_CASE("Wall process projections apply before explicit object overrides", "[FeatureCadence]")
 {
