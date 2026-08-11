@@ -19145,10 +19145,18 @@ void Plater::notify_filament_process_resolutions(const DynamicPrintConfig &full_
             const wxString message = format_wxstr(
                 _L("First layer stays at %1% mm (a global setting)."),
                 nozzle_number(initial_height->value));
+            // "Change" jumps to the setting itself, not the filament mapping — the remedy for a
+            // first-layer height is editing the first-layer height.
+            const auto open_first_layer_setting = [](wxEvtHandler *) {
+                wxGetApp().CallAfter([] {
+                    wxGetApp().sidebar().jump_to_option("initial_layer_print_height", Preset::TYPE_PRINT, L"");
+                });
+                return true;
+            };
             get_notification_manager()->push_notification(
                 NotificationType::CustomNotification,
                 NotificationManager::NotificationLevel::HintNotificationLevel,
-                message.utf8_string(), _u8L("Change"), open_mapping);
+                message.utf8_string(), _u8L("Change"), open_first_layer_setting);
         }
     }
 }
