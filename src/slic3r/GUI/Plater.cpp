@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <numeric>
 #include <limits>
@@ -59,6 +60,7 @@
 #include <wx/clrpicker.h>
 #include <wx/tokenzr.h>
 #include <wx/aui/aui.h>
+#include <wx/numformatter.h>
 
 #include "libslic3r/libslic3r.h"
 #include "libslic3r/Format/STL.hpp"
@@ -67,6 +69,7 @@
 #include "libslic3r/Format/AMF.hpp"
 //#include "libslic3r/Format/3mf.hpp"
 #include "libslic3r/Format/bbs_3mf.hpp"
+#include "libslic3r/FeatureProcessResolver.hpp"
 #include "libslic3r/GCode/ThumbnailData.hpp"
 #include "libslic3r/Model.hpp"
 #include "libslic3r/SLA/Hollowing.hpp"
@@ -75,6 +78,7 @@
 #include "libslic3r/Polygon.hpp"
 #include "libslic3r/Print.hpp"
 #include "libslic3r/PrintConfig.hpp"
+#include "libslic3r/Slicing.hpp"
 #include "libslic3r/SLAPrint.hpp"
 #include "libslic3r/Utils.hpp"
 #include "libslic3r/PresetBundle.hpp"
@@ -253,6 +257,21 @@ static string get_diameter_string(float diameter)
         if (s.back() == '.') s += '0';        // Ensure "1." → "1.0"
     }
     return s;
+}
+
+static bool has_mixed_reported_nozzle_diameters(const MachineObject &obj)
+{
+    std::optional<float> first_diameter;
+    for (const DevExtder &extruder : obj.GetExtderSystem()->GetExtruders()) {
+        const float diameter = extruder.GetNozzleDiameter();
+        if (diameter == 0.0f)
+            continue;
+        if (!first_diameter)
+            first_diameter = diameter;
+        else if (std::fabs(*first_diameter - diameter) >= 1e-3f)
+            return true;
+    }
+    return false;
 }
 
 template <typename T, typename OptionType>
@@ -767,7 +786,9 @@ struct Sidebar::priv
     // extruder_count >= 2 && support_multi_nozzle. When is_manual, always pops the MultiNozzleSyncDialog;
     // otherwise reuses the app_config-cached option when the machine's nozzle config is unchanged.
     std::optional<NozzleOption> get_nozzle_options(MachineObject* obj, int extruder_count, bool support_multi_nozzle, bool is_manual);
-    bool switch_diameter(bool single);
+    bool apply_mixed_nozzle_overlay(const wxString &left_diameter, const wxString &right_diameter,
+                                    bool printer_preset_changed = false);
+    bool switch_diameter(bool single, bool printer_preset_changed = false);
     void update_sync_status(const MachineObject* obj);
 
     // Filament Track Switch (H2-family accessory): true only when the connected printer is the
@@ -1058,6 +1079,88 @@ std::vector<int> get_min_flush_volumes(const DynamicPrintConfig &full_config, si
 
 // Sidebar / public
 
+namespace {
+
+struct PhysicalNozzleContext
+{
+    DynamicPrintConfig  config;
+    std::vector<double> diameters;
+    std::vector<int>    filament_map;
+    std::vector<int>    physical_extruder_map;
+    std::string         printer_type;
+
+    bool mixed() const
+    {
+        if (diameters.size() < 2)
+            return false;
+        const auto range = std::minmax_element(diameters.begin(), diameters.end());
+        return *range.second - *range.first > EPSILON;
+    }
+
+    size_t tool_for_filament(unsigned int filament_1based) const
+    {
+        const size_t filament_index = filament_1based > 0 ? filament_1based - 1 : 0;
+        if (filament_index < filament_map.size() && filament_map[filament_index] > 0)
+            return size_t(filament_map[filament_index] - 1);
+        return filament_index;
+    }
+
+    wxString tool_name(size_t logical_tool, bool short_name = false) const
+    {
+        const int physical_tool = logical_tool < physical_extruder_map.size() ?
+                                      physical_extruder_map[logical_tool] : int(logical_tool);
+        if (!printer_type.empty() && (physical_tool == MAIN_EXTRUDER_ID || physical_tool == DEPUTY_EXTRUDER_ID)) {
+            return _L(DevPrinterConfigUtil::get_toolhead_display_name(
+                printer_type, physical_tool, ToolHeadComponent::Nozzle,
+                short_name ? ToolHeadNameCase::TitleCase : ToolHeadNameCase::SentenceCase, short_name));
+        }
+        return format_wxstr(_L("nozzle %1%"), logical_tool + 1);
+    }
+};
+
+PhysicalNozzleContext physical_nozzle_context(const DynamicPrintConfig *config_override = nullptr)
+{
+    PhysicalNozzleContext context;
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return context;
+
+    if (config_override != nullptr) {
+        context.config = *config_override;
+    } else {
+        PartPlate *plate = wxGetApp().plater() == nullptr ? nullptr :
+                               wxGetApp().plater()->get_partplate_list().get_curr_plate();
+        if (plate != nullptr) {
+            std::vector<int> filament_map = plate->get_real_filament_maps(bundle->project_config);
+            std::vector<int> filament_volume_map = plate->get_real_filament_volume_maps(bundle->project_config);
+            if (filament_volume_map.empty())
+                filament_volume_map = bundle->get_default_nozzle_volume_types_for_filaments(filament_map);
+            context.config = bundle->full_config(false, filament_map, filament_volume_map);
+        } else {
+            context.config = bundle->full_config(false);
+        }
+    }
+
+    context.diameters = effective_nozzle_diameters(context.config);
+    if (const auto *map = context.config.option<ConfigOptionInts>("filament_map"); map != nullptr)
+        context.filament_map = map->values;
+    if (const auto *physical_map = context.config.option<ConfigOptionInts>("physical_extruder_map"); physical_map != nullptr)
+        context.physical_extruder_map = physical_map->values;
+    try {
+        context.printer_type = bundle->printers.get_selected_preset().get_printer_type(bundle);
+    } catch (...) {
+        // Generic and third-party profiles fall back to stable logical nozzle numbers.
+    }
+    return context;
+}
+
+wxString nozzle_number(double value)
+{
+    return wxNumberFormatter::ToString(value, 3, wxNumberFormatter::Style_NoTrailingZeroes);
+}
+
+} // namespace
+
 struct DynamicFilamentList : DynamicList
 {
     std::vector<std::pair<wxString, wxBitmap *>> items;
@@ -1105,6 +1208,7 @@ struct DynamicFilamentList : DynamicList
         items.clear();
         if (!force && m_choices.empty())
             return;
+        const PhysicalNozzleContext nozzle_context = physical_nozzle_context();
         auto icons = get_extruder_color_icons(true);
         auto presets = wxGetApp().preset_bundle->filament_presets;
         for (int i = 0; i < presets.size(); ++i) {
@@ -1112,9 +1216,440 @@ struct DynamicFilamentList : DynamicList
             std::string type;
             wxGetApp().preset_bundle->filaments.find_preset(presets[i])->get_filament_type(type);
             str << type;
+            if (nozzle_context.diameters.size() >= 2) {
+                const size_t tool = nozzle_context.tool_for_filament(unsigned(i + 1));
+                if (tool < nozzle_context.diameters.size()) {
+                    str = format_wxstr(_L("%1% — %2% mm (%3%)"), str,
+                                       nozzle_number(nozzle_context.diameters[tool]),
+                                       nozzle_context.tool_name(tool));
+                }
+            }
             items.push_back({str, i < icons.size() ? icons[i] : nullptr});
         }
         DynamicList::update();
+    }
+};
+
+namespace {
+
+wxString feature_process_number(double value)
+{
+    return wxNumberFormatter::ToString(value, 3, wxNumberFormatter::Style_NoTrailingZeroes);
+}
+
+FeatureProcessPolicy wall_process_policy(const DynamicPrintConfig &config)
+{
+    const auto *policy = config.option<ConfigOptionEnum<FeatureProcessPolicy>>("wall_process_policy");
+    return policy == nullptr ? FeatureProcessPolicy::AutoNozzleVariant : policy->value;
+}
+
+FeatureProcessRequest wall_process_request(const DynamicPrintConfig &config, const PresetBundle &bundle)
+{
+    // Phase 2 uses the selected global context for every instantiated tab. Per-object scope
+    // resolution belongs with the per-scope GUI refinement in Phase 3.
+    FeatureProcessRequest request;
+    request.role = FeatureRole::Wall;
+    request.policy = wall_process_policy(config);
+    if (const auto *pinned = config.option<ConfigOptionString>("wall_process_preset"); pinned != nullptr)
+        request.pinned_preset_name = pinned->value;
+    if (const auto *height = config.option<ConfigOptionFloat>("wall_layer_height"); height != nullptr)
+        request.requested_layer_height = height->value;
+    if (const auto *filament = config.option<ConfigOptionInt>("outer_wall_filament_id"); filament != nullptr)
+        request.feature_filament = filament->value;
+    if (request.feature_filament <= 0) {
+        if (const auto *object_filament = config.option<ConfigOptionInt>("extruder"); object_filament != nullptr)
+            request.feature_filament = object_filament->value;
+    }
+    if (const auto *process = config.option<ConfigOptionString>("print_settings_id"); process != nullptr)
+        request.object_process_preset = process->value;
+    if (request.object_process_preset.empty())
+        request.object_process_preset = bundle.prints.get_selected_preset_name();
+    request.effective_object_config = &config;
+    request.bundle = &bundle;
+    request.printer_config = &config;
+    return request;
+}
+
+wxString resolved_feature_process_name(const FeatureProcessRequest &request,
+                                       const FeatureProcessResolution &resolution)
+{
+    if (!resolution.resolved_preset.empty())
+        return from_u8(resolution.resolved_preset);
+    if (request.policy == FeatureProcessPolicy::Pinned && !request.pinned_preset_name.empty())
+        return from_u8(request.pinned_preset_name);
+    return _L("Same as object");
+}
+
+wxString feature_process_readout_text(const FeatureProcessRequest &request,
+                                      const FeatureProcessResolution &resolution)
+{
+    const wxString target = resolved_feature_process_name(request, resolution);
+    if (!resolution.ok) {
+        wxString shown_target = target;
+        if (resolution.rejection == FeatureProcessRejection::PresetMissing)
+            shown_target = format_wxstr(_L("%1% (missing)"), shown_target);
+        return format_wxstr(_L("Resolves to: %1% — %2%"), shown_target,
+                            feature_process_rejection_text(resolution.rejection, resolution.nozzle_diameter));
+    }
+
+    if (resolution.cadence_ratio > 1) {
+        return format_wxstr(_L("Resolves to: %1% — %2% mm nozzle — %3% fine layers per %4% mm layer"),
+                            target, feature_process_number(resolution.nozzle_diameter), resolution.cadence_ratio,
+                            feature_process_number(resolution.base_layer_height));
+    }
+    return format_wxstr(_L("Resolves to: %1% — %2% mm nozzle — same layer cadence"), target,
+                        feature_process_number(resolution.nozzle_diameter));
+}
+
+bool refresh_and_sync_filament_process_projections(PresetBundle &bundle, DynamicPrintConfig &full_config)
+{
+    update_filament_process_projections(bundle, full_config);
+    bool changed = false;
+    static const std::array<const char *, 3> keys{{
+        "filament_process_policy", "filament_process_preset", "filament_process_projection",
+    }};
+    for (const char *key : keys) {
+        const ConfigOption *source = full_config.option(key);
+        if (source == nullptr)
+            continue;
+        ConfigOption *target = bundle.project_config.option(key);
+        if (target == nullptr) {
+            bundle.project_config.set_key_value(key, source->clone());
+            changed = true;
+        } else if (*target != *source) {
+            target->set(source);
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+} // namespace
+
+struct DynamicProcessPresetList : DynamicList
+{
+    struct Item {
+        std::string value;
+        wxString    label;
+    };
+
+    std::vector<Item>          items;
+    std::vector<std::string>   missing_names;
+    std::vector<wxStaticText*> readouts;
+    std::vector<std::pair<Choice *, std::string>> preserved_values;
+    FeatureProcessPolicy       current_policy = FeatureProcessPolicy::AutoNozzleVariant;
+
+    void rebuild(const DynamicPrintConfig *config_override = nullptr)
+    {
+        items.clear();
+        try {
+            PresetBundle *bundle = wxGetApp().preset_bundle;
+            if (bundle == nullptr)
+                throw std::runtime_error("Preset bundle unavailable");
+            DynamicPrintConfig config = config_override == nullptr ? bundle->full_config() : *config_override;
+            FeatureProcessRequest request = wall_process_request(config, *bundle);
+            current_policy = request.policy;
+
+            FeatureProcessRequest automatic_request = request;
+            automatic_request.policy = FeatureProcessPolicy::AutoNozzleVariant;
+            automatic_request.pinned_preset_name.clear();
+            const FeatureProcessResolution automatic = resolve_feature_process(automatic_request);
+            wxString automatic_label = _L("Automatic");
+            if (automatic.ok)
+                automatic_label = format_wxstr(_L("Automatic: %1%"), resolved_feature_process_name(automatic_request, automatic));
+            else
+                automatic_label = format_wxstr(_L("Automatic (%1%)"),
+                                               feature_process_rejection_text(automatic.rejection, automatic.nozzle_diameter));
+            items.push_back({"", automatic_label});
+            items.push_back({"", _L("Same as object")});
+
+            for (const FeatureProcessCandidate &candidate : enumerate_feature_process_candidates(request)) {
+                wxString label = format_wxstr(_L("%1% — %2% mm, %3% mm nozzle"), from_u8(candidate.preset_name),
+                                              feature_process_number(candidate.preset_layer_height),
+                                              feature_process_number(candidate.preset_nozzle));
+                if (!candidate.compatible)
+                    label = format_wxstr(_L("%1% (%2%)"), label,
+                                         feature_process_rejection_text(candidate.why_not, candidate.preset_nozzle));
+                items.push_back({candidate.preset_name, label});
+            }
+        } catch (...) {
+            items.push_back({"", _L("Automatic (process presets are unavailable)")});
+            items.push_back({"", _L("Same as object")});
+        }
+
+        for (const std::string &name : missing_names) {
+            const auto found = std::find_if(items.begin(), items.end(), [&name](const Item &item) { return item.value == name; });
+            if (found == items.end())
+                items.push_back({name, format_wxstr(_L("%1% (missing)"), from_u8(name))});
+        }
+    }
+
+    int find_value(const std::string &value) const
+    {
+        if (value.empty()) {
+            return current_policy == FeatureProcessPolicy::SameAsObject ? 1 : 0;
+        }
+        const auto found = std::find_if(items.begin(), items.end(), [&value](const Item &item) { return item.value == value; });
+        return found == items.end() ? wxNOT_FOUND : int(std::distance(items.begin(), found));
+    }
+
+    void apply_on(Choice *choice) override
+    {
+        try {
+            if (items.empty())
+                rebuild();
+            auto *combo = dynamic_cast<ComboBox *>(choice->window);
+            if (combo == nullptr)
+                return;
+
+            // wxOSX may emit wxEVT_COMBOBOX from Clear()/SetSelection(). This refresh is
+            // reached from another field's change handler, so allowing those synthetic
+            // events to propagate recursively re-enters on_config_change() until the app
+            // terminates. Preserve the existing suppression state across the whole rebuild.
+            const bool was_suppressed = choice->m_disable_change_event;
+            choice->m_disable_change_event = true;
+            ScopeGuard restore_change_events([choice, was_suppressed] {
+                choice->m_disable_change_event = was_suppressed;
+            });
+
+            std::string old_value;
+            const auto preserved = std::find_if(preserved_values.begin(), preserved_values.end(),
+                                                [choice](const auto &entry) { return entry.first == choice; });
+            if (preserved != preserved_values.end()) {
+                old_value = preserved->second;
+            } else {
+                const int old_index = combo->GetSelection();
+                if (old_index >= 0 && size_t(old_index) < items.size())
+                    old_value = items[old_index].value;
+            }
+
+            combo->Clear();
+            for (const Item &item : items)
+                combo->Append(item.label);
+
+            const int new_index = find_value(old_value);
+            combo->SetSelection(new_index == wxNOT_FOUND ? 0 : new_index);
+        } catch (...) {
+            auto *combo = dynamic_cast<ComboBox *>(choice->window);
+            if (combo != nullptr && combo->GetCount() == 0)
+                combo->Append(_L("Automatic (process presets are unavailable)"));
+        }
+    }
+
+    wxString get_value(int index) override
+    {
+        return index >= 0 && size_t(index) < items.size() ? from_u8(items[index].value) : wxString();
+    }
+
+    int index_of(wxString value) override
+    {
+        const std::string stored_name = into_u8(value);
+        int index = find_value(stored_name);
+        if (index != wxNOT_FOUND || stored_name.empty())
+            return index;
+
+        if (std::find(missing_names.begin(), missing_names.end(), stored_name) == missing_names.end())
+            missing_names.push_back(stored_name);
+        items.push_back({stored_name, format_wxstr(_L("%1% (missing)"), value)});
+        for (Choice *choice : m_choices) {
+            if (auto *combo = dynamic_cast<ComboBox *>(choice->window); combo != nullptr)
+                combo->Append(items.back().label);
+        }
+        return int(items.size() - 1);
+    }
+
+    void update_readouts(const DynamicPrintConfig *config_override = nullptr)
+    {
+        wxString label = _L("Resolves to: unavailable");
+        try {
+            PresetBundle *bundle = wxGetApp().preset_bundle;
+            if (bundle != nullptr) {
+                DynamicPrintConfig config = config_override == nullptr ? bundle->full_config() : *config_override;
+                const FeatureProcessRequest request = wall_process_request(config, *bundle);
+                label = feature_process_readout_text(request, resolve_feature_process(request));
+            }
+        } catch (...) {
+        }
+        for (wxStaticText *readout : readouts) {
+            if (readout != nullptr) {
+                readout->SetLabel(label);
+                readout->GetParent()->Layout();
+            }
+        }
+    }
+
+    void update(const DynamicPrintConfig *config_override = nullptr)
+    {
+        preserved_values.clear();
+        for (Choice *choice : m_choices) {
+            auto *combo = dynamic_cast<ComboBox *>(choice->window);
+            const int selection = combo == nullptr ? wxNOT_FOUND : combo->GetSelection();
+            if (selection >= 0 && size_t(selection) < items.size())
+                preserved_values.emplace_back(choice, items[selection].value);
+        }
+        rebuild(config_override);
+        for (const auto &entry : preserved_values) {
+            const std::string &name = entry.second;
+            if (name.empty() || find_value(name) != wxNOT_FOUND)
+                continue;
+            if (std::find(missing_names.begin(), missing_names.end(), name) == missing_names.end())
+                missing_names.push_back(name);
+            items.push_back({name, format_wxstr(_L("%1% (missing)"), from_u8(name))});
+        }
+        DynamicList::update();
+        preserved_values.clear();
+        update_readouts(config_override);
+    }
+
+    void add_readout(wxStaticText *readout)
+    {
+        if (readout == nullptr)
+            return;
+        readouts.push_back(readout);
+        readout->Bind(wxEVT_DESTROY, [this, readout](wxWindowDestroyEvent &event) {
+            readouts.erase(std::remove(readouts.begin(), readouts.end(), readout), readouts.end());
+            event.Skip();
+        });
+        update_readouts();
+    }
+};
+
+class DetailNozzleControls
+{
+    struct Control {
+        ComboBox *combo;
+        wxSizer  *row;
+    };
+
+    std::vector<Control> controls;
+    bool                 updating = false;
+
+    static int reflected_selection(const PhysicalNozzleContext &context)
+    {
+        const auto *wall_filament = context.config.option<ConfigOptionInt>("outer_wall_filament_id");
+        if (wall_filament == nullptr || wall_filament->value <= 0)
+            return 0;
+        const size_t tool = context.tool_for_filament(unsigned(wall_filament->value));
+        return tool < context.diameters.size() ? int(tool + 1) : 0;
+    }
+
+    static bool set_print_field(const std::string &key, int value)
+    {
+        Tab *tab = wxGetApp().get_tab(Preset::TYPE_PRINT);
+        if (tab == nullptr)
+            return false;
+        tab->activate_option(key, wxString());
+        Field *field = tab->get_field(key);
+        if (field == nullptr)
+            return false;
+        field->set_value(boost::any(value), false);
+        field->field_changed();
+        return true;
+    }
+
+    void selected(ComboBox *combo)
+    {
+        if (updating || combo == nullptr)
+            return;
+        const int selection = combo->GetSelection();
+        if (selection < 0)
+            return;
+        // Applying the selection rebuilds the page that owns this combo, destroying it while
+        // its own event is still on the stack. Defer past the handler; capture no widget.
+        wxGetApp().CallAfter([this, selection] { apply_selection(selection); });
+    }
+
+    void apply_selection(int selection)
+    {
+        if (updating)
+            return;
+
+        const PhysicalNozzleContext context = physical_nozzle_context();
+        if (!context.mixed() || selection == reflected_selection(context))
+            return;
+
+        if (selection == 0) {
+            set_print_field("outer_wall_filament_id", 0);
+            set_print_field("inner_wall_filament_id", 0);
+            update();
+            return;
+        }
+
+        const size_t tool = size_t(selection - 1);
+        if (tool >= context.diameters.size()) {
+            update();
+            return;
+        }
+
+        std::vector<int> mapped_filaments;
+        for (size_t filament = 0; filament < context.filament_map.size(); ++filament)
+            if (context.filament_map[filament] == int(tool + 1))
+                mapped_filaments.push_back(int(filament + 1));
+
+        NotificationManager *notifications = wxGetApp().plater()->get_notification_manager();
+        if (mapped_filaments.empty()) {
+            const wxString message = format_wxstr(
+                _L("No filament is mapped to the %1% mm nozzle — assign one in Filament Mapping first."),
+                nozzle_number(context.diameters[tool]));
+            notifications->push_notification(NotificationType::CustomNotification,
+                                             NotificationManager::NotificationLevel::WarningNotificationLevel,
+                                             message.utf8_string());
+            update();
+            return;
+        }
+
+        const int filament = mapped_filaments.front();
+        if (mapped_filaments.size() > 1) {
+            const wxString message = format_wxstr(
+                _L("Multiple filaments are mapped to the %1% mm nozzle; filament %2% was selected."),
+                nozzle_number(context.diameters[tool]), filament);
+            notifications->push_notification(message.utf8_string());
+        }
+        set_print_field("outer_wall_filament_id", filament);
+        update();
+    }
+
+public:
+    ComboBox *last_control() const { return controls.empty() ? nullptr : controls.back().combo; }
+
+    void add(ComboBox *combo, wxSizer *row)
+    {
+        if (combo == nullptr || row == nullptr)
+            return;
+        controls.push_back({combo, row});
+        combo->Bind(wxEVT_COMBOBOX, [this, combo](wxCommandEvent &event) {
+            selected(combo);
+            event.Skip();
+        });
+        combo->Bind(wxEVT_DESTROY, [this, combo](wxWindowDestroyEvent &event) {
+            controls.erase(std::remove_if(controls.begin(), controls.end(),
+                                          [combo](const Control &control) { return control.combo == combo; }),
+                           controls.end());
+            event.Skip();
+        });
+        update();
+    }
+
+    void update(const DynamicPrintConfig *config_override = nullptr)
+    {
+        if (updating)
+            return;
+        updating = true;
+        const PhysicalNozzleContext context = physical_nozzle_context(config_override);
+        const bool show = context.mixed();
+        for (const Control &control : controls) {
+            control.combo->Clear();
+            control.combo->Append(_L("Off (single process)"));
+            for (size_t tool = 0; tool < context.diameters.size(); ++tool) {
+                control.combo->Append(format_wxstr(_L("%1% mm (%2%)"),
+                                                   nozzle_number(context.diameters[tool]),
+                                                   context.tool_name(tool, true)));
+            }
+            control.combo->SetSelection(reflected_selection(context));
+            control.row->ShowItems(show);
+            control.combo->GetParent()->Layout();
+        }
+        updating = false;
     }
 };
 
@@ -1134,6 +1669,23 @@ static bool has_junction_deviation(const DynamicPrintConfig* printer_config)
 }
 
 static DynamicFilamentList dynamic_filament_list;
+static DynamicProcessPresetList dynamic_process_preset_list;
+static DetailNozzleControls detail_nozzle_controls;
+
+void register_feature_process_readout(wxStaticText *readout)
+{
+    dynamic_process_preset_list.add_readout(readout);
+}
+
+void register_detail_nozzle_control(ComboBox *combo, wxSizer *row)
+{
+    detail_nozzle_controls.add(combo, row);
+}
+
+ComboBox *detail_nozzle_control_for_smoke()
+{
+    return detail_nozzle_controls.last_control();
+}
 
 class AMSCountPopupWindow : public PopupWindow
 {
@@ -1476,7 +2028,7 @@ void ExtruderGroup::SetTitle(const wxString& title)
         hover_label->SetTitle(title);
 }
 
-bool Sidebar::priv::switch_diameter(bool single)
+bool Sidebar::priv::switch_diameter(bool single, bool printer_preset_changed)
 {
     wxString diameter;
     if (single) {
@@ -1485,6 +2037,9 @@ bool Sidebar::priv::switch_diameter(bool single)
         auto diameter_left = left_extruder->combo_diameter->GetValue();
         auto diameter_right = right_extruder->combo_diameter->GetValue();
         if (diameter_left != diameter_right) {
+            if (wxGetApp().preset_bundle->is_bbl_vendor())
+                return apply_mixed_nozzle_overlay(diameter_left, diameter_right, printer_preset_changed);
+
             std::string printer_type = wxGetApp().preset_bundle->printers.get_edited_preset().get_printer_type(wxGetApp().preset_bundle);
             auto left_name  = _L(DevPrinterConfigUtil::get_toolhead_display_name(printer_type, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::SentenceCase));
             auto right_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(printer_type, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::SentenceCase));
@@ -1511,10 +2066,19 @@ bool Sidebar::priv::switch_diameter(bool single)
     // ORCA: Check if the selected diameter matches the current nozzle diameter in the config
     Preset& printer_preset = wxGetApp().preset_bundle->printers.get_edited_preset();
     auto* nozzle_diameter = dynamic_cast<const ConfigOptionFloats*>(printer_preset.config.option("nozzle_diameter"));
+    auto *project_nozzle_diameter = wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+    const bool clear_overlay = wxGetApp().preset_bundle->is_bbl_vendor() && project_nozzle_diameter != nullptr &&
+                               !project_nozzle_diameter->values.empty();
     if (nozzle_diameter && nozzle_diameter->size() > 0) {
         auto current_nozzle_dia = get_diameter_string(nozzle_diameter->values[0]);
         // If the selected diameter is the same as current nozzle, don't switch profiles
         if (current_nozzle_dia == diameter.ToStdString()) {
+            if (clear_overlay) {
+                project_nozzle_diameter->values.clear();
+                plater->update_project_dirty_from_presets();
+                plater->sidebar().update_presets(Preset::TYPE_PRINTER);
+                plater->on_config_change(wxGetApp().preset_bundle->full_config());
+            }
             return true;
         }
     }
@@ -1527,7 +2091,70 @@ bool Sidebar::priv::switch_diameter(bool single)
         return false;
     }
     preset->is_visible = true; // force visible
+    if (clear_overlay) {
+        project_nozzle_diameter->values.clear();
+        plater->update_project_dirty_from_presets();
+    }
     return wxGetApp().get_tab(Preset::TYPE_PRINTER)->select_preset(preset->name);
+}
+
+bool Sidebar::priv::apply_mixed_nozzle_overlay(const wxString &left_diameter, const wxString &right_diameter,
+                                               bool printer_preset_changed)
+{
+    double left_value = 0.0;
+    double right_value = 0.0;
+    if (!left_diameter.ToDouble(&left_value) || !right_diameter.ToDouble(&right_value))
+        return false;
+
+    PresetBundle *preset_bundle = wxGetApp().preset_bundle;
+    Preset &printer_preset = preset_bundle->printers.get_edited_preset();
+    const auto *base_diameters = printer_preset.config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (base_diameters == nullptr)
+        return false;
+
+    std::vector<double> overlay = base_diameters->values;
+    const int left_index = logical_index_for_device_extruder(printer_preset.config, DEPUTY_EXTRUDER_ID);
+    const int right_index = logical_index_for_device_extruder(printer_preset.config, MAIN_EXTRUDER_ID);
+    if (left_index < 0 || right_index < 0 || size_t(left_index) >= overlay.size() || size_t(right_index) >= overlay.size())
+        return false;
+
+    overlay[left_index] = left_value;
+    overlay[right_index] = right_value;
+    preset_bundle->project_config.set_key_value("project_nozzle_diameter", new ConfigOptionFloats(std::move(overlay)));
+
+    const std::string printer_type = printer_preset.get_printer_type(preset_bundle);
+    const wxString left_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(
+        printer_type, DEPUTY_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::SentenceCase));
+    const wxString right_name = _L(DevPrinterConfigUtil::get_toolhead_display_name(
+        printer_type, MAIN_EXTRUDER_ID, ToolHeadComponent::Nozzle, ToolHeadNameCase::SentenceCase));
+    const wxString process_name = from_u8(preset_bundle->prints.get_edited_preset().name);
+    const wxString message = printer_preset_changed ?
+        format_wxstr(_L("Using mixed nozzles: %1% %2% mm / %3% %4% mm — printer preset switched to %5%; process preset: %6%"),
+                     left_name, left_diameter, right_name, right_diameter,
+                     from_u8(printer_preset.name), process_name) :
+        format_wxstr(_L("Using mixed nozzles: %1% %2% mm / %3% %4% mm — process preset: %5%"),
+                     left_name, left_diameter, right_name, right_diameter, process_name);
+
+    plater->update_project_dirty_from_presets();
+    plater->sidebar().update_presets(Preset::TYPE_PRINTER);
+    plater->on_config_change(preset_bundle->full_config());
+    plater->get_notification_manager()->push_notification(message.utf8_string());
+    return true;
+}
+
+bool Sidebar::apply_nozzle_diameters_for_smoke(const wxString &left_diameter, const wxString &right_diameter)
+{
+    if (left_diameter != right_diameter)
+        return p->apply_mixed_nozzle_overlay(left_diameter, right_diameter);
+
+    auto *project_diameters = wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+    if (project_diameters == nullptr)
+        return false;
+    project_diameters->values.clear();
+    wxGetApp().plater()->update_project_dirty_from_presets();
+    update_presets(Preset::TYPE_PRINTER);
+    wxGetApp().plater()->on_config_change(wxGetApp().preset_bundle->full_config());
+    return true;
 }
 
 static bool is_skip_high_flow_printer(const std::string& printer)
@@ -1673,6 +2300,17 @@ static std::string serialize_nozzle_option(const NozzleOption& option) {
             oss << static_cast<int>(stat_pair.first) << "#" << stat_pair.second;
         }
     }
+    // Preserve the legacy two-field byte representation for every uniform option. Mixed options
+    // append a third field, so caches written by older versions continue to deserialize unchanged.
+    if (!option.extruder_diameters.empty()) {
+        oss << "|";
+        bool first_diameter = true;
+        for (const auto &[extruder_id, diameter] : option.extruder_diameters) {
+            if (!first_diameter) oss << ",";
+            first_diameter = false;
+            oss << extruder_id << "#" << diameter;
+        }
+    }
     return oss.str();
 }
 
@@ -1681,7 +2319,7 @@ static std::optional<NozzleOption> deserialize_nozzle_option(const std::string& 
 
     std::vector<std::string> parts;
     boost::split(parts, option_str, boost::is_any_of("|"));
-    if (parts.size() != 2) return std::nullopt;
+    if (parts.size() != 2 && parts.size() != 3) return std::nullopt;
 
     NozzleOption option;
     option.diameter = parts[0];
@@ -1713,6 +2351,19 @@ static std::optional<NozzleOption> deserialize_nozzle_option(const std::string& 
         }
 
         option.extruder_nozzle_stats[extruder_id] = stats;
+    }
+
+    if (parts.size() == 3) {
+        std::vector<std::string> diameter_parts;
+        boost::split(diameter_parts, parts[2], boost::is_any_of(","));
+        for (const auto &diameter_part : diameter_parts) {
+            std::vector<std::string> kv;
+            boost::split(kv, diameter_part, boost::is_any_of("#"));
+            if (kv.size() == 2)
+                option.extruder_diameters[std::stoi(kv[0])] = kv[1];
+        }
+        if (option.extruder_diameters.empty())
+            return std::nullopt;
     }
 
     return option;
@@ -1951,6 +2602,8 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << "check error: machine_preset empty";
         return false;
     }
+    const bool reported_nozzles_are_mixed = preset_bundle->is_bbl_vendor() && has_mixed_reported_nozzle_diameters(*obj);
+    const bool printer_preset_changed = machine_preset->name != preset_bundle->printers.get_selected_preset().name;
     if (machine_print_name != target_model_id) {
         MessageDialog dlg(this->plater, _L("The currently selected machine preset is inconsistent with the connected printer type.\n"
                                             "Are you sure to continue syncing?"), _L("Sync printer information"), wxICON_WARNING | wxYES | wxNO);
@@ -1961,10 +2614,20 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
         if (!this->plater)
             return false;
 
-        this->plater->update_objects_position_when_select_preset([&obj, machine_preset]() {
+        this->plater->update_objects_position_when_select_preset([machine_preset]() {
+            if (auto *project_diameters = GUI::wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter"))
+                project_diameters->values.clear();
             Tab *printer_tab = GUI::wxGetApp().get_tab(Preset::Type::TYPE_PRINTER);
             printer_tab->select_preset(machine_preset->name);
         });
+        this->plater->update_project_dirty_from_presets();
+    } else if (reported_nozzles_are_mixed && printer_preset_changed) {
+        if (auto *project_diameters = preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter"))
+            project_diameters->values.clear();
+        Tab *printer_tab = GUI::wxGetApp().get_tab(Preset::Type::TYPE_PRINTER);
+        if (printer_tab == nullptr || !printer_tab->select_preset(machine_preset->name))
+            return false;
+        this->plater->update_project_dirty_from_presets();
     }
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << __LINE__ << " go on sync_extruder_list";
     const Preset &cur_preset  = preset_bundle->printers.get_selected_preset();
@@ -1996,7 +2659,11 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
     std::vector<NozzleVolumeType> target_types(extruder_nums, NozzleVolumeType::nvtStandard);
     for (size_t index = 0; index < extruder_nums; ++index) {
         int extruder_id = extruder_map[index];
-        nozzle_diameters[extruder_id] = nozzle_option ? atof(nozzle_option->diameter.c_str()) : obj->GetExtderSystem()->GetNozzleDiameter(index);
+        const int logical_index = reported_nozzles_are_mixed ?
+            logical_index_for_device_extruder(cur_preset.config, int(index)) : extruder_id;
+        assert(logical_index >= 0 && logical_index < extruder_nums);
+        nozzle_diameters[logical_index] = nozzle_option && !reported_nozzles_are_mixed ?
+            atof(nozzle_option->diameter.c_str()) : obj->GetExtderSystem()->GetNozzleDiameter(index);
         NozzleVolumeType target_type = NozzleVolumeType::nvtStandard;
         std::optional<NozzleVolumeType> select_type;
         if (nozzle_option && nozzle_option->extruder_nozzle_stats.count(index)) {
@@ -2015,7 +2682,7 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
                 continue;
             }
             // hack code, only use standard flow for 0.2
-            if (std::fabs(nozzle_diameters[extruder_id] - 0.2) > EPSILON)
+            if (std::fabs(nozzle_diameters[logical_index] - 0.2) > EPSILON)
                 // Map device flow->volume via the table, not `flowtype - 1`.
                 // The arithmetic only aligns for S_FLOW/H_FLOW; U_FLOW(3)-1 would yield nvtHybrid(2), not nvtTPUHighFlow(3).
                 target_type = DevNozzle::ToNozzleVolumeType(obj->GetExtderSystem()->GetNozzleFlowType(extruder_id));
@@ -2057,12 +2724,12 @@ bool Sidebar::priv::sync_extruder_list(bool &only_external_material, bool is_man
 
     if (extruder_nums > 1) {
         int left_index  = left_extruder->combo_diameter->FindString(get_diameter_string(nozzle_diameters[0]));
-        int right_index = left_extruder->combo_diameter->FindString(get_diameter_string(nozzle_diameters[1]));
+        int right_index = right_extruder->combo_diameter->FindString(get_diameter_string(nozzle_diameters[1]));
         assert(left_index != -1 && right_index != -1);
         left_extruder->combo_diameter->SetSelection(left_index);
         right_extruder->combo_diameter->SetSelection(right_index);
         is_switching_diameter = true;
-        switch_diameter(false);
+        switch_diameter(false, printer_preset_changed);
         is_switching_diameter = false;
         AMSCountPopupWindow::SetAMSCount(deputy_index, deputy_4, deputy_1);
         AMSCountPopupWindow::SetAMSCount(main_index, main_4, main_1);
@@ -2364,6 +3031,7 @@ Sidebar::Sidebar(Plater *parent)
     Choice::register_dynamic_list("top_surface_filament_id", &dynamic_filament_list);
     Choice::register_dynamic_list("bottom_surface_filament_id", &dynamic_filament_list);
     Choice::register_dynamic_list("wipe_tower_filament", &dynamic_filament_list);
+    Choice::register_dynamic_list("wall_process_preset", &dynamic_process_preset_list);
 
     p->scrolled = new wxPanel(this);
     //    p->scrolled->SetScrollbars(0, 100, 1, 2); // ys_DELETE_after_testing. pixelsPerUnitY = 100
@@ -3465,7 +4133,28 @@ void Sidebar::update_presets(Preset::Type preset_type)
         auto diameters = wxGetApp().preset_bundle->printers.diameters_of_selected_printer();
         auto diameter = printer_preset.config.opt_string("printer_variant");
         auto extruder_max_nozzle_count = printer_preset.config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count");
-        auto update_extruder_variant = [printer_model, extruders_def, extruders, nozzle_volumes_def, nozzle_volumes, extruder_variants,diameter,extruder_max_nozzle_count](ExtruderGroup & extruder, int index) {
+        const std::vector<double> effective_diameters = effective_nozzle_diameters(wxGetApp().preset_bundle->full_config());
+        const auto *project_diameters = wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+        const bool has_nozzle_overlay = project_diameters != nullptr && !project_diameters->values.empty();
+        if (isBBL && is_dual_extruder) {
+            std::set<double> known_diameters;
+            for (const std::string &variant : diameters) {
+                std::vector<std::string> tokens;
+                boost::algorithm::split(tokens, variant, boost::algorithm::is_any_of("+"));
+                for (const std::string &token : tokens) {
+                    size_t consumed = 0;
+                    const double value = string_to_double_decimal_point(token, &consumed);
+                    if (consumed > 0)
+                        known_diameters.insert(value);
+                }
+            }
+            diameters.clear();
+            for (double value : known_diameters)
+                diameters.emplace_back(get_diameter_string(float(value)));
+        }
+        auto update_extruder_variant = [printer_model, extruders_def, extruders, nozzle_volumes_def, nozzle_volumes,
+                                        extruder_variants, diameter, extruder_max_nozzle_count, effective_diameters,
+                                        isBBL, has_nozzle_overlay](ExtruderGroup & extruder, int index) {
             extruder.combo_flow->Clear();
             auto type = extruders_def->enum_labels[extruders->values[index]];
             int select = -1;
@@ -3476,8 +4165,10 @@ void Sidebar::update_presets(Preset::Type preset_type)
                 if (boost::algorithm::contains(extruder_variants->values[index], type + " " + nozzle_volumes_def->enum_labels[i]) ||
                     extruder_max_nozzle_count->get_at(index) > 1 && extruder_max_nozzle_count->get_at(index) != ConfigOptionIntsNullable::nil_value() &&
                     nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == nvtHybrid) {
-                    if (nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == NozzleVolumeType::nvtHighFlow &&(diameter == "0.2" ||
-                        is_skip_high_flow_printer(printer_model)))
+                    const bool suppress_high_flow_for_diameter = isBBL && has_nozzle_overlay && size_t(index) < effective_diameters.size() ?
+                        effective_diameters[index] < 0.25 : diameter == "0.2";
+                    if (nozzle_volumes_def->enum_keys_map->at(nozzle_volumes_def->enum_values[i]) == NozzleVolumeType::nvtHighFlow &&
+                        (suppress_high_flow_for_diameter || is_skip_high_flow_printer(printer_model)))
                         continue;
                     if (nozzle_volumes->values[index] == i)
                         select = extruder.combo_flow->GetCount();
@@ -3489,11 +4180,14 @@ void Sidebar::update_presets(Preset::Type preset_type)
             extruder.combo_flow->SetSelection(select);
         };
 
-        auto update_extruder_diameter = [&diameters, &diameter, &nozzle_diameter](int extruder_index,ExtruderGroup & extruder) {
+        auto update_extruder_diameter = [&diameters, &nozzle_diameter, &effective_diameters, isBBL,
+                                         is_dual_extruder](int extruder_index, ExtruderGroup &extruder) {
             extruder.combo_diameter->Clear();
             int select = -1;
             // ORCA get the actual nozzle diameter from printer config
-            auto nozzle_dia = get_diameter_string(nozzle_diameter->values[extruder_index]);
+            const double effective_diameter = isBBL && is_dual_extruder && size_t(extruder_index) < effective_diameters.size() ?
+                effective_diameters[extruder_index] : nozzle_diameter->values[extruder_index];
+            auto nozzle_dia = get_diameter_string(float(effective_diameter));
             // ORCA try to add nozzle diameter from config if list is empty. fixes blank nozzle combo box when preset has no alias
             if(diameters[0].empty() && !nozzle_dia.empty()){
                 diameters[0] = nozzle_dia;
@@ -3571,6 +4265,10 @@ void Sidebar::update_presets(Preset::Type preset_type)
 
     // Synchronize config.ini with the current selections.
     wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
+    if (print_tech == ptFFF && preset_type != Preset::TYPE_FILAMENT) {
+        dynamic_process_preset_list.update();
+        detail_nozzle_controls.update();
+    }
 
     BOOST_LOG_TRIVIAL(debug) << __FUNCTION__ << boost::format(": exit.");
 }
@@ -4036,6 +4734,8 @@ void Sidebar::on_filaments_delete(size_t filament_id)
     p->m_panel_filament_title->Refresh();
     update_ui_from_settings();
     dynamic_filament_list.update();
+    dynamic_process_preset_list.update();
+    detail_nozzle_controls.update();
 }
 
 void Sidebar::add_filament() {
@@ -4414,6 +5114,8 @@ void Sidebar::sync_ams_list(bool is_from_big_sync_btn)
             wxGetApp().get_tab(Preset::TYPE_FILAMENT)->select_preset(wxGetApp().preset_bundle->filament_presets[0], false, "", false, true);
             wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
             dynamic_filament_list.update();
+            dynamic_process_preset_list.update();
+            detail_nozzle_controls.update();
         }
         m_sync_dlg->set_check_dirty_fialment(false);
         dlg_res = m_sync_dlg->ShowModal();
@@ -4669,6 +5371,8 @@ void Sidebar::enable_nozzle_count_edit(bool enable)
 void Sidebar::update_dynamic_filament_list()
 {
     dynamic_filament_list.update();
+    dynamic_process_preset_list.update();
+    detail_nozzle_controls.update();
 }
 
 PlaterPresetComboBox* Sidebar::printer_combox()
@@ -7805,8 +8509,26 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                     std::string machine_type = obj->printer_type;
                     if (obj->is_support_upgrade_kit && obj->installed_upgrade_kit) machine_type = "C12";
 
+                    const bool model_mismatch = printer_preset.get_current_printer_type(preset_bundle) != machine_type;
                     bool nozzle_mismatch = !obj->GetExtderSystem()->NozzleDiameterMatchesOrUnknown(0, (float) preset_nozzle_diameter);
-                    if (printer_preset.get_current_printer_type(preset_bundle) != machine_type || nozzle_mismatch) {
+                    const bool device_has_mixed_nozzles = preset_bundle->is_bbl_vendor() && obj->is_multi_extruders() &&
+                                                          has_mixed_reported_nozzle_diameters(*obj);
+                    if (device_has_mixed_nozzles) {
+                        const DynamicPrintConfig effective_config = preset_bundle->full_config();
+                        const std::vector<double> effective_diameters = effective_nozzle_diameters(effective_config);
+                        nozzle_mismatch = false;
+                        for (const DevExtder &extruder : obj->GetExtderSystem()->GetExtruders()) {
+                            const int logical_index = logical_index_for_device_extruder(effective_config, extruder.GetExtId());
+                            if (logical_index < 0 || size_t(logical_index) >= effective_diameters.size() ||
+                                !obj->GetExtderSystem()->NozzleDiameterMatchesOrUnknown(
+                                    extruder.GetExtId(), float(effective_diameters[logical_index])))
+                                nozzle_mismatch = true;
+                        }
+                    }
+
+                    if (!model_mismatch && nozzle_mismatch && device_has_mixed_nozzles) {
+                        GUI::wxGetApp().sidebar().sync_extruder_list();
+                    } else if (model_mismatch || nozzle_mismatch) {
                         Preset *machine_preset = get_printer_preset(obj);
                         if (machine_preset != nullptr) {
                             std::string printer_model = machine_preset->config.option<ConfigOptionString>("printer_model")->value;
@@ -7822,6 +8544,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                                 sync_printer_info = wxGetApp().app_config->get("sync_after_load_file_show_flag") == "true";
                             }
                             if (sync_printer_info) {
+                                if (model_mismatch) {
+                                    if (auto *project_diameters = preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter"))
+                                        project_diameters->values.clear();
+                                }
                                 Tab *printer_tab = GUI::wxGetApp().get_tab(Preset::Type::TYPE_PRINTER);
                                 printer_tab->select_preset(machine_preset->name);
                                 if (obj->is_multi_extruders()) GUI::wxGetApp().sidebar().sync_extruder_list();
@@ -8914,6 +9640,12 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
 
     Print::ApplyStatus invalidated;
     const auto& preset_bundle = wxGetApp().preset_bundle;
+    // Heal stale/loaded projects whose feature processes depend on an auto filament map
+    // (e.g. a 3MF saved before mapping was pinned): switches to a concrete manual map and
+    // refreshes projections. Self-extinguishing once the mode is manual.
+    q->pin_feature_filament_map_for_active_features();
+
+    DynamicPrintConfig full_config;
     if (preset_bundle->get_printer_extruder_count() > 1) {
         PartPlate* cur_plate = background_process.get_current_plate();
         std::vector<int> f_maps = cur_plate->get_real_filament_maps(preset_bundle->project_config);
@@ -8921,11 +9653,20 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
         if (f_volume_maps.empty()) {
             f_volume_maps = preset_bundle->get_default_nozzle_volume_types_for_filaments(f_maps);
         }
-        invalidated = background_process.apply(this->model, preset_bundle->full_config(false, f_maps, f_volume_maps));
-        background_process.fff_print()->set_extruder_filament_info(get_extruder_filament_info());
+        full_config = preset_bundle->full_config(false, f_maps, f_volume_maps);
     }
     else
-        invalidated = background_process.apply(this->model, preset_bundle->full_config(false));
+        full_config = preset_bundle->full_config(false);
+
+    if (refresh_and_sync_filament_process_projections(*preset_bundle, full_config))
+        q->update_project_dirty_from_presets();
+    update_feature_process_projections(this->model, *preset_bundle, full_config);
+    q->notify_filament_process_resolutions(full_config, *preset_bundle);
+    dynamic_process_preset_list.update(&full_config);
+    detail_nozzle_controls.update(&full_config);
+    invalidated = background_process.apply(this->model, full_config);
+    if (preset_bundle->get_printer_extruder_count() > 1)
+        background_process.fff_print()->set_extruder_filament_info(get_extruder_filament_info());
 
     if ((invalidated == Print::APPLY_STATUS_CHANGED) || (invalidated == Print::APPLY_STATUS_INVALIDATED))
         // BBS: add only gcode mode
@@ -8977,7 +9718,7 @@ unsigned int Plater::priv::update_background_process(bool force_validation, bool
         StringObjectException err = background_process.validate(&warnings, &polygons, &height_polygons);
         // update string by type
         q->post_process_string_object_exception(err);
-        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": validate err=%1%, warnings=%2%")%err.string%warnings.size();
+        BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": validate err=%1%, key=%2%, warnings=%3%")%err.string%err.opt_key%warnings.size();
 
         if (err.string.empty()) {
             this->partplate_list.get_curr_plate()->update_apply_result_invalid(false);
@@ -10510,13 +11251,26 @@ void Plater::priv::on_select_preset(wxCommandEvent &evt)
                 preset_name = preset->name;
             }
             std::string old_preset_name = wxGetApp().preset_bundle->printers.get_edited_preset().name;
+            const std::string old_printer_model = wxGetApp().preset_bundle->printers.get_edited_preset().config.opt_string("printer_model");
+            bool cleared_nozzle_overlay = false;
 
-            update_objects_position_when_select_preset([this, &preset_type, &preset_name]() {
+            update_objects_position_when_select_preset([this, &preset_type, &preset_name, &old_printer_model, &cleared_nozzle_overlay]() {
                 wxWindowUpdateLocker noUpdates2(sidebar->filament_panel());
                 wxGetApp().get_tab(preset_type)->select_preset(preset_name);
+                const std::string new_printer_model = wxGetApp().preset_bundle->printers.get_edited_preset().config.opt_string("printer_model");
+                if (new_printer_model != old_printer_model) {
+                    if (auto *project_diameters = wxGetApp().preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+                        project_diameters != nullptr && !project_diameters->values.empty()) {
+                        project_diameters->values.clear();
+                        cleared_nozzle_overlay = true;
+                    }
+                }
                 // update plater with new config
                 q->on_config_change(wxGetApp().preset_bundle->full_config());
             });
+
+            if (cleared_nozzle_overlay)
+                q->update_project_dirty_from_presets();
 
 
             if (old_preset_name != preset_name && wxGetApp().app_config->get("auto_calculate_flush") == "all") {
@@ -13735,7 +14489,7 @@ void Plater::_calib_pa_pattern(const Calib_Params& params)
         // TODO: per-variant cap
         double speed = CalibPressureAdvance::find_optimal_PA_speed(
             wxGetApp().preset_bundle->full_config(),
-            print_config.get_abs_value("line_width", nozzle_diameter),
+            print_config.option<ConfigOptionFloatsOrPercentsNullable>("line_width")->get_at(0).get_abs_value(nozzle_diameter),
             print_config.get_abs_value("layer_height"), 0, 0);
         set_config_values<double, ConfigOptionFloatsNullable>(&print_config, "outer_wall_speed", speed);
 
@@ -16110,26 +16864,68 @@ Preset *get_printer_preset(const MachineObject *obj)
     if (!obj)
         return nullptr;
 
-    Preset       *printer_preset = nullptr;
-
+    Preset       *model_match              = nullptr;
+    Preset       *coarsest_variant_match   = nullptr;
+    Preset       *diameter_match           = nullptr;
     PresetBundle *preset_bundle  = wxGetApp().preset_bundle;
+    const std::string printer_type = obj->get_show_printer_type();
+    const std::string selected_base_name = preset_bundle->printers.get_selected_preset_base().name;
+    const auto &extruders = obj->GetExtderSystem()->GetExtruders();
+    const bool reported_nozzles_are_mixed = has_mixed_reported_nozzle_diameters(*obj);
+    std::optional<float> coarsest_reported_diameter;
+    for (const DevExtder &extruder : extruders) {
+        const float diameter = extruder.GetNozzleDiameter();
+        if (diameter > 0.f && (!coarsest_reported_diameter || diameter > *coarsest_reported_diameter))
+            coarsest_reported_diameter = diameter;
+    }
+
     for (auto printer_it = preset_bundle->printers.begin(); printer_it != preset_bundle->printers.end(); printer_it++) {
         // only use system printer preset
         if (!printer_it->is_system)
             continue;
 
-        ConfigOption       *printer_nozzle_opt  = printer_it->config.option("nozzle_diameter");
-        ConfigOptionFloats *printer_nozzle_vals = nullptr;
-        if (printer_nozzle_opt) printer_nozzle_vals = dynamic_cast<ConfigOptionFloats *>(printer_nozzle_opt);
-        std::string model_id = printer_it->get_current_printer_type(preset_bundle);
+        if (printer_it->get_current_printer_type(preset_bundle) != printer_type)
+            continue;
 
-        std::string printer_type = obj->get_show_printer_type();
-        bool nozzle_diameter_matches_or_unknown = printer_nozzle_vals && obj->GetExtderSystem()->NozzleDiameterMatchesOrUnknown(0, printer_nozzle_vals->get_at(0));
-        if (model_id.compare(printer_type) == 0 && nozzle_diameter_matches_or_unknown) {
-            printer_preset = &(*printer_it);
+        const bool selected_base = printer_it->name == selected_base_name;
+        if (model_match == nullptr || selected_base)
+            model_match = &(*printer_it);
+
+        if (coarsest_reported_diameter) {
+            const std::string &variant = printer_it->config.opt_string("printer_variant");
+            size_t consumed = 0;
+            const double variant_diameter = string_to_double_decimal_point(variant, &consumed);
+            if (consumed == variant.size() && std::abs(variant_diameter - *coarsest_reported_diameter) < 1e-3 &&
+                (coarsest_variant_match == nullptr || selected_base)) {
+                // When no preset represents the full mixed set, use the coarsest nozzle's family as
+                // the object-level base; finer tools then supply feature-specific process variants.
+                coarsest_variant_match = &(*printer_it);
+            }
         }
+
+        DynamicPrintConfig effective_config(printer_it->config);
+        if (const auto *project_diameters = preset_bundle->project_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+            !reported_nozzles_are_mixed && project_diameters != nullptr && !project_diameters->values.empty()) {
+            effective_config.set_key_value("project_nozzle_diameter", project_diameters->clone());
+        }
+
+        const std::vector<double> nozzle_diameters = effective_nozzle_diameters(effective_config);
+        bool all_diameters_match = !nozzle_diameters.empty();
+        for (const DevExtder &extruder : extruders) {
+            const int logical_index = logical_index_for_device_extruder(effective_config, extruder.GetExtId());
+            if (logical_index < 0 || size_t(logical_index) >= nozzle_diameters.size() ||
+                !obj->GetExtderSystem()->NozzleDiameterMatchesOrUnknown(
+                    extruder.GetExtId(), float(nozzle_diameters[logical_index]))) {
+                all_diameters_match = false;
+                break;
+            }
+        }
+        if (all_diameters_match && (diameter_match == nullptr || selected_base))
+            diameter_match = &(*printer_it);
     }
-    return printer_preset;
+    if (diameter_match != nullptr)
+        return diameter_match;
+    return coarsest_variant_match != nullptr ? coarsest_variant_match : model_match;
 }
 
 bool Plater::check_printer_initialized(MachineObject *obj, bool only_warning, bool popup_warning)
@@ -17724,6 +18520,7 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
 {
     bool update_scheduled = false;
     bool bed_shape_changed = false;
+    bool feature_process_changed = false;
     //bool print_sequence_changed = false;
     t_config_option_keys diff_keys = p->config->diff(config);
 
@@ -17736,6 +18533,10 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
     }
 
     for (auto opt_key : diff_keys) {
+        if (opt_key == "wall_process_policy" || opt_key == "wall_process_preset" ||
+            opt_key == "wall_layer_height" || opt_key == "outer_wall_filament_id" ||
+            opt_key == "extruder" || opt_key == "filament_map" || opt_key == "nozzle_diameter")
+            feature_process_changed = true;
         if (opt_key == "filament_colour") {
             update_scheduled = true; // update should be scheduled (for update 3DScene) #2738
 
@@ -17818,6 +18619,11 @@ void Plater::on_config_change(const DynamicPrintConfig &config)
 
     if (bed_shape_changed)
         set_bed_shape();
+    if (feature_process_changed) {
+        dynamic_filament_list.update();
+        dynamic_process_preset_list.update(&config);
+        detail_nozzle_controls.update(&config);
+    }
 
     config_change_notification(config, std::string("print_sequence"));
 
@@ -18025,12 +18831,362 @@ void Plater::set_global_filament_map(const std::vector<int>& filament_map)
 {
     auto& project_config = wxGetApp().preset_bundle->project_config;
     project_config.option<ConfigOptionInts>("filament_map")->values = filament_map;
+    dynamic_filament_list.update();
+    dynamic_process_preset_list.update();
+    detail_nozzle_controls.update();
 }
 
 void Plater::set_global_filament_volume_map(const std::vector<int>& filament_volume_map)
 {
     auto& project_config = wxGetApp().preset_bundle->project_config;
     project_config.option<ConfigOptionInts>("filament_volume_map")->values = filament_volume_map;
+}
+
+static const std::array<const char *, 8> s_feature_filament_keys{{
+    "outer_wall_filament_id", "inner_wall_filament_id", "sparse_infill_filament_id",
+    "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id",
+    "support_filament", "support_interface_filament",
+}};
+
+// A feature process depends on the filament map when any feature filament or process policy
+// override is active in the given (sparse-safe) config.
+static bool config_activates_feature_process(const DynamicPrintConfig &config)
+{
+    for (const char *key : s_feature_filament_keys)
+        if (const auto *opt = config.option<ConfigOptionInt>(key); opt != nullptr && opt->value > 0)
+            return true;
+    static const std::array<const char *, 7> prefixes{{
+        "wall", "sparse_infill_process", "internal_solid_process", "top_surface_process",
+        "bottom_surface_process", "support_process", "support_interface_process",
+    }};
+    for (const char *prefix : prefixes) {
+        const std::string base(prefix);
+        if (const auto *policy = config.option<ConfigOptionEnum<FeatureProcessPolicy>>(base + "_process_policy");
+            policy != nullptr && policy->value != FeatureProcessPolicy::AutoNozzleVariant)
+            return true;
+        if (const auto *preset = config.option<ConfigOptionString>(base + "_process_preset");
+            preset != nullptr && !preset->value.empty())
+            return true;
+        const std::string height_key = base == "wall" ? "wall_layer_height" : base + "_layer_height";
+        if (const auto *height = config.option<ConfigOptionFloat>(height_key); height != nullptr && height->value > 0.)
+            return true;
+    }
+    return false;
+}
+
+bool Plater::pin_feature_filament_map_if_needed(const std::string &opt_key)
+{
+    if (std::find(s_feature_filament_keys.begin(), s_feature_filament_keys.end(), opt_key) == s_feature_filament_keys.end())
+        return false;
+
+    // Walls are one unit in the cadence model: when the user routes OUTER walls to a filament
+    // and inner walls are still at "Default", follow along — otherwise the natural first click
+    // dead-ends in the "walls must share a nozzle" validation error.
+    if (opt_key == "outer_wall_filament_id") {
+        Tab *print_tab = wxGetApp().get_tab(Preset::TYPE_PRINT);
+        const DynamicPrintConfig &print_config = wxGetApp().preset_bundle->prints.get_edited_preset().config;
+        const auto *outer = print_config.option<ConfigOptionInt>("outer_wall_filament_id");
+        const auto *inner = print_config.option<ConfigOptionInt>("inner_wall_filament_id");
+        if (print_tab != nullptr && outer != nullptr && inner != nullptr && outer->value > 0 &&
+            inner->value != outer->value && inner->value == 0) {
+            // Same public field path the user's own edit took; the Multimaterial page is the
+            // active context because outer_wall_filament_id was just changed there.
+            print_tab->activate_option("inner_wall_filament_id", wxString());
+            if (Field *field = print_tab->get_field("inner_wall_filament_id"); field != nullptr) {
+                field->set_value(boost::any(outer->value), false);
+                field->field_changed();
+                const wxString message = format_wxstr(
+                    _L("Inner walls follow the outer walls' filament (%1%) so all walls print with the same nozzle."),
+                    outer->value);
+                get_notification_manager()->push_notification(message.utf8_string());
+            }
+        }
+    }
+
+    return pin_feature_filament_map_for_active_features();
+}
+
+bool Plater::pin_feature_filament_map_for_active_features()
+{
+    PresetBundle &bundle = *wxGetApp().preset_bundle;
+    DynamicPrintConfig &project_config = bundle.project_config;
+    const auto *map_mode = project_config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode");
+    PartPlate *plate = p->partplate_list.get_curr_plate();
+    if (map_mode == nullptr || plate == nullptr)
+        return false;
+
+    std::vector<int> filament_map = plate->get_real_filament_maps(project_config);
+    if (filament_map.empty())
+        return false;
+    std::vector<int> filament_volume_map = plate->get_real_filament_volume_maps(project_config);
+    if (filament_volume_map.empty())
+        filament_volume_map = bundle.get_default_nozzle_volume_types_for_filaments(filament_map);
+
+    DynamicPrintConfig full_config = bundle.full_config(false, filament_map, filament_volume_map);
+    const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (diameters == nullptr || diameters->values.size() < 2)
+        return false;
+    const auto diameter_range = std::minmax_element(diameters->values.begin(), diameters->values.end());
+    if (*diameter_range.second - *diameter_range.first <= EPSILON)
+        return false;
+    if (std::any_of(filament_map.begin(), filament_map.end(), [diameters](int tool) {
+            return tool <= 0 || size_t(tool) > diameters->values.size();
+        }))
+        return false;
+
+    // Only pin when a feature process actually depends on the map: the global config, any
+    // object, or any volume carries an active feature override. Keeps mixed-nozzle projects
+    // without feature usage on auto mapping.
+    bool active = config_activates_feature_process(full_config);
+    for (const ModelObject *object : p->model.objects) {
+        if (active)
+            break;
+        if (object == nullptr)
+            continue;
+        active = config_activates_feature_process(object->config.get());
+        for (const ModelVolume *volume : object->volumes) {
+            if (active)
+                break;
+            if (volume != nullptr)
+                active = config_activates_feature_process(volume->config.get());
+        }
+    }
+    if (!active)
+        return false;
+
+    // The plate-level mode overrides the global one in the applied config, so an auto mode on
+    // either layer would still trip the manual-mapping validation at slice time.
+    const bool switched_to_manual = is_auto_filament_map_mode(map_mode->value) ||
+                                    is_auto_filament_map_mode(plate->get_filament_map_mode());
+    if (switched_to_manual) {
+        set_global_filament_map(filament_map);
+        set_global_filament_map_mode(FilamentMapMode::fmmManual);
+        plate->set_filament_maps(filament_map);
+        plate->set_filament_map_mode(FilamentMapMode::fmmManual);
+        full_config = bundle.full_config(false, filament_map, filament_volume_map);
+    }
+    if (refresh_and_sync_filament_process_projections(bundle, full_config))
+        update_project_dirty_from_presets();
+    update_feature_process_projections(p->model, bundle, full_config);
+    notify_filament_process_resolutions(full_config, bundle);
+    detail_nozzle_controls.update(&full_config);
+    if (switched_to_manual) {
+        update_project_dirty_from_presets();
+        on_config_change(full_config);
+        const wxString message = _L("Filament-to-nozzle mapping switched to manual so feature-specific processes stay bound to their nozzles.");
+        get_notification_manager()->push_notification(message.utf8_string());
+    }
+
+    // Explain wall assignments that cannot produce the user's likely fine-detail intent. Each
+    // hint is emitted once for the exact binding state so background projection refreshes do not
+    // spam notifications.
+    // Refetch from full_config: the switched_to_manual branch reassigned it, invalidating any
+    // option pointers taken before the reassignment.
+    const auto *effective_diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (const auto *wall_filament = full_config.option<ConfigOptionInt>("outer_wall_filament_id");
+        effective_diameters != nullptr && wall_filament != nullptr && wall_filament->value > 0) {
+        // Same semantics as get_extruder_index_from_filament_id: 1-based filament through
+        // filament_map, identity for unmapped slots.
+        const auto *map_opt = full_config.option<ConfigOptionInts>("filament_map");
+        const auto tool_for_filament = [map_opt](unsigned filament_1based) -> size_t {
+            const size_t idx = filament_1based > 0 ? filament_1based - 1 : 0;
+            if (map_opt != nullptr && idx < map_opt->values.size())
+                return size_t(std::max(map_opt->values[idx] - 1, 0));
+            return idx;
+        };
+        const size_t wall_tool = tool_for_filament(unsigned(wall_filament->value));
+        const auto *object_filament = full_config.option<ConfigOptionInt>("extruder");
+        const size_t object_tool = tool_for_filament(
+            object_filament != nullptr && object_filament->value > 0 ? unsigned(object_filament->value) : 1u);
+        if (wall_tool >= effective_diameters->values.size() || object_tool >= effective_diameters->values.size())
+            return switched_to_manual;
+        const double wall_nozzle   = effective_diameters->values[wall_tool];
+        const double object_nozzle = effective_diameters->values[object_tool];
+        const std::string binding_state = std::to_string(wall_filament->value) + "@" +
+                                          std::to_string(wall_tool) + "/" + std::to_string(object_tool) + "@" +
+                                          nozzle_number(wall_nozzle).ToStdString() + "/" +
+                                          nozzle_number(object_nozzle).ToStdString();
+        if (std::abs(wall_nozzle - object_nozzle) <= EPSILON && wall_tool == object_tool) {
+            if (m_wall_intent_hint_states.insert("same|" + binding_state).second) {
+                const wxString hint = format_wxstr(
+                    _L("Walls use filament %1%, which is on the same %2% mm nozzle as the rest of the object. "
+                       "Move it to the other nozzle in Filament Mapping to print finer walls."),
+                    wall_filament->value, nozzle_number(wall_nozzle));
+                get_notification_manager()->push_notification(hint.utf8_string());
+            }
+        } else if (wall_nozzle > object_nozzle + EPSILON &&
+                   m_wall_intent_hint_states.insert("coarser-tool|" + binding_state).second) {
+            const wxString hint = format_wxstr(
+                _L("Walls are assigned to the %1% mm nozzle, which is coarser than the object's %2% mm nozzle. "
+                   "For fine walls, assign a filament on the smaller nozzle."),
+                nozzle_number(wall_nozzle), nozzle_number(object_nozzle));
+            get_notification_manager()->push_notification(
+                NotificationType::CustomNotification,
+                NotificationManager::NotificationLevel::WarningNotificationLevel,
+                hint.utf8_string());
+        }
+
+        const FeatureProcessRequest request = wall_process_request(full_config, bundle);
+        const FeatureProcessResolution resolution = resolve_feature_process(request);
+        if (resolution.feature_layer_height > 0. && resolution.base_layer_height > 0. &&
+            resolution.feature_layer_height + EPSILON >= resolution.base_layer_height) {
+            const std::string cadence_state = "cadence|" + binding_state + "@" +
+                                              nozzle_number(resolution.feature_layer_height).ToStdString() + "/" +
+                                              nozzle_number(resolution.base_layer_height).ToStdString();
+            if (m_wall_intent_hint_states.insert(cadence_state).second) {
+                const wxString hint = format_wxstr(
+                    _L("The wall process resolves to a %1% mm layer height, which is not finer than the object's %2% mm — "
+                       "walls will print at the object cadence."),
+                    nozzle_number(resolution.feature_layer_height), nozzle_number(resolution.base_layer_height));
+                get_notification_manager()->push_notification(
+                    NotificationType::CustomNotification,
+                    NotificationManager::NotificationLevel::WarningNotificationLevel,
+                    hint.utf8_string());
+            }
+        }
+    }
+    return switched_to_manual;
+}
+
+void Plater::notify_filament_process_resolutions(const DynamicPrintConfig &full_config,
+                                                 const PresetBundle &bundle)
+{
+    for (const FilamentValueOverlayNote &note : bundle.filament_value_overlay_notes()) {
+        const std::string state = "filament-value|" + std::to_string(note.slot + 1) + "|" +
+                                  nozzle_number(note.tool_nozzle).ToStdString() + "|" +
+                                  note.source_preset_name + "|" + nozzle_number(note.limited_speed).ToStdString();
+        if (!m_filament_process_hint_states.insert(state).second)
+            continue;
+
+        const wxString suffix = note.source_preset_name.empty() ?
+            format_wxstr(_L("estimated — no %1% mm preset for this filament"), nozzle_number(note.tool_nozzle)) :
+            format_wxstr(_L("from %1%"), from_u8(note.source_preset_name));
+        const wxString message = format_wxstr(
+            _L("Filament %1% flow limited to %2% mm³/s for the %3% mm nozzle (%4%)."),
+            note.slot + 1, nozzle_number(note.limited_speed), nozzle_number(note.tool_nozzle), suffix);
+        get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::HintNotificationLevel,
+            message.utf8_string());
+    }
+
+    const auto *diameters = full_config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto *policies = full_config.option<ConfigOptionEnumsGeneric>("filament_process_policy");
+    const auto *presets = full_config.option<ConfigOptionStrings>("filament_process_preset");
+    if (diameters == nullptr || policies == nullptr)
+        return;
+
+    const auto open_mapping = [](wxEvtHandler *) {
+        wxGetApp().CallAfter([] {
+            if (Plater *plater = wxGetApp().plater(); plater != nullptr) {
+                wxCommandEvent event;
+                plater->open_filament_map_setting_dialog(event);
+            }
+        });
+        return true;
+    };
+    const auto diameter_range = std::minmax_element(diameters->values.begin(), diameters->values.end());
+    const bool mixed_nozzles = diameter_range.first != diameters->values.end() &&
+                               *diameter_range.second - *diameter_range.first > EPSILON;
+    for (size_t index = 0; index < policies->values.size(); ++index) {
+        FilamentProcessPolicy policy = FilamentProcessPolicy::AutoNozzleVariant;
+        if (policies->values[index] == int(FilamentProcessPolicy::Pinned))
+            policy = FilamentProcessPolicy::Pinned;
+        else if (policies->values[index] == int(FilamentProcessPolicy::GlobalProcess))
+            policy = FilamentProcessPolicy::GlobalProcess;
+
+        FilamentProcessRequest request;
+        request.filament_id = unsigned(index + 1);
+        request.policy = policy;
+        if (presets != nullptr && index < presets->values.size())
+            request.pinned_preset_name = presets->values[index];
+        request.bundle = &bundle;
+        request.full_config = &full_config;
+        const FilamentProcessResolution resolution = resolve_filament_process(request);
+        const std::string resolved_name = !resolution.resolved_preset.empty() ? resolution.resolved_preset :
+                                          !request.pinned_preset_name.empty() ? request.pinned_preset_name : std::string();
+        const std::string state = std::to_string(index + 1) + "|" + std::to_string(resolution.tool_id) + "|" +
+                                  nozzle_number(resolution.tool_nozzle).ToStdString() + "/" +
+                                  nozzle_number(resolution.reference_nozzle).ToStdString() + "|" + resolved_name + "|" +
+                                  std::to_string(int(policy));
+
+        if (!resolution.ok && policy != FilamentProcessPolicy::GlobalProcess && resolution.tool_nozzle > 0.) {
+            if (m_filament_process_hint_states.insert(state).second) {
+                const wxString message = format_wxstr(
+                    _L("No process matches the %1% mm nozzle for Filament %2% — pick one in Filament mapping."),
+                    nozzle_number(resolution.tool_nozzle), index + 1);
+                get_notification_manager()->push_notification(
+                    NotificationType::CustomNotification,
+                    NotificationManager::NotificationLevel::WarningNotificationLevel,
+                    message.utf8_string(), _u8L("Change"), open_mapping);
+            }
+        } else if (!resolved_name.empty() && policy != FilamentProcessPolicy::GlobalProcess) {
+            if (m_filament_process_hint_states.insert(state).second) {
+                const wxString message = format_wxstr(
+                    _L("Filament %1% is on the %2% mm nozzle — using %3% for everything it prints."),
+                    index + 1, nozzle_number(resolution.tool_nozzle), from_u8(resolved_name));
+                get_notification_manager()->push_notification(
+                    NotificationType::CustomNotification,
+                    NotificationManager::NotificationLevel::HintNotificationLevel,
+                    message.utf8_string(), _u8L("Change"), open_mapping);
+            }
+        }
+
+    }
+
+    const auto *initial_height = full_config.option<ConfigOptionFloat>("initial_layer_print_height");
+    if (mixed_nozzles && initial_height != nullptr) {
+        const size_t first_layer_tool = size_t(std::distance(diameters->values.begin(), diameter_range.first));
+        const double max_height = Slicing::max_layer_height_from_nozzle(full_config, int(first_layer_tool + 1));
+        const std::string first_layer_state = "first-layer|" + std::to_string(first_layer_tool) + "|" +
+                                              nozzle_number(initial_height->value).ToStdString();
+        if (initial_height->value > max_height + EPSILON &&
+            m_filament_process_hint_states.insert(first_layer_state).second) {
+            const wxString message = format_wxstr(
+                _L("First layer stays at %1% mm (a global setting)."),
+                nozzle_number(initial_height->value));
+            // "Change" jumps to the setting itself, not the filament mapping — the remedy for a
+            // first-layer height is editing the first-layer height.
+            const auto open_first_layer_setting = [](wxEvtHandler *) {
+                wxGetApp().CallAfter([] {
+                    wxGetApp().sidebar().jump_to_option("initial_layer_print_height", Preset::TYPE_PRINT, L"");
+                });
+                return true;
+            };
+            get_notification_manager()->push_notification(
+                NotificationType::CustomNotification,
+                NotificationManager::NotificationLevel::HintNotificationLevel,
+                message.utf8_string(), _u8L("Change"), open_first_layer_setting);
+        }
+    }
+}
+
+bool Plater::clear_auto_feature_process_state_for_filament(unsigned int filament_id)
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr || !Slic3r::clear_auto_feature_process_state_for_filament(
+                                 p->model, filament_id, bundle->full_config()))
+        return false;
+
+    set_plater_dirty(true);
+    schedule_background_process();
+    const std::string state = "cleared-auto-feature|" + std::to_string(filament_id);
+    if (m_filament_process_hint_states.insert(state).second) {
+        const wxString message = format_wxstr(
+            _L("Cleared the fine wall settings that filament %1%'s process had applied."), filament_id);
+        get_notification_manager()->push_notification(
+            NotificationType::CustomNotification,
+            NotificationManager::NotificationLevel::HintNotificationLevel,
+            message.utf8_string());
+    }
+    return true;
+}
+
+bool Plater::filament_process_hint_registered_for_smoke(unsigned int filament_id) const
+{
+    const std::string prefix = std::to_string(filament_id) + "|";
+    return std::any_of(m_filament_process_hint_states.begin(), m_filament_process_hint_states.end(),
+                       [&prefix](const std::string &state) { return state.compare(0, prefix.size(), prefix) == 0; });
 }
 
 std::vector<int> Plater::get_global_filament_map() const
@@ -19202,6 +20358,9 @@ void Plater::open_filament_map_setting_dialog(wxCommandEvent &evt)
                                 old_filament_volume_maps != new_filament_volume_maps);
 
         if (need_invalidate) {
+            dynamic_filament_list.update();
+            dynamic_process_preset_list.update();
+            detail_nozzle_controls.update();
             if (need_slice) {
                 wxPostEvent(this, SimpleEvent(EVT_GLTOOLBAR_SLICE_PLATE));
             }

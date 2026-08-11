@@ -217,8 +217,8 @@ FilamentMapDialog::FilamentMapDialog(wxWindow                       *parent,
 {
     SetBackgroundColour(*wxWHITE);
 
-    SetMinSize(wxSize(FromDIP(580), -1));
-    SetMaxSize(wxSize(FromDIP(580), -1));
+    SetMinSize(wxSize(FromDIP(780), -1));
+    SetMaxSize(wxSize(FromDIP(780), -1));
 
     // Orca: when a filament track switch is ready, every AMS filament reaches both nozzles, so the
     // Match/Convenience sub-mode is dropped and Auto is presented purely as a filament-saving mode.
@@ -270,6 +270,9 @@ FilamentMapDialog::FilamentMapDialog(wxWindow                       *parent,
     // A manual grouping can point filaments at a nozzle volume the extruder does not physically
     // carry; the panel's validation timer reports that here so OK is gated on a printable map.
     m_manual_map_panel->Bind(wxEVT_INVALID_MANUAL_MAP, [this](wxCommandEvent &event) {
+        if (m_process_panel != nullptr)
+            m_process_panel->Rebuild(m_manual_map_panel->GetFilamentMaps(),
+                                     m_manual_map_panel->GetFilamentVolumeMaps());
         if (m_page_type != PageType::ptManual) {
             if (!m_ok_btn->IsEnabled()) { m_ok_btn->Enable(); }
             return;
@@ -290,6 +293,10 @@ FilamentMapDialog::FilamentMapDialog(wxWindow                       *parent,
     panel_sizer->Add(m_auto_map_panel, 0, wxEXPAND);
     if (show_default) panel_sizer->Add(m_default_map_panel, 0, wxEXPAND);
     main_sizer->Add(panel_sizer, 0, wxEXPAND);
+
+    main_sizer->AddSpacer(FromDIP(18));
+    m_process_panel = new FilamentProcessPanel(this, filaments);
+    main_sizer->Add(m_process_panel, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(15));
 
     // Smart filament section, shown only in filament-saving (flush) mode when the switch is ready.
     if (m_fila_switch_ready) {
@@ -364,6 +371,7 @@ FilamentMapMode FilamentMapDialog::get_mode()
 
 int FilamentMapDialog::ShowModal()
 {
+    m_process_panel->Rebuild(m_filament_map, m_filament_volume_map);
     update_panel_status(m_page_type);
     return wxDialog::ShowModal();
 }
@@ -443,6 +451,8 @@ void FilamentMapDialog::on_switch_mode(wxCommandEvent &event)
     m_page_type = PageType(win_id);
 
     update_panel_status(m_page_type);
+    m_process_panel->Rebuild(m_manual_map_panel->GetFilamentMaps(),
+                             m_manual_map_panel->GetFilamentVolumeMaps());
     event.Skip();
 }
 

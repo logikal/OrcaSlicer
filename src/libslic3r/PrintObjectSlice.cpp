@@ -818,10 +818,18 @@ void PrintObject::slice()
 {
     if (! this->set_started(posSlice))
         return;
+    if (m_slicing_params.cadence_ratio > 1 || m_slicing_params.cadence_zone_digest != 0) {
+        const bool has_layer_height_range = std::any_of(
+            this->model_object()->layer_config_ranges.begin(), this->model_object()->layer_config_ranges.end(),
+            [](const auto &range) { return range.second.has("layer_height"); });
+        if (!this->model_object()->layer_height_profile.empty() || has_layer_height_range || m_config.precise_z_height.value)
+            BOOST_LOG_TRIVIAL(warning) << "Fine feature cadence is active with a variable layer-height or precise-Z setting; "
+                                          "validation must reject this Phase-1 combination";
+    }
     //BBS: add flag to reload scene for shell rendering
     m_print->set_status(5, L("Slicing mesh"), PrintBase::SlicingStatus::RELOAD_SCENE);
     std::vector<coordf_t> layer_height_profile;
-    this->update_layer_height_profile(*this->model_object(), m_slicing_params, layer_height_profile);
+    this->update_layer_height_profile(*this->model_object(), m_slicing_params, layer_height_profile, m_cadence_zones);
     m_print->throw_if_canceled();
     m_typed_slices = false;
     this->clear_layers();
@@ -1407,7 +1415,7 @@ void PrintObject::apply_conical_overhang() {
     const double tan_angle = tan(angle_radians); // the XY-component of the angle
     BOOST_LOG_TRIVIAL(info) << "angle " << angle_radians << " maxHoleArea " << max_hole_area << " tan_angle "
                             << tan_angle;
-    const coordf_t layer_thickness = m_config.layer_height.value;
+    const coordf_t layer_thickness = m_slicing_params.layer_height;
     const coordf_t max_dist_from_lower_layer = tan_angle * layer_thickness; // max dist which can be bridged, in MM
     BOOST_LOG_TRIVIAL(info) << "layer_thickness " << layer_thickness << " max_dist_from_lower_layer "
                             << max_dist_from_lower_layer;

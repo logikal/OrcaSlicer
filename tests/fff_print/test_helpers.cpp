@@ -7,6 +7,7 @@
 #include "libslic3r/Format/OBJ.hpp"
 #include "libslic3r/Format/STL.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <string>
 
@@ -216,12 +217,135 @@ DynamicPrintConfig multifilament_config(unsigned int filaments, std::initializer
 	for (const char *key : { "filament_type", "filament_vendor", "filament_start_gcode" })
 		static_cast<ConfigOptionVectorBase *>(config.option(key, true))->resize(filaments, defaults.option(key));
 
+	// PresetBundle sizes every per-filament variant column when composing a real project;
+	// headless fixtures must do the same, or a materialized filament_self_index maps filaments
+	// onto columns that size-1 default arrays don't have (nullable reads then come back as
+	// zero and kill extrusion flow).
+	for (const std::string &key : filament_options_with_variant)
+		if (auto *opt = dynamic_cast<ConfigOptionVectorBase *>(config.option(key, true)); opt != nullptr)
+			opt->resize(filaments, defaults.option(key));
+
 	// flush_volumes_matrix must be sized filaments*filaments or export rejects it.
 	config.set_deserialize_strict({ { "filament_colour", colours }, { "flush_volumes_matrix", flush } });
 
 	if (extra.size() > 0)
 		config.set_deserialize_strict(extra);
 	return config;
+}
+
+DynamicPrintConfig mixed_nozzle_config(std::initializer_list<ConfigBase::SetDeserializeItem> extra)
+{
+    DynamicPrintConfig config = multifilament_config(2, {
+        { "layer_height",                    0.2 },
+        { "initial_layer_print_height",      0.2 },
+        { "nozzle_diameter",                 "0.2,0.4" },
+        { "min_layer_height",                "0.05,0.1" },
+        { "max_layer_height",                "0.15,0.3" },
+        { "printer_extruder_id",             "1,2" },
+        // NOTE: comma on purpose — as a single concatenated (non-matching) token this keeps the
+        // PRINTER-side variant expansion inert for these fixtures, as it has been for all fff
+        // tests (activating it rewrites retract/machine vectors sized for defaults).
+        { "printer_extruder_variant",        "Direct Drive Standard,Direct Drive Standard" },
+        { "extruder_variant_list",           "Direct Drive Standard;Direct Drive Standard" },
+        // FILAMENT-side variant columns are materialized like PresetBundle does for a real
+        // project, so per-filament values (temperatures, flow) resolve for every filament.
+        { "filament_extruder_variant",       "Direct Drive Standard;Direct Drive Standard" },
+        { "filament_self_index",             "1,2" },
+        { "outer_wall_filament_id",          1 },
+        { "inner_wall_filament_id",          1 },
+        { "sparse_infill_filament_id",       2 },
+        { "internal_solid_filament_id",      2 },
+        { "top_surface_filament_id",         2 },
+        { "bottom_surface_filament_id",      2 },
+        { "skirt_loops",                     0 },
+        { "bridge_line_width",               0. },
+        { "skin_infill_line_width",          0. },
+        { "skeleton_infill_line_width",      0. },
+        { "before_layer_change_gcode",       "G92 E0" },
+    });
+    config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value = fmmManual;
+    config.option<ConfigOptionInts>("filament_map", true)->values = {1, 2};
+    if (extra.size() > 0)
+        config.set_deserialize_strict(extra);
+    return config;
+}
+
+namespace {
+
+bool parse_tool_command(std::string_view command, int &tool)
+{
+    if (command.size() < 2 || command.front() != 'T' || !std::isdigit(static_cast<unsigned char>(command[1])))
+        return false;
+    tool = std::stoi(std::string(command.substr(1)));
+    return true;
+}
+
+} // namespace
+
+std::vector<GCodeExtrusion> gcode_extrusions(const std::string &gcode)
+{
+    std::vector<GCodeExtrusion> extrusions;
+    ExtrusionRole role = erNone;
+    double height = 0.;
+    int tool = 0;
+    bool in_wipe_tower = false;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.find("WIPE_TOWER_START") != std::string_view::npos)
+            in_wipe_tower = true;
+        else if (comment.find("WIPE_TOWER_END") != std::string_view::npos)
+            in_wipe_tower = false;
+        if (comment.rfind("TYPE:", 0) == 0)
+            role = ExtrusionEntity::string_to_role(comment.substr(5));
+        else if (comment.rfind(" FEATURE: ", 0) == 0)
+            role = ExtrusionEntity::string_to_role(comment.substr(10));
+        else if (comment.rfind("HEIGHT:", 0) == 0)
+            height = std::stod(std::string(comment.substr(7)));
+        else if (comment.rfind(" LAYER_HEIGHT: ", 0) == 0)
+            height = std::stod(std::string(comment.substr(15)));
+
+        int parsed_tool = tool;
+        if (parse_tool_command(line.cmd(), parsed_tool)) {
+            tool = parsed_tool;
+            return;
+        }
+        if (!line.extruding(self))
+            return;
+        const bool object_extrusion =
+            ((role == erPerimeter || role == erExternalPerimeter || role == erOverhangPerimeter) &&
+             comment.find("perimeter") != std::string_view::npos) ||
+            ((role == erInternalInfill || role == erSolidInfill || role == erTopSolidInfill ||
+              role == erBottomSurface || role == erBridgeInfill || role == erInternalBridgeInfill ||
+              role == erGapFill) && comment.find("infill") != std::string_view::npos) ||
+            (role == erSkirt && comment.find("skirt") != std::string_view::npos) ||
+            (role == erBrim && comment.find("brim") != std::string_view::npos) ||
+            (is_support(role) && comment.find("support") != std::string_view::npos);
+        if (object_extrusion || in_wipe_tower)
+            extrusions.push_back({in_wipe_tower ? erWipeTower : role, tool, line.new_Z(self), height});
+    });
+    return extrusions;
+}
+
+std::vector<GCodeToolChange> gcode_tool_changes(const std::string &gcode)
+{
+    std::vector<GCodeToolChange> changes;
+    double layer_z = 0.;
+    int current_tool = -1;
+    GCodeReader reader;
+    reader.parse_buffer(gcode, [&](GCodeReader &self, const GCodeReader::GCodeLine &line) {
+        const std::string_view comment = line.comment();
+        if (comment.rfind("Z:", 0) == 0)
+            layer_z = std::stod(std::string(comment.substr(2)));
+        else if (comment.rfind(" Z_HEIGHT:", 0) == 0)
+            layer_z = std::stod(std::string(comment.substr(10)));
+        int tool = 0;
+        if (parse_tool_command(line.cmd(), tool) && tool != current_tool) {
+            changes.push_back({tool, layer_z > 0. ? layer_z : self.z()});
+            current_tool = tool;
+        }
+    });
+    return changes;
 }
 
 void init_print(std::vector<TriangleMesh> &&meshes, Slic3r::Print &print, Slic3r::Model &model, const DynamicPrintConfig &config_in,

@@ -15,8 +15,7 @@ SCENARIO("Placeholder parser scripting", "[PlaceholderParser]") {
 	    { "nozzle_temperature", "357,359,363,378" }
 	});
     // To test the "min_width_top_surface" over "inner_wall_line_width".
-    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->value = 150.;
-    config.option<ConfigOptionFloatOrPercent>("inner_wall_line_width")->percent = true;
+    config.option<ConfigOptionFloatsOrPercentsNullable>("inner_wall_line_width")->get_at(0) = {150., true};
     // To let the PlaceholderParser throw when referencing scarf_joint_speed if it is set to percent, as the PlaceholderParser does not know
     // a percent to what.
     config.option<ConfigOptionFloatOrPercent>("scarf_joint_speed")->value = 50.;

@@ -2,6 +2,7 @@
 #define slic3r_Plater_hpp_
 
 #include <memory>
+#include <set>
 #include <vector>
 #include <boost/filesystem/path.hpp>
 
@@ -35,6 +36,7 @@ class wxButton;
 class ScalableButton;
 class wxScrolledWindow;
 class wxString;
+class wxStaticText;
 class ComboBox;
 class Button;
 
@@ -54,6 +56,7 @@ class BackgroundSlicingProcess;
 enum SLAPrintObjectStep : unsigned int;
 enum class ConversionType : int;
 class DevAms;
+enum class FilamentProcessPolicy;
 
 using ModelInstancePtrs = std::vector<ModelInstance*>;
 
@@ -213,6 +216,7 @@ public:
     void set_extruder_nozzle_count(int extruder_id, int nozzle_count);
     void enable_nozzle_count_edit(bool enable);
     void update_dynamic_filament_list();
+    bool apply_nozzle_diameters_for_smoke(const wxString &left_diameter, const wxString &right_diameter);
 
     PlaterPresetComboBox *  printer_combox();
     ObjectList*             obj_list();
@@ -588,6 +592,13 @@ public:
     void set_global_filament_map_mode(FilamentMapMode mode);
     void set_global_filament_map(const std::vector<int>& filament_map);
     void set_global_filament_volume_map(const std::vector<int>& filament_volume_map);
+    bool pin_feature_filament_map_if_needed(const std::string &opt_key);
+    // Heals stale/loaded projects: pins the map and refreshes projections whenever an active
+    // feature process depends on it. Self-extinguishing (no-op once the mode is manual and
+    // nothing changed). Safe to call from update_background_process.
+    bool pin_feature_filament_map_for_active_features();
+    bool clear_auto_feature_process_state_for_filament(unsigned int filament_id);
+    bool filament_process_hint_registered_for_smoke(unsigned int filament_id) const;
     std::vector<int> get_global_filament_map() const;
     std::vector<int> get_global_filament_volume_map() const;
     FilamentMapMode get_global_filament_map_mode() const;
@@ -964,6 +975,10 @@ private:
     struct priv;
     std::unique_ptr<priv> p;
     std::string           m_3mf_path;
+    // One-shot wall intent hints, keyed by hint type and the physical binding that caused it.
+    std::set<std::string> m_wall_intent_hint_states;
+    // One-shot per-filament process hints, keyed by slot, tool/nozzles, resolution and policy.
+    std::set<std::string> m_filament_process_hint_states;
     // Set true during PopupMenu() tracking to suppress immediate error message boxes.
     // The error messages are collected to m_tracking_popup_menu_error_message instead and these error messages
     // are shown after the pop-up dialog closes.
@@ -984,6 +999,8 @@ private:
 
     void suppress_snapshots();
     void allow_snapshots();
+    void notify_filament_process_resolutions(const DynamicPrintConfig &full_config,
+                                             const PresetBundle &bundle);
     // BBS: single snapshot
     void single_snapshots_enter(SingleSnapshot *single);
     void single_snapshots_leave(SingleSnapshot *single);
@@ -1012,6 +1029,11 @@ private:
 };
 
 std::vector<int> get_min_flush_volumes(const DynamicPrintConfig &full_config, size_t nozzle_id);
+
+void register_feature_process_readout(wxStaticText *readout);
+// Smoke-harness accessor: the most recently created "Print fine details with" combo.
+ComboBox *detail_nozzle_control_for_smoke();
+void register_detail_nozzle_control(ComboBox *combo, wxSizer *row);
 
 Preset *get_printer_preset(const MachineObject *obj);
 wxArrayString get_all_camera_view_type();

@@ -4,6 +4,7 @@
 #include "I18N.hpp"
 
 #include <algorithm>
+#include <iostream>
 #include <boost/lexical_cast.hpp>
 #include <boost/format.hpp>
 
@@ -30,6 +31,23 @@
 
 namespace Slic3r {
 namespace GUI {
+
+int gui_smoke_modal_result(wxDialog *dialog)
+{
+    GUI_App *app = dynamic_cast<GUI_App *>(wxApp::GetInstance());
+    if (app == nullptr || !app->is_gui_smoke() || dialog == nullptr)
+        return wxID_NONE;
+
+    const long style = dialog->GetWindowStyleFlag();
+    const int result = (style & wxYES_NO) == wxYES_NO ? wxID_NO : wxID_CANCEL;
+    std::string title = into_u8(dialog->GetTitle());
+    std::replace(title.begin(), title.end(), '\n', ' ');
+    const std::string line = "SMOKE MODAL: auto-declined title=\"" + title +
+                             "\" result=" + std::to_string(result);
+    std::cout << line << std::endl;
+    BOOST_LOG_TRIVIAL(info) << line;
+    return result;
+}
 
 #ifdef _WIN32
 wxDEFINE_EVENT(EVT_HID_DEVICE_ATTACHED, HIDDeviceAttachedEvent);

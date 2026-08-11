@@ -89,6 +89,10 @@ void update_dark_ui(wxWindow* window);
 
 extern std::deque<wxDialog*> dialogStack;
 
+// Returns wxID_NONE outside GUI smoke mode. In smoke mode, logs and supplies a
+// non-accepting result so an unexpected modal cannot stall the scripted run.
+int gui_smoke_modal_result(wxDialog *dialog);
+
 template<class P> class DPIAware : public P, public wxInspector::wxInspectable
 {
 public:
@@ -198,6 +202,8 @@ public:
 
     int ShowModal()
     {
+        if (const int smoke_result = gui_smoke_modal_result(this); smoke_result != wxID_NONE)
+            return smoke_result;
         dialogStack.push_front(this);
         int r = wxDialog::ShowModal();
         dialogStack.pop_front();

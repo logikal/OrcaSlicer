@@ -59,6 +59,19 @@ struct MergeFilamentInfo {
     bool  is_empty() { return merges.empty();}
 };
 
+struct FilamentValueOverlayNote
+{
+    size_t      slot {0};
+    double      tool_nozzle {0.};
+    std::string source_preset_name;
+    double      limited_speed {0.};
+};
+
+class PresetBundle;
+
+std::vector<FilamentValueOverlayNote> apply_filament_nozzle_value_overlay(
+    DynamicPrintConfig &out, const PresetBundle &bundle);
+
 
 struct FilamentBaseInfo
 {
@@ -387,6 +400,10 @@ public:
     DynamicPrintConfig          full_config(bool apply_extruder = true, std::optional<std::vector<int>>filament_maps = std::nullopt, std::optional<std::vector<int>> filament_volume_maps = std::nullopt) const;
     // full_config() with the some "useless" config removed.
     DynamicPrintConfig          full_config_secure(std::optional<std::vector<int>>filament_maps = std::nullopt) const;
+    const Preset               *sibling_printer_preset_for_diameter(double diameter) const;
+    const Preset               *sibling_filament_preset_for_nozzle(size_t filament_index, double tool_diameter) const;
+    const std::vector<FilamentValueOverlayNote> &filament_value_overlay_notes() const
+        { return m_filament_value_overlay_notes; }
 
     // Default per-filament nozzle-volume types: each filament inherits the volume type of the
     // extruder it maps to (1-based f_maps), Standard when unknown.
@@ -550,6 +567,8 @@ private:
 
     DynamicPrintConfig          full_fff_config(bool apply_extruder, std::optional<std::vector<int>> filament_maps=std::nullopt, std::optional<std::vector<int>> filament_volume_maps=std::nullopt) const;
     DynamicPrintConfig          full_sla_config() const;
+
+    mutable std::vector<FilamentValueOverlayNote> m_filament_value_overlay_notes;
 
     // Orca: used for validation only
     bool validation_mode = false;

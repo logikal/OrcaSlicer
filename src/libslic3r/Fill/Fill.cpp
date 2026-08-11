@@ -1038,12 +1038,18 @@ std::vector<SurfaceFill> group_fills(const Layer &layer, LockRegionParam &lock_p
 				//get locked region param
 				if (params.pattern == ipLockedZag){
 					const PrintObject *object = layerm.layer()->object();
-					auto nozzle_diameter = float(object->print()->config().nozzle_diameter.get_at(layerm.region().extruder(extrusion_role) - 1));
-					Flow skin_flow = params.bridge ? params.flow : Flow::new_from_config_width(extrusion_role, region_config.skin_infill_line_width, nozzle_diameter, float((surface.thickness == -1) ? layer.height : surface.thickness));
+					const PrintConfig &print_config = object->print()->config();
+					const unsigned int filament_id = layerm.region().extruder(extrusion_role);
+					const size_t extruder_id = get_extruder_index_from_filament_id(print_config, filament_id);
+					const size_t config_index = get_print_config_index_from_filament_id(print_config, filament_id);
+					auto nozzle_diameter = float(print_config.nozzle_diameter.get_at(extruder_id));
+					const FloatOrPercent &skin_width = region_config.skin_infill_line_width.get_at(config_index);
+					Flow skin_flow = params.bridge ? params.flow : Flow::new_from_config_width(extrusion_role, ConfigOptionFloatOrPercent(skin_width.value, skin_width.percent), nozzle_diameter, float((surface.thickness == -1) ? layer.height : surface.thickness));
 					//add skin flow
 					append_flow_param(lock_param.skin_flow_params, skin_flow, surface.expolygon);
 
-					Flow skeleton_flow = params.bridge ? params.flow : Flow::new_from_config_width(extrusion_role, region_config.skeleton_infill_line_width, nozzle_diameter, float((surface.thickness == -1) ? layer.height : surface.thickness)) ;
+					const FloatOrPercent &skeleton_width = region_config.skeleton_infill_line_width.get_at(config_index);
+					Flow skeleton_flow = params.bridge ? params.flow : Flow::new_from_config_width(extrusion_role, ConfigOptionFloatOrPercent(skeleton_width.value, skeleton_width.percent), nozzle_diameter, float((surface.thickness == -1) ? layer.height : surface.thickness)) ;
 					// add skeleton flow
 					append_flow_param(lock_param.skeleton_flow_params, skeleton_flow, surface.expolygon);
 

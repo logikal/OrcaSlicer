@@ -27,8 +27,11 @@
 #include <boost/preprocessor/stringize.hpp>
 #include <boost/preprocessor/tuple/elem.hpp>
 #include <boost/preprocessor/tuple/to_seq.hpp>
+#include <type_traits>
 
 namespace Slic3r {
+
+class Preset;
 
 enum GCodeFlavor : unsigned char {
     gcfMarlinLegacy, 
@@ -507,6 +510,18 @@ enum FilamentMapMode {
     fmmDefault
 };
 
+enum class FeatureProcessPolicy {
+    AutoNozzleVariant = 0,
+    Pinned,
+    SameAsObject,
+};
+
+enum class FilamentProcessPolicy {
+    AutoNozzleVariant = 0,
+    Pinned,
+    GlobalProcess,
+};
+
 // All auto modes are ordered before fmmManual (see the enum ordering note above).
 inline bool is_auto_filament_map_mode(FilamentMapMode mode) {
     return mode < fmmManual;
@@ -672,6 +687,8 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PerimeterGeneratorType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ToolChangeOrderingType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(PowerLossRecoveryMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SurfaceFillOrder)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FeatureProcessPolicy)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(FilamentProcessPolicy)
 
 #undef CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS
 
@@ -835,6 +852,13 @@ public:
     std::string get_filament_vendor() const;
     std::string get_filament_type() const;
 };
+
+void apply_project_nozzle_diameters(
+    DynamicPrintConfig &config,
+    const std::function<const Preset *(double)> &sibling_source = nullptr);
+std::vector<double> effective_nozzle_diameters(const DynamicPrintConfig &full_or_printer_config);
+int logical_index_for_device_extruder(const DynamicPrintConfig &config, int device_ext_id);
+
 extern std::set<std::string> printer_extruder_options;
 extern std::set<std::string> print_options_with_variant;
 extern std::set<std::string> filament_options_with_variant;
@@ -1089,7 +1113,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                 elefant_foot_compensation_layers))
     ((ConfigOptionPercent,             elefant_foot_layers_density))
     ((ConfigOptionFloat,               max_bridge_length))
-    ((ConfigOptionFloatOrPercent,      line_width))
+    ((ConfigOptionFloatsOrPercentsNullable, line_width))
     // Force the generation of solid shells between adjacent materials/volumes.
     ((ConfigOptionBool,                interface_shells))
     ((ConfigOptionFloat,               layer_height))
@@ -1116,10 +1140,18 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionFloat,               support_bottom_z_distance))
     ((ConfigOptionInt,                 enforce_support_layers))
     ((ConfigOptionInt,                 support_filament))
-    ((ConfigOptionFloatOrPercent,      support_line_width))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, support_process_policy))
+    ((ConfigOptionString,              support_process_preset))
+    ((ConfigOptionFloat,               support_process_layer_height))
+    ((ConfigOptionString,              support_process_projection))
+    ((ConfigOptionFloatsOrPercentsNullable, support_line_width))
     ((ConfigOptionBool,                support_interface_not_for_body))
     ((ConfigOptionBool,                support_interface_loop_pattern))
     ((ConfigOptionInt,                 support_interface_filament))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, support_interface_process_policy))
+    ((ConfigOptionString,              support_interface_process_preset))
+    ((ConfigOptionFloat,               support_interface_process_layer_height))
+    ((ConfigOptionString,              support_interface_process_projection))
     ((ConfigOptionInt,                 support_interface_top_layers))
     ((ConfigOptionInt,                 support_interface_bottom_layers))
     // Spacing between interface lines (the hatching distance). Set zero to get a solid interface.
@@ -1253,7 +1285,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionEnum<SurfaceFillOrder>, top_surface_fill_order))
     ((ConfigOptionEnum<SurfaceFillOrder>, bottom_surface_fill_order))
     ((ConfigOptionEnum<InfillPattern>, internal_solid_infill_pattern))
-    ((ConfigOptionFloatOrPercent,       outer_wall_line_width))
+    ((ConfigOptionFloatsOrPercentsNullable, outer_wall_line_width))
     ((ConfigOptionFloatsNullable,       outer_wall_speed))
     ((ConfigOptionFloat,                infill_direction))
     ((ConfigOptionFloat,                solid_infill_direction))
@@ -1290,7 +1322,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt,                  fuzzy_skin_layers_between_ripple_offset))
     ((ConfigOptionFloatsNullable,       gap_infill_speed))
     ((ConfigOptionInt,                  sparse_infill_filament_id))
-    ((ConfigOptionFloatOrPercent,       sparse_infill_line_width))
+    ((ConfigOptionFloatsOrPercentsNullable, sparse_infill_line_width))
     ((ConfigOptionPercent,              infill_wall_overlap))
     ((ConfigOptionPercent,              top_bottom_infill_wall_overlap))
     ((ConfigOptionFloatsNullable,       sparse_infill_speed))
@@ -1298,8 +1330,8 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionPercent, skin_infill_density))
     ((ConfigOptionFloat, infill_lock_depth))
     ((ConfigOptionFloat, skin_infill_depth))
-    ((ConfigOptionFloatOrPercent, skin_infill_line_width))
-    ((ConfigOptionFloatOrPercent, skeleton_infill_line_width))
+    ((ConfigOptionFloatsOrPercentsNullable, skin_infill_line_width))
+    ((ConfigOptionFloatsOrPercentsNullable, skeleton_infill_line_width))
     ((ConfigOptionBool, infill_combination))
     // Orca:
     ((ConfigOptionFloatOrPercent,                infill_combination_max_layer_height))
@@ -1324,7 +1356,7 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool, detect_overhang_wall))
     ((ConfigOptionInt, outer_wall_filament_id))
     ((ConfigOptionInt, inner_wall_filament_id))
-    ((ConfigOptionFloatOrPercent, inner_wall_line_width))
+    ((ConfigOptionFloatsOrPercentsNullable, inner_wall_line_width))
     ((ConfigOptionFloatsNullable, inner_wall_speed))
     // Total number of perimeters.
     ((ConfigOptionInt, wall_loops))
@@ -1333,11 +1365,31 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionInt, internal_solid_filament_id))
     ((ConfigOptionInt, top_surface_filament_id))
     ((ConfigOptionInt, bottom_surface_filament_id))
-    ((ConfigOptionFloatOrPercent, internal_solid_infill_line_width))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, wall_process_policy))
+    ((ConfigOptionString, wall_process_preset))
+    ((ConfigOptionFloat, wall_layer_height))
+    ((ConfigOptionString, wall_process_projection))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, sparse_infill_process_policy))
+    ((ConfigOptionString, sparse_infill_process_preset))
+    ((ConfigOptionFloat, sparse_infill_process_layer_height))
+    ((ConfigOptionString, sparse_infill_process_projection))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, internal_solid_process_policy))
+    ((ConfigOptionString, internal_solid_process_preset))
+    ((ConfigOptionFloat, internal_solid_process_layer_height))
+    ((ConfigOptionString, internal_solid_process_projection))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, top_surface_process_policy))
+    ((ConfigOptionString, top_surface_process_preset))
+    ((ConfigOptionFloat, top_surface_process_layer_height))
+    ((ConfigOptionString, top_surface_process_projection))
+    ((ConfigOptionEnum<FeatureProcessPolicy>, bottom_surface_process_policy))
+    ((ConfigOptionString, bottom_surface_process_preset))
+    ((ConfigOptionFloat, bottom_surface_process_layer_height))
+    ((ConfigOptionString, bottom_surface_process_projection))
+    ((ConfigOptionFloatsOrPercentsNullable, internal_solid_infill_line_width))
     ((ConfigOptionFloatsNullable, internal_solid_infill_speed))
     // Detect thin walls.
     ((ConfigOptionBool, detect_thin_wall))
-    ((ConfigOptionFloatOrPercent, top_surface_line_width))
+    ((ConfigOptionFloatsOrPercentsNullable, top_surface_line_width))
     ((ConfigOptionInt, top_shell_layers))
     ((ConfigOptionFloat, top_shell_thickness))
     ((ConfigOptionFloat, top_surface_expansion))
@@ -1531,6 +1583,10 @@ PRINT_CONFIG_CLASS_DEFINE(
     ((ConfigOptionBool,                support_object_skip_flush))
     ((ConfigOptionEnum<BedTempFormula>, bed_temperature_formula))
     ((ConfigOptionInts,                physical_extruder_map))
+    ((ConfigOptionFloats,              project_nozzle_diameter))
+    ((ConfigOptionEnumsGeneric,        filament_process_policy))
+    ((ConfigOptionStrings,             filament_process_preset))
+    ((ConfigOptionStrings,             filament_process_projection))
     ((ConfigOptionIntsNullable,        nozzle_flush_dataset))
     ((ConfigOptionFloatsNullable,      filament_flush_volumetric_speed))
     ((ConfigOptionIntsNullable,        filament_flush_temp))
@@ -1761,7 +1817,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionBools,              activate_air_filtration_on_completion))
     ((ConfigOptionInts,               during_print_exhaust_fan_speed))
     ((ConfigOptionInts,               complete_print_exhaust_fan_speed))
-    ((ConfigOptionFloatOrPercent,     initial_layer_line_width))
+    ((ConfigOptionFloatsOrPercentsNullable, initial_layer_line_width))
     ((ConfigOptionFloat,              initial_layer_print_height))
     ((ConfigOptionFloatsNullable,     initial_layer_speed))
 
@@ -2322,7 +2378,22 @@ public:
     void         apply_only(const ConfigBase &other, const t_config_option_keys &keys, bool ignore_nonexistent = false) { m_data.apply_only(other, keys, ignore_nonexistent); this->touch(); }
     bool         set_key_value(const std::string &opt_key, ConfigOption *opt) { bool out = m_data.set_key_value(opt_key, opt); this->touch(); return out; }
     template<typename T>
-    void         set(const std::string &opt_key, T value) { m_data.set(opt_key, value, true); this->touch(); }
+    void         set(const std::string &opt_key, T value) {
+        if constexpr (std::is_arithmetic_v<T> && !std::is_same_v<std::remove_cv_t<T>, bool>) {
+            const ConfigOptionDef *def = print_config_def.get(opt_key);
+            const bool line_width_key = opt_key == "line_width" ||
+                (opt_key.size() >= 11 && opt_key.compare(opt_key.size() - 11, 11, "_line_width") == 0);
+            if (line_width_key && def != nullptr && def->type == coFloatsOrPercents) {
+                // Model configs historically stored these overrides as scalars. Keep that
+                // representation so applying an old-style object override broadcasts it.
+                m_data.set_key_value(opt_key, new ConfigOptionFloatOrPercent(double(value), false));
+                this->touch();
+                return;
+            }
+        }
+        m_data.set(opt_key, value, true);
+        this->touch();
+    }
     void         set_deserialize(const t_config_option_key &opt_key, const std::string &str, ConfigSubstitutionContext &substitution_context, bool append = false)
         { m_data.set_deserialize(opt_key, str, substitution_context, append); this->touch(); }
     bool         erase(const t_config_option_key &opt_key) { bool out = m_data.erase(opt_key); if (out) this->touch(); return out; }
@@ -2395,6 +2466,8 @@ static void set_flush_volumes_matrix(std::vector<T> &out_matrix, const std::vect
 }
 
 size_t get_extruder_index(const GCodeConfig& config, unsigned int filament_id);
+size_t get_extruder_index_from_filament_id(const GCodeConfig& config, unsigned int filament_id);
+size_t get_print_config_index_from_filament_id(const GCodeConfig& config, unsigned int filament_id);
 
 } // namespace Slic3r
 

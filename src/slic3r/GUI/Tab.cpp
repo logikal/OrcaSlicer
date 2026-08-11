@@ -2256,6 +2256,14 @@ void Tab::on_value_change(const std::string& opt_key, const boost::any& value)
         }
     }
 
+    static const std::unordered_set<std::string> feature_filament_keys{
+        "outer_wall_filament_id", "inner_wall_filament_id", "sparse_infill_filament_id",
+        "internal_solid_filament_id", "top_surface_filament_id", "bottom_surface_filament_id",
+        "support_filament", "support_interface_filament",
+    };
+    if (feature_filament_keys.count(opt_key) != 0 && m_config->opt_int(opt_key) > 0)
+        wxGetApp().plater()->pin_feature_filament_map_if_needed(opt_key);
+
     if (m_postpone_update_ui) {
         // It means that not all values are rolled to the system/last saved values jet.
         // And call of the update() can causes a redundant check of the config values,
@@ -2425,7 +2433,7 @@ void Tab::on_presets_changed()
 
         // Trigger per-vendor preset update check
         const Preset& printer_preset = m_preset_bundle->printers.get_edited_preset();
-        if (printer_preset.vendor) {
+        if (printer_preset.vendor && !wxGetApp().is_gui_smoke()) {
             wxGetApp().get_preset_updater()->check_vendor_update(printer_preset.vendor->id);
         }
     }
@@ -2631,14 +2639,14 @@ void TabPrint::build()
         optgroup->append_single_option_line("initial_layer_print_height","quality_settings_layer_height");
 
         optgroup = page->new_optgroup(L("Line width"), L"param_line_width");
-        optgroup->append_single_option_line("line_width","quality_settings_line_width");
-        optgroup->append_single_option_line("initial_layer_line_width","quality_settings_line_width#first-layer");
-        optgroup->append_single_option_line("outer_wall_line_width","quality_settings_line_width#outer-wall");
-        optgroup->append_single_option_line("inner_wall_line_width","quality_settings_line_width#inner-wall");
-        optgroup->append_single_option_line("top_surface_line_width","quality_settings_line_width#top-surface");
-        optgroup->append_single_option_line("sparse_infill_line_width","quality_settings_line_width#sparse-infill");
-        optgroup->append_single_option_line("internal_solid_infill_line_width","quality_settings_line_width#internal-solid-infill");
-        optgroup->append_single_option_line("support_line_width","quality_settings_line_width#support");
+        optgroup->append_single_option_line("line_width","quality_settings_line_width", 0);
+        optgroup->append_single_option_line("initial_layer_line_width","quality_settings_line_width#first-layer", 0);
+        optgroup->append_single_option_line("outer_wall_line_width","quality_settings_line_width#outer-wall", 0);
+        optgroup->append_single_option_line("inner_wall_line_width","quality_settings_line_width#inner-wall", 0);
+        optgroup->append_single_option_line("top_surface_line_width","quality_settings_line_width#top-surface", 0);
+        optgroup->append_single_option_line("sparse_infill_line_width","quality_settings_line_width#sparse-infill", 0);
+        optgroup->append_single_option_line("internal_solid_infill_line_width","quality_settings_line_width#internal-solid-infill", 0);
+        optgroup->append_single_option_line("support_line_width","quality_settings_line_width#support", 0);
         optgroup->append_single_option_line("bridge_line_width","quality_settings_line_width#bridge");
 
         optgroup = page->new_optgroup(L("Seam"), L"param_seam");
@@ -2797,8 +2805,8 @@ void TabPrint::build()
         optgroup->append_single_option_line("skeleton_infill_density", "strength_settings_patterns#locked-zag");
         optgroup->append_single_option_line("infill_lock_depth", "strength_settings_patterns#locked-zag");
         optgroup->append_single_option_line("skin_infill_depth", "strength_settings_patterns#locked-zag");
-        optgroup->append_single_option_line("skin_infill_line_width", "strength_settings_patterns#locked-zag");
-        optgroup->append_single_option_line("skeleton_infill_line_width", "strength_settings_patterns#locked-zag");
+        optgroup->append_single_option_line("skin_infill_line_width", "strength_settings_patterns#locked-zag", 0);
+        optgroup->append_single_option_line("skeleton_infill_line_width", "strength_settings_patterns#locked-zag", 0);
         optgroup->append_single_option_line("symmetric_infill_y_axis", "strength_settings_infill#symmetric-infill-y-axis");
         optgroup->append_single_option_line("infill_shift_step", "strength_settings_patterns#cross-hatch");
         optgroup->append_single_option_line("lateral_lattice_angle_1", "strength_settings_patterns#lateral-lattice");
@@ -2847,7 +2855,7 @@ void TabPrint::build()
         optgroup->append_single_option_line("ironing_speed", "speed_settings_other_layers_speed#ironing-speed");
         optgroup->append_single_option_line("support_speed", "speed_settings_other_layers_speed#support", 0);
         optgroup->append_single_option_line("support_interface_speed", "speed_settings_other_layers_speed#support-interface", 0);
-        optgroup->append_single_option_line("small_support_perimeter_speed", "speed_settings_other_layers_speed#small-tree-support-perimeters", 0);
+        optgroup->append_single_option_line("small_support_perimeter_speed", "speed_settings_other_layers_speed#small-tree-support-perimeters");
         optgroup->append_single_option_line("small_support_perimeter_threshold", "speed_settings_other_layers_speed#small-tree-support-perimeters-threshold", 0);
         optgroup = page->new_optgroup(L("Overhang speed"), L"param_overhang_speed", 15);
         optgroup->append_single_option_line("enable_overhang_speed", "speed_settings_overhang_speed#slow-down-for-overhang", 0);
@@ -3000,6 +3008,45 @@ void TabPrint::build()
         optgroup->append_single_option_line("top_surface_filament_id", "multimaterial_settings_filament_for_features#top-surface");
         optgroup->append_single_option_line("bottom_surface_filament_id", "multimaterial_settings_filament_for_features#bottom-surface");
         optgroup->append_single_option_line("wipe_tower_filament", "multimaterial_settings_filament_for_features#wipe-tower");
+
+        if (m_type == Preset::TYPE_PRINT) {
+            Line detail_nozzle_line = { "", "" };
+            detail_nozzle_line.full_width = 1;
+            detail_nozzle_line.widget = [](wxWindow *parent) {
+                auto *sizer = new wxBoxSizer(wxHORIZONTAL);
+                auto *label = new wxStaticText(parent, wxID_ANY, _L("Print fine details with") + ":");
+                auto *combo = new ComboBox(parent, wxID_ANY, wxEmptyString, wxDefaultPosition,
+                                           wxSize(30 * wxGetApp().em_unit(), -1), 0, nullptr, wxCB_READONLY);
+                combo->SetName("detail_nozzle_control");
+                sizer->Add(label, 0, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+                sizer->Add(combo, 0, wxALIGN_CENTER_VERTICAL);
+                register_detail_nozzle_control(combo, sizer);
+                return sizer;
+            };
+            optgroup->append_line(detail_nozzle_line);
+        }
+
+        // Reuses the sibling group's icon; no dedicated param_process_for_features.svg exists.
+        optgroup = page->new_optgroup(L("Process for Features"), L"param_filament_for_features");
+        optgroup->append_single_option_line("wall_process_policy", "multimaterial_settings_process_for_features#walls");
+        Option wall_process_preset = optgroup->get_option("wall_process_preset");
+        // Keep the config option a free-form preset-name string; only its GUI is a dynamic choice.
+        // TabPrintModel reuses this page, so object/part/modifier panels get the same control.
+        wall_process_preset.opt.gui_type = ConfigOptionDef::GUIType::i_enum_open;
+        optgroup->append_single_option_line(wall_process_preset, "multimaterial_settings_process_for_features#walls");
+
+        if (m_type == Preset::TYPE_PRINT) {
+            Line process_resolution_line = { "", "" };
+            process_resolution_line.full_width = 1;
+            process_resolution_line.widget = [](wxWindow *parent) {
+                auto *sizer = new wxBoxSizer(wxHORIZONTAL);
+                auto *readout = new wxStaticText(parent, wxID_ANY, _L("Resolves to: unavailable"));
+                register_feature_process_readout(readout);
+                sizer->Add(readout, 1, wxEXPAND);
+                return sizer;
+            };
+            optgroup->append_line(process_resolution_line);
+        }
 
         optgroup = page->new_optgroup(L("Ooze prevention"), L"param_ooze_prevention");
         optgroup->append_single_option_line("ooze_prevention", "multimaterial_settings_ooze_prevention");

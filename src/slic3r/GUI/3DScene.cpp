@@ -1067,10 +1067,21 @@ float GLVolumeCollection::get_selection_support_normal_z() const
         // Use wall extruder's nozzle diameter for better estimation of external perimeter width,
         // which is more relevant to overhang printing than the default nozzle diameter.
         const double nozzle_diameter = nozzle_diameter_opt->values[wall_extruder_idx];
+        size_t wall_config_idx = wall_extruder_idx;
+        if (const auto *filament_map = full_cfg.option<ConfigOptionInts>("filament_map_2");
+            filament_map != nullptr && wall_filament_id > 0 && size_t(wall_filament_id) <= filament_map->values.size()) {
+            const int mapped = filament_map->get_at(size_t(wall_filament_id - 1));
+            if (mapped >= 0)
+                wall_config_idx = size_t(mapped);
+        }
 
-        double external_perimeter_width = full_cfg.get_abs_value("outer_wall_line_width", nozzle_diameter);
+        double external_perimeter_width = full_cfg.option<ConfigOptionFloatsOrPercentsNullable>("outer_wall_line_width")
+                                              ->get_at(wall_config_idx)
+                                              .get_abs_value(nozzle_diameter);
         if (external_perimeter_width <= 0.0) {
-            external_perimeter_width = full_cfg.get_abs_value("line_width", nozzle_diameter);
+            external_perimeter_width = full_cfg.option<ConfigOptionFloatsOrPercentsNullable>("line_width")
+                                           ->get_at(wall_config_idx)
+                                           .get_abs_value(nozzle_diameter);
 
             if (external_perimeter_width <= 0.0)
                 external_perimeter_width = nozzle_diameter;

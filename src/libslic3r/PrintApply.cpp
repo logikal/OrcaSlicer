@@ -306,6 +306,21 @@ static t_config_option_keys full_print_config_diffs(const DynamicPrintConfig &cu
     return full_config_diff;
 }
 
+static void normalize_legacy_line_width_vectors(DynamicPrintConfig &config)
+{
+    for (const std::string &key : print_options_with_variant) {
+        const ConfigOptionDef *definition = print_config_def.get(key);
+        const auto *legacy = dynamic_cast<const ConfigOptionFloatOrPercent *>(config.option(key));
+        const bool line_width_key = key == "line_width" ||
+            (key.size() >= 11 && key.compare(key.size() - 11, 11, "_line_width") == 0);
+        if (!line_width_key || definition == nullptr || definition->type != coFloatsOrPercents || legacy == nullptr)
+            continue;
+        auto *values = new ConfigOptionFloatsOrPercentsNullable;
+        values->values.emplace_back(legacy->value, legacy->percent);
+        config.set_key_value(key, values);
+    }
+}
+
 static bool is_printable_filament_changed(const DynamicPrintConfig& new_full_config, const Polygon& old_poly, const Polygon& new_poly)
 {
     if (old_poly != new_poly) {
@@ -736,7 +751,33 @@ PrintObjectRegions::BoundingBox find_modifier_volume_extents(const PrintObjectRe
     return out;
 }
 
-PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &default_or_parent_region_config, const DynamicPrintConfig *layer_range_config, const ModelVolume &volume, size_t num_extruders, std::vector<int>& variant_index);
+PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &default_or_parent_region_config,
+                                                  const PrintRegionConfig &global_region_defaults,
+                                                  const DynamicPrintConfig *layer_range_config,
+                                                  const ModelVolume &volume, size_t num_extruders,
+                                                  std::vector<int>& variant_index, const PrintConfig &print_config,
+                                                  unsigned int inherited_base_filament, double object_layer_height,
+                                                  const t_config_option_keys *inherited_explicit_keys,
+                                                  unsigned int *resolved_base_filament,
+                                                  t_config_option_keys *resolved_explicit_keys);
+
+static PrintRegionConfig painted_region_config(const PrintObjectRegions::LayerRangeRegions &layer_range,
+                                               int parent_region_id, unsigned int painted_filament,
+                                               const PrintConfig &print_config,
+                                               const PrintRegionConfig &global_region_defaults,
+                                               double object_layer_height)
+{
+    PrintRegionConfig cfg = layer_range.volume_regions[parent_region_id].region->config();
+    cfg.outer_wall_filament_id.value = painted_filament;
+    cfg.inner_wall_filament_id.value = painted_filament;
+    cfg.internal_solid_filament_id.value = painted_filament;
+    cfg.top_surface_filament_id.value = painted_filament;
+    cfg.bottom_surface_filament_id.value = painted_filament;
+    cfg.sparse_infill_filament_id.value = painted_filament;
+    apply_filament_process_delta(cfg, print_config, global_region_defaults, painted_filament, object_layer_height,
+                                 layer_range.volume_regions[parent_region_id].explicit_keys);
+    return cfg;
+}
 
 void print_region_ref_inc(PrintRegion &r) { ++ r.m_ref_cnt; }
 void print_region_ref_reset(PrintRegion &r) { r.m_ref_cnt = 0; }
@@ -749,6 +790,8 @@ bool verify_update_print_object_regions(
     ModelVolumePtrs                     model_volumes,
     const PrintRegionConfig            &default_region_config,
     size_t                              num_extruders,
+    const PrintConfig                  &print_config,
+    double                              object_layer_height,
     PrintObjectRegions                 &print_object_regions,
     const std::function<void(const PrintRegionConfig&, const PrintRegionConfig&, const t_config_option_keys&)> &callback_invalidate,
     std::vector<int>& variant_index)
@@ -796,16 +839,30 @@ bool verify_update_print_object_regions(
                             } else if (PrintObjectRegions::BoundingBox parent_bbox = find_modifier_volume_extents(layer_range, parent_region_id); parent_bbox.intersects(*bbox))
                                 // Such parent region does not exist. If it is needed, then we need to reslice.
                                 // Only create new region for a modifier, which actually modifies config of it's parent.
-                                if (PrintRegionConfig config = region_config_from_model_volume(parent_region.region->config(), nullptr, **it_model_volume, num_extruders, variant_index);
+                                if (PrintRegionConfig config = region_config_from_model_volume(
+                                        parent_region.region->config(), default_region_config, nullptr, **it_model_volume, num_extruders, variant_index,
+                                        print_config, parent_region.base_filament, object_layer_height,
+                                        &parent_region.explicit_keys, nullptr, nullptr);
                                     config != parent_region.region->config())
                                     // This modifier newly overrides a region, which it did not before. We need to reslice.
                                     return false;
                         }
                     }
                 }
+                unsigned int resolved_base_filament = 1;
+                t_config_option_keys resolved_explicit_keys;
                 PrintRegionConfig cfg = region.parent == -1 ?
-                    region_config_from_model_volume(default_region_config, layer_range.config, **it_model_volume, num_extruders, variant_index) :
-                    region_config_from_model_volume(layer_range.volume_regions[region.parent].region->config(), nullptr, **it_model_volume, num_extruders, variant_index);
+                    region_config_from_model_volume(default_region_config, default_region_config, layer_range.config, **it_model_volume, num_extruders,
+                                                    variant_index, print_config, 1, object_layer_height, nullptr,
+                                                    &resolved_base_filament, &resolved_explicit_keys) :
+                    region_config_from_model_volume(layer_range.volume_regions[region.parent].region->config(), default_region_config, nullptr,
+                                                    **it_model_volume, num_extruders, variant_index, print_config,
+                                                    layer_range.volume_regions[region.parent].base_filament,
+                                                    object_layer_height,
+                                                    &layer_range.volume_regions[region.parent].explicit_keys,
+                                                    &resolved_base_filament, &resolved_explicit_keys);
+                region.base_filament = resolved_base_filament;
+                region.explicit_keys = std::move(resolved_explicit_keys);
                 if (cfg != region.region->config()) {
                     // Region configuration changed.
                     if (print_region_ref_cnt(*region.region) == 0) {
@@ -826,14 +883,8 @@ bool verify_update_print_object_regions(
     // Verify and / or update PrintRegions produced by color painting.
     for (const PrintObjectRegions::LayerRangeRegions &layer_range : print_object_regions.layer_ranges)
         for (const PrintObjectRegions::PaintedRegion &region : layer_range.painted_regions) {
-            const PrintObjectRegions::VolumeRegion &parent_region   = layer_range.volume_regions[region.parent];
-            PrintRegionConfig                       cfg             = parent_region.region->config();
-            cfg.outer_wall_filament_id.value = region.extruder_id;
-            cfg.inner_wall_filament_id.value = region.extruder_id;
-            cfg.internal_solid_filament_id.value = region.extruder_id;
-            cfg.top_surface_filament_id.value = region.extruder_id;
-            cfg.bottom_surface_filament_id.value = region.extruder_id;
-            cfg.sparse_infill_filament_id.value       = region.extruder_id;
+            PrintRegionConfig cfg = painted_region_config(
+                layer_range, region.parent, region.extruder_id, print_config, default_region_config, object_layer_height);
             if (cfg != region.region->config()) {
                 // Region configuration changed.
                 if (print_region_ref_cnt(*region.region) == 0) {
@@ -975,6 +1026,8 @@ static PrintObjectRegions* generate_print_object_regions(
     const PrintRegionConfig                     &default_region_config,
     const Transform3d                           &trafo,
     size_t                                       num_extruders,
+    const PrintConfig                           &print_config,
+    double                                       object_layer_height,
     const float                                  xy_contour_compensation,
     const std::vector<unsigned int>             &painting_extruders,
     std::vector<int>                            &variant_index,
@@ -1034,10 +1087,15 @@ static PrintObjectRegions* generate_print_object_regions(
                 if (const PrintObjectRegions::BoundingBox *bbox = find_volume_extents(layer_range, volume); bbox) {
                     if (volume.is_model_part()) {
                         // Add a model volume, assign an existing region or generate a new one.
+                        unsigned int base_filament = 1;
+                        t_config_option_keys explicit_keys;
+                        PrintRegionConfig config = region_config_from_model_volume(
+                            default_region_config, default_region_config, layer_range.config, volume, num_extruders, variant_index, print_config,
+                            1, object_layer_height, nullptr, &base_filament, &explicit_keys);
                         layer_range.volume_regions.push_back({
                             &volume, -1,
-                            get_create_region(region_config_from_model_volume(default_region_config, layer_range.config, volume, num_extruders, variant_index)),
-                            bbox
+                            get_create_region(std::move(config)),
+                            bbox, base_filament, std::move(explicit_keys)
                         });
                     } else if (volume.is_negative_volume()) {
                         // Add a negative (subtractor) volume. Such volume has neither region nor parent volume assigned.
@@ -1053,10 +1111,16 @@ static PrintObjectRegions* generate_print_object_regions(
                             if (parent_volume.is_model_part() || parent_volume.is_modifier())
                                 if (PrintObjectRegions::BoundingBox parent_bbox = find_modifier_volume_extents(layer_range, parent_region_id); parent_bbox.intersects(*bbox)) {
                                     // Only create new region for a modifier, which actually modifies config of it's parent.
-                                    if (PrintRegionConfig config = region_config_from_model_volume(parent_region.region->config(), nullptr, volume, num_extruders, variant_index);
-                                        config != parent_region.region->config()) {
+                                    unsigned int base_filament = parent_region.base_filament;
+                                    t_config_option_keys explicit_keys;
+                                    PrintRegionConfig config = region_config_from_model_volume(
+                                        parent_region.region->config(), default_region_config, nullptr, volume, num_extruders, variant_index,
+                                        print_config, parent_region.base_filament, object_layer_height,
+                                        &parent_region.explicit_keys, &base_filament, &explicit_keys);
+                                    if (config != parent_region.region->config()) {
                                         added = true;
-                                        layer_range.volume_regions.push_back({ &volume, parent_region_id, get_create_region(std::move(config)), bbox });
+                                        layer_range.volume_regions.push_back({ &volume, parent_region_id,
+                                            get_create_region(std::move(config)), bbox, base_filament, std::move(explicit_keys) });
                                     } else if (parent_model_part_id == -1 && parent_volume.is_model_part())
                                         parent_model_part_id = parent_region_id;
                                 }
@@ -1064,7 +1128,10 @@ static PrintObjectRegions* generate_print_object_regions(
                         if (! added && parent_model_part_id >= 0)
                             // This modifier does not override any printable volume's configuration, however it may in the future.
                             // Store it so that verify_update_print_object_regions() will handle this modifier correctly if its configuration changes.
-                            layer_range.volume_regions.push_back({ &volume, parent_model_part_id, layer_range.volume_regions[parent_model_part_id].region, bbox });
+                            layer_range.volume_regions.push_back({ &volume, parent_model_part_id,
+                                layer_range.volume_regions[parent_model_part_id].region, bbox,
+                                layer_range.volume_regions[parent_model_part_id].base_filament,
+                                layer_range.volume_regions[parent_model_part_id].explicit_keys });
                     }
                 }
             }
@@ -1076,13 +1143,8 @@ static PrintObjectRegions* generate_print_object_regions(
             for (int parent_region_id = 0; parent_region_id < int(layer_range.volume_regions.size()); ++ parent_region_id)
                 if (const PrintObjectRegions::VolumeRegion &parent_region = layer_range.volume_regions[parent_region_id];
                     parent_region.model_volume->is_model_part() || parent_region.model_volume->is_modifier()) {
-                    PrintRegionConfig cfg = parent_region.region->config();
-                    cfg.outer_wall_filament_id.value = painted_extruder_id;
-                    cfg.inner_wall_filament_id.value = painted_extruder_id;
-                    cfg.internal_solid_filament_id.value = painted_extruder_id;
-                    cfg.top_surface_filament_id.value = painted_extruder_id;
-                    cfg.bottom_surface_filament_id.value = painted_extruder_id;
-                    cfg.sparse_infill_filament_id.value       = painted_extruder_id;
+                    PrintRegionConfig cfg = painted_region_config(
+                        layer_range, parent_region_id, painted_extruder_id, print_config, default_region_config, object_layer_height);
                     layer_range.painted_regions.push_back({ painted_extruder_id, parent_region_id, get_create_region(std::move(cfg))});
                 }
         // Sort the regions by parent region::print_object_region_id() and extruder_id to help the slicing algorithm when applying MM segmentation.
@@ -1132,6 +1194,19 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     //BBS: add more logs
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", Line %1%: enter")%__LINE__;
+
+    // Bundle composition already applied the overlay with sibling-preset limits. This defensive
+    // source-free pass is safe because unchanged diameters are skipped, so the composed values remain intact.
+    apply_project_nozzle_diameters(new_full_config);
+    // The overlay is project-layer input, not slicing state. Downstream consumers use the
+    // effective nozzle/min/max values; dropping the consumed key also keeps an empty overlay
+    // byte-identical in the exported full-config block.
+    new_full_config.erase("project_nozzle_diameter");
+
+    // Programmatic and old project configs may still carry pre-promotion scalar widths.
+    // Normalize them before variant expansion, diffing, and static-config application.
+    normalize_legacy_line_width_vectors(new_full_config);
+
     // Normalize the config.
 	new_full_config.option("print_settings_id",            true);
 	new_full_config.option("filament_settings_id",         true);
@@ -1364,6 +1439,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
 
     // Do not use the ApplyStatus as we will use the max function when updating apply_status.
     unsigned int apply_status = APPLY_STATUS_UNCHANGED;
+    const bool filament_process_projection_changed =
+        std::find(print_diff.begin(), print_diff.end(), "filament_process_projection") != print_diff.end();
     auto update_apply_status = [&apply_status](bool invalidated)
         { apply_status = std::max<unsigned int>(apply_status, invalidated ? APPLY_STATUS_INVALIDATED : APPLY_STATUS_CHANGED); };
     if (! (print_diff.empty() && object_diff.empty() && region_diff.empty())) {
@@ -1612,8 +1689,10 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             bool object_config_changed = ! model_object.config.timestamp_matches(model_object_new.config);
 			if (object_config_changed)
 				model_object.config.assign_config(model_object_new.config);
-            if (! object_diff.empty() || object_config_changed || num_extruders_changed ) {
-                PrintObjectConfig new_config = PrintObject::object_config_from_model_object(m_default_object_config, model_object, num_extruders, print_variant_index);
+            if (!object_diff.empty() || object_config_changed || num_extruders_changed ||
+                filament_process_projection_changed) {
+                PrintObjectConfig new_config = PrintObject::object_config_from_model_object(
+                    m_default_object_config, model_object, num_extruders, print_variant_index, m_config);
                 for (const PrintObjectStatus &print_object_status : print_object_status_db.get_range(model_object)) {
                     t_config_option_keys diff = print_object_status.print_object->config().diff(new_config);
                     if (! diff.empty()) {
@@ -1682,7 +1761,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
             auto print_object_apply_config = [this, &print_object_last, model_object, num_extruders, &print_variant_index](PrintObject *print_object) {
                 print_object->config_apply(print_object_last ?
                     print_object_last->config() :
-                    PrintObject::object_config_from_model_object(m_default_object_config, *model_object, num_extruders, print_variant_index));
+                    PrintObject::object_config_from_model_object(
+                        m_default_object_config, *model_object, num_extruders, print_variant_index, m_config));
                 print_object_last = print_object;
             };
             if (old.empty()) {
@@ -1756,7 +1836,20 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
     }
 
     //BBS: check the config again
-    int new_used_filaments = this->extruders(true).size();
+    // Region configs may not exist yet on the first apply for new objects, making per-feature
+    // filament ids (wall/infill/surface overrides) invisible to extruders(); a print whose
+    // multi-filament usage is expressed only through those ids would be misclassified as
+    // single-filament and lose e.g. its prime tower. The default region config was already
+    // refreshed from new_full_config above, so union its feature extruders in.
+    std::vector<unsigned int> new_used_filament_ids = this->extruders(true);
+    {
+        std::vector<unsigned int> feature_extruders;
+        PrintRegion::collect_object_printing_extruders(m_config, m_default_region_config,
+                                                       /*has_brim=*/false, feature_extruders);
+        new_used_filament_ids.insert(new_used_filament_ids.end(), feature_extruders.begin(), feature_extruders.end());
+        sort_remove_duplicates(new_used_filament_ids);
+    }
+    int new_used_filaments = int(new_used_filament_ids.size());
     t_config_option_keys new_changed_keys = new_full_config.normalize_fdm_2(objects().size(), new_used_filaments);
     if (new_changed_keys.size() > 0) {
         BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(", got new_changed_keys, size=%1%")%new_changed_keys.size();
@@ -1855,6 +1948,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                     print_object.model_object()->volumes,
                     m_default_region_config,
                     num_extruders,
+                    m_config,
+                    print_object.config().layer_height.value,
                     *print_object_regions,
                     [it_print_object, it_print_object_end, &update_apply_status](const PrintRegionConfig &old_config, const PrintRegionConfig &new_config, const t_config_option_keys &diff_keys) {
                         for (auto it = it_print_object; it != it_print_object_end; ++it)
@@ -1881,6 +1976,8 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 m_default_region_config,
                 model_object_status.print_instances.front().trafo,
                 num_extruders ,
+                m_config,
+                print_object.config().layer_height.value,
                 print_object.is_mm_painted() ? 0.f : float(print_object.config().xy_contour_compensation.value),
                 painting_extruders,
                 print_variant_index,

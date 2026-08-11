@@ -1,9 +1,16 @@
 #include "FilamentMapPanel.hpp"
 #include "GUI_App.hpp"
+#include "MsgDialog.hpp"
 #include "Plater.hpp"
+#include "format.hpp"
 #include "Widgets/MultiNozzleSync.hpp" // manuallySetNozzleCount producer for extruder_nozzle_stats
+#include "libslic3r/FeatureProcessResolver.hpp"
+#include "libslic3r/PresetBundle.hpp"
+#include "libslic3r/Utils.hpp"
 #include <algorithm>
+#include <wx/choice.h>
 #include <wx/dcbuffer.h>
+#include <wx/numformatter.h>
 #include <wx/utils.h>
 #include "wx/graphics.h"
 
@@ -23,6 +30,307 @@ static const wxColour TextDisableColor = wxColour("#CECECE");
 static const wxColour TextErrorColor = wxColour("#E14747");
 
 wxDEFINE_EVENT(wxEVT_INVALID_MANUAL_MAP, wxCommandEvent);
+
+namespace {
+
+wxString process_number(double value)
+{
+    return wxNumberFormatter::ToString(value, 3, wxNumberFormatter::Style_NoTrailingZeroes);
+}
+
+FilamentProcessPolicy filament_process_policy_at(const DynamicPrintConfig &config, size_t index)
+{
+    const auto *policies = config.option<ConfigOptionEnumsGeneric>("filament_process_policy");
+    if (policies == nullptr || index >= policies->values.size())
+        return FilamentProcessPolicy::AutoNozzleVariant;
+    if (policies->values[index] == int(FilamentProcessPolicy::Pinned))
+        return FilamentProcessPolicy::Pinned;
+    if (policies->values[index] == int(FilamentProcessPolicy::GlobalProcess))
+        return FilamentProcessPolicy::GlobalProcess;
+    return FilamentProcessPolicy::AutoNozzleVariant;
+}
+
+std::string filament_process_preset_at(const DynamicPrintConfig &config, size_t index)
+{
+    const auto *presets = config.option<ConfigOptionStrings>("filament_process_preset");
+    return presets == nullptr || index >= presets->values.size() ? std::string() : presets->values[index];
+}
+
+void apply_filament_process_choice(unsigned int filament_id, int command)
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr || filament_id == 0)
+        return;
+    if (command == 0) {
+        set_filament_process_selection(filament_id - 1, FilamentProcessPolicy::AutoNozzleVariant, {});
+        return;
+    }
+    if (command == 1) {
+        set_filament_process_selection(filament_id - 1, FilamentProcessPolicy::GlobalProcess, {});
+        return;
+    }
+
+    DynamicPrintConfig full_config = bundle->full_config();
+    FilamentProcessRequest request;
+    request.filament_id = filament_id;
+    request.bundle = bundle;
+    request.full_config = &full_config;
+    const std::vector<FeatureProcessCandidate> candidates = enumerate_filament_process_candidates(request);
+    const size_t candidate_index = size_t(command - 2);
+    if (candidate_index < candidates.size())
+        set_filament_process_selection(filament_id - 1, FilamentProcessPolicy::Pinned,
+                                       candidates[candidate_index].preset_name);
+}
+
+} // namespace
+
+wxString feature_process_rejection_text(FeatureProcessRejection rejection, double preset_nozzle)
+{
+    switch (rejection) {
+    case FeatureProcessRejection::None:
+        return {};
+    case FeatureProcessRejection::PresetMissing:
+        return _L("preset is missing");
+    case FeatureProcessRejection::PrinterModelMismatch:
+        return _L("for a different printer model");
+    case FeatureProcessRejection::NozzleMismatch:
+        return preset_nozzle > 0. ?
+                   format_wxstr(_L("needs %1% mm nozzle"), process_number(preset_nozzle)) :
+                   _L("needs a different nozzle");
+    case FeatureProcessRejection::LayerHeightNotDivisor:
+        return _L("layer height does not divide the object layer height");
+    case FeatureProcessRejection::LayerHeightOutOfToolRange:
+        return _L("layer height is outside the tool range");
+    case FeatureProcessRejection::NoVariantFound:
+        return _L("no compatible process preset found");
+    case FeatureProcessRejection::PolicyRequiresMatchingNozzle:
+        return _L("object process requires a matching nozzle");
+    case FeatureProcessRejection::NoBundle:
+        return _L("process presets are unavailable");
+    }
+    return _L("incompatible");
+}
+
+bool set_filament_process_selection(size_t filament_index, FilamentProcessPolicy policy,
+                                    const std::string &preset_name)
+{
+    PresetBundle *bundle = wxGetApp().preset_bundle;
+    if (bundle == nullptr)
+        return false;
+
+    DynamicPrintConfig &project_config = bundle->project_config;
+    auto *policies = project_config.option<ConfigOptionEnumsGeneric>("filament_process_policy", true);
+    auto *presets = project_config.option<ConfigOptionStrings>("filament_process_preset", true);
+    auto *projections = project_config.option<ConfigOptionStrings>("filament_process_projection", true);
+    const size_t size = std::max(bundle->filament_presets.size(), filament_index + 1);
+    policies->values.resize(size, int(FilamentProcessPolicy::AutoNozzleVariant));
+    presets->values.resize(size, "");
+    projections->values.resize(size, "");
+
+    const FilamentProcessPolicy previous_policy = filament_process_policy_at(project_config, filament_index);
+    const std::string stored_preset = policy == FilamentProcessPolicy::Pinned ? preset_name : std::string();
+    const bool changed = policies->values[filament_index] != int(policy) ||
+                         presets->values[filament_index] != stored_preset;
+    if (changed) {
+        policies->values[filament_index] = int(policy);
+        presets->values[filament_index] = stored_preset;
+        projections->values[filament_index].clear();
+        if (Plater *plater = wxGetApp().plater(); plater != nullptr) {
+            plater->update_project_dirty_from_presets();
+            if (policy == FilamentProcessPolicy::GlobalProcess &&
+                previous_policy != FilamentProcessPolicy::GlobalProcess)
+                plater->clear_auto_feature_process_state_for_filament(unsigned(filament_index + 1));
+        }
+    }
+    if (Plater *plater = wxGetApp().plater(); plater != nullptr)
+        plater->schedule_background_process();
+    return changed;
+}
+
+struct FilamentProcessPanel::priv
+{
+    struct Item {
+        int                     command = 0;
+        std::string             preset_name;
+        wxString                label;
+        bool                    compatible = true;
+        FeatureProcessRejection rejection = FeatureProcessRejection::None;
+        double                  preset_nozzle = 0.;
+    };
+    struct Row {
+        unsigned int      filament_id = 0;
+        Label            *nozzle = nullptr;
+        wxChoice         *choice = nullptr;
+        std::vector<Item> items;
+        int               selected = wxNOT_FOUND;
+    };
+
+    FilamentProcessPanel *q;
+    std::vector<Row>      rows;
+    bool                  m_disable_change_event = false;
+
+    priv(FilamentProcessPanel *q, const std::vector<int> &filaments) : q(q)
+    {
+        auto *sizer = new wxFlexGridSizer(3, q->FromDIP(6), q->FromDIP(10));
+        sizer->AddGrowableCol(2, 1);
+        auto add_header = [this, sizer](const wxString &text) {
+            auto *label = new Label(this->q, text);
+            label->SetFont(Label::Body_13);
+            sizer->Add(label, 0, wxALIGN_CENTER_VERTICAL);
+        };
+        add_header(_L("Filament"));
+        add_header(_L("Nozzle"));
+        add_header(_L("Process"));
+
+        for (int filament : filaments) {
+            if (filament <= 0)
+                continue;
+            Row row;
+            row.filament_id = unsigned(filament);
+            auto *filament_label = new Label(q, format_wxstr(_L("Filament %1%"), filament));
+            row.nozzle = new Label(q, wxEmptyString);
+            row.choice = new wxChoice(q, wxID_ANY);
+            row.choice->SetMinSize(wxSize(q->FromDIP(430), -1));
+            const size_t row_index = rows.size();
+            row.choice->Bind(wxEVT_CHOICE, [this, row_index](wxCommandEvent &event) {
+                if (m_disable_change_event || row_index >= rows.size())
+                    return;
+                Row &row = rows[row_index];
+                const int selection = row.choice->GetSelection();
+                if (selection < 0 || size_t(selection) >= row.items.size())
+                    return;
+                const Item &item = row.items[size_t(selection)];
+                if (!item.compatible) {
+                    const bool was_suppressed = m_disable_change_event;
+                    m_disable_change_event = true;
+                    ScopeGuard restore_change_events([this, was_suppressed] {
+                        m_disable_change_event = was_suppressed;
+                    });
+                    row.choice->SetSelection(row.selected);
+                    MessageDialog dialog(this->q,
+                        format_wxstr(_L("This process cannot be used with the filament's nozzle: %1%."),
+                                     feature_process_rejection_text(item.rejection, item.preset_nozzle)),
+                        _L("Process is not compatible"), wxOK | wxICON_WARNING);
+                    dialog.ShowModal();
+                    return;
+                }
+                row.selected = selection;
+                const unsigned int filament_id = row.filament_id;
+                const int command = item.command;
+                // Applying the option schedules a background refresh which may rebuild dialog
+                // content. Leave the wx choice event stack first and capture no widget pointers.
+                wxGetApp().CallAfter([filament_id, command] {
+                    apply_filament_process_choice(filament_id, command);
+                });
+                event.Skip();
+            });
+            sizer->Add(filament_label, 0, wxALIGN_CENTER_VERTICAL);
+            sizer->Add(row.nozzle, 0, wxALIGN_CENTER_VERTICAL);
+            sizer->Add(row.choice, 1, wxEXPAND | wxALIGN_CENTER_VERTICAL);
+            rows.push_back(std::move(row));
+        }
+        q->SetSizer(sizer);
+    }
+
+    int selection_for(const Row &row, FilamentProcessPolicy policy, const std::string &preset_name) const
+    {
+        if (policy == FilamentProcessPolicy::AutoNozzleVariant)
+            return 0;
+        if (policy == FilamentProcessPolicy::GlobalProcess)
+            return 1;
+        const auto found = std::find_if(row.items.begin(), row.items.end(), [&preset_name](const Item &item) {
+            return item.command >= 2 && item.preset_name == preset_name;
+        });
+        return found == row.items.end() ? wxNOT_FOUND : int(std::distance(row.items.begin(), found));
+    }
+
+    void rebuild(const std::vector<int> &filament_map, const std::vector<int> &filament_volume_map)
+    {
+        PresetBundle *bundle = wxGetApp().preset_bundle;
+        if (bundle == nullptr)
+            return;
+        DynamicPrintConfig full_config = filament_map.empty() ? bundle->full_config() :
+                                             bundle->full_config(false, filament_map, filament_volume_map);
+
+        const bool was_suppressed = m_disable_change_event;
+        m_disable_change_event = true;
+        ScopeGuard restore_change_events([this, was_suppressed] {
+            m_disable_change_event = was_suppressed;
+        });
+
+        for (Row &row : rows) {
+            row.items.clear();
+            FilamentProcessRequest request;
+            request.filament_id = row.filament_id;
+            request.bundle = bundle;
+            request.full_config = &full_config;
+
+            FilamentProcessRequest automatic_request = request;
+            automatic_request.policy = FilamentProcessPolicy::AutoNozzleVariant;
+            const FilamentProcessResolution automatic = resolve_filament_process(automatic_request);
+            row.nozzle->SetLabel(format_wxstr(_L("%1% mm nozzle"), process_number(automatic.tool_nozzle)));
+            wxString automatic_label;
+            if (automatic.ok) {
+                const wxString target = automatic.display_label.empty() ?
+                                            (automatic.resolved_preset.empty() ? _L("Use the global process") :
+                                                                                from_u8(automatic.resolved_preset)) :
+                                            from_u8(automatic.display_label);
+                automatic_label = format_wxstr(_L("Automatic: %1%"), target);
+            } else {
+                automatic_label = format_wxstr(_L("Automatic (no match for %1% mm nozzle)"),
+                                               process_number(automatic.tool_nozzle));
+            }
+            row.items.push_back({0, {}, automatic_label, true, automatic.rejection, automatic.tool_nozzle});
+            row.items.push_back({1, {}, _L("Use the global process"), true, FeatureProcessRejection::None, 0.});
+
+            const std::vector<FeatureProcessCandidate> candidates = enumerate_filament_process_candidates(request);
+            for (size_t index = 0; index < candidates.size(); ++index) {
+                const FeatureProcessCandidate &candidate = candidates[index];
+                wxString label = format_wxstr(_L("%1% — %2% mm layers, %3% mm nozzle"),
+                                              from_u8(candidate.preset_name),
+                                              process_number(candidate.preset_layer_height),
+                                              process_number(candidate.preset_nozzle));
+                if (!candidate.compatible)
+                    label = format_wxstr(_L("%1% (%2%)"), label,
+                                         feature_process_rejection_text(candidate.why_not, candidate.preset_nozzle));
+                row.items.push_back({int(index + 2), candidate.preset_name, label, candidate.compatible,
+                                     candidate.why_not, candidate.preset_nozzle});
+            }
+
+            const size_t config_index = row.filament_id - 1;
+            const FilamentProcessPolicy policy = filament_process_policy_at(full_config, config_index);
+            const std::string preset_name = filament_process_preset_at(full_config, config_index);
+            int selection = selection_for(row, policy, preset_name);
+            if (policy == FilamentProcessPolicy::Pinned && selection == wxNOT_FOUND && !preset_name.empty()) {
+                row.items.push_back({-1, preset_name, format_wxstr(_L("%1% (missing)"), from_u8(preset_name)), false,
+                                     FeatureProcessRejection::PresetMissing, 0.});
+                selection = int(row.items.size() - 1);
+            }
+
+            row.choice->Clear();
+            for (const Item &item : row.items)
+                row.choice->Append(item.label);
+            row.selected = selection == wxNOT_FOUND ? 0 : selection;
+            row.choice->SetSelection(row.selected);
+        }
+        q->Layout();
+    }
+};
+
+FilamentProcessPanel::FilamentProcessPanel(wxWindow *parent, const std::vector<int> &filaments)
+    : wxPanel(parent), p(std::make_unique<priv>(this, filaments))
+{
+    SetBackgroundColour(*wxWHITE);
+    Rebuild();
+}
+
+FilamentProcessPanel::~FilamentProcessPanel() = default;
+
+void FilamentProcessPanel::Rebuild(const std::vector<int> &filament_map,
+                                   const std::vector<int> &filament_volume_map)
+{
+    p->rebuild(filament_map, filament_volume_map);
+}
 
 // Orca: whether the edited printer has an extruder that can physically carry several nozzles
 // (only such extruders track a per-volume-type nozzle inventory worth validating against).

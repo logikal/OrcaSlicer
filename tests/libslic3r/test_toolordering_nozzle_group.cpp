@@ -48,6 +48,23 @@ std::vector<NozzleInfo> single_nozzle_per_extruder(int extruder_count)
     }
     return nozzle_list;
 }
+
+DynamicPrintConfig mixed_diameter_multi_nozzle_config()
+{
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.option<ConfigOptionFloats>("nozzle_diameter", true)->values = {0.2, 0.4};
+    config.option<ConfigOptionIntsNullable>("extruder_max_nozzle_count", true)->values = {2, 2};
+    config.option<ConfigOptionStrings>("extruder_nozzle_stats", true)->values = {"Standard#2", "Standard#2"};
+    config.option<ConfigOptionEnumsGeneric>("nozzle_volume_type", true)->values = {nvtStandard, nvtStandard};
+    config.option<ConfigOptionStrings>("filament_type", true)->values = {"PLA", "PLA"};
+    config.option<ConfigOptionFloats>("filament_diameter", true)->values = {1.75, 1.75};
+    config.option<ConfigOptionStrings>("filament_colour", true)->values = {"#FF0000", "#00FF00"};
+    config.option<ConfigOptionInts>("filament_map", true)->values = {1, 2};
+    config.option<ConfigOptionInts>("filament_volume_map", true)->values = {(int) nvtStandard, (int) nvtStandard};
+    config.option<ConfigOptionInts>("filament_nozzle_map", true)->values = {0, 1};
+    config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value = FilamentMapMode::fmmNozzleManual;
+    return config;
+}
 } // namespace
 
 TEST_CASE("Multi-nozzle gate predicate mirrors BambuStudio", "[ToolOrdering][H2C]")
@@ -161,6 +178,62 @@ TEST_CASE("H2C multi-nozzle: filaments get distinct nozzles on the 6-nozzle extr
         REQUIRE(first->extruder_id == 1);
         REQUIRE(first->group_id == group.get_nozzle_id(f));
     }
+}
+
+TEST_CASE("Manual multi-nozzle grouping keeps each extruder's diameter", "[ToolOrdering][H2C][MixedDiameter]")
+{
+    DynamicPrintConfig config = mixed_diameter_multi_nozzle_config();
+    Model model;
+    model.add_object("cube", "", make_cube(20, 20, 20))->add_instance();
+
+    Print print;
+    print.apply(model, config);
+
+    auto result = ToolOrdering::get_recommended_filament_maps({{0, 1}}, &print, FilamentMapMode::fmmNozzleManual, {}, {});
+    auto nozzle_0 = result.get_first_nozzle_for_filament(0);
+    auto nozzle_1 = result.get_first_nozzle_for_filament(1);
+    REQUIRE(nozzle_0.has_value());
+    REQUIRE(nozzle_1.has_value());
+    REQUIRE(nozzle_0->extruder_id == 0);
+    REQUIRE(nozzle_1->extruder_id == 1);
+    REQUIRE(nozzle_0->diameter == "0.2");
+    REQUIRE(nozzle_1->diameter == "0.4");
+}
+
+TEST_CASE("Sequential multi-nozzle grouping keeps each extruder's diameter", "[ToolOrdering][H2C][MixedDiameter]")
+{
+    DynamicPrintConfig config = mixed_diameter_multi_nozzle_config();
+    config.option<ConfigOptionEnum<PrintSequence>>("print_sequence", true)->value = PrintSequence::ByObject;
+    config.option<ConfigOptionInt>("outer_wall_filament_id", true)->value = 1;
+    config.option<ConfigOptionInt>("inner_wall_filament_id", true)->value = 1;
+    config.option<ConfigOptionInt>("sparse_infill_filament_id", true)->value = 2;
+    config.option<ConfigOptionFloats>("flush_volumes_matrix", true)->values = std::vector<double>(8, 140.);
+    config.option<ConfigOptionFloats>("flush_multiplier", true)->values = {1., 1.};
+
+    Model model;
+    ModelObject *object_0 = model.add_object("cube_0", "", make_cube(20, 20, 20));
+    ModelInstance *instance_0 = object_0->add_instance();
+    instance_0->set_offset(Vec3d(70., 100., 0.));
+    instance_0->arrange_order = 1;
+    ModelObject *object_1 = model.add_object("cube_1", "", make_cube(20, 20, 20));
+    ModelInstance *instance_1 = object_1->add_instance();
+    instance_1->set_offset(Vec3d(150., 100., 0.));
+    instance_1->arrange_order = 2;
+
+    Print print;
+    print.apply(model, config);
+    print.process();
+    REQUIRE(print.objects().size() == 2);
+
+    ToolOrdering ordering(*print.objects().front(), static_cast<unsigned int>(-1));
+    ordering.sort_and_build_data(*print.objects().front(), static_cast<unsigned int>(-1));
+    const auto &result = ordering.get_layered_nozzle_group_result();
+    auto nozzle_0 = result.get_first_nozzle_for_filament(0);
+    auto nozzle_1 = result.get_first_nozzle_for_filament(1);
+    REQUIRE(nozzle_0.has_value());
+    REQUIRE(nozzle_1.has_value());
+    REQUIRE(nozzle_0->diameter == "0.2");
+    REQUIRE(nozzle_1->diameter == "0.4");
 }
 
 TEST_CASE("H2C dynamic selector: per-layer nozzle ids reach the g-code surface", "[ToolOrdering][H2C][Dynamic]")

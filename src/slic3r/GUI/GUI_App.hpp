@@ -89,6 +89,7 @@ class NetworkErrorDialog;
 class PluginsDialog;
 class SpeedDialWebDialog;
 class TerminalDialog;
+class GuiSmokeTest;
 
 
 enum FileType
@@ -356,6 +357,10 @@ public:
     explicit GUI_App();
     //explicit GUI_App(EAppMode mode = EAppMode::Editor);
     ~GUI_App() override;
+
+    bool is_gui_smoke() const;
+    void prepare_gui_smoke_mode();
+    void handle_gui_smoke_unhandled_exception();
 
     void show_message_box(std::string msg) { wxMessageBox(msg); }
     EAppMode get_app_mode() const { return m_app_mode; }
@@ -638,6 +643,7 @@ public:
     ActionRegistry& action_registry() { return m_action_registry; }
     void            open_exportpresetbundledialog(size_t open_on_tab = 0, const std::string& highlight_option = std::string());
     virtual bool OnExceptionInMainLoop() override;
+    void OnUnhandledException() override;
     // Calls wxLaunchDefaultBrowser if user confirms in dialog.
     bool            open_browser_with_warning_dialog(const wxString& url, int flags = 0);
 #ifdef __APPLE__
@@ -821,6 +827,7 @@ private:
     boost::optional<Semver> m_last_config_version;
     bool                    m_config_corrupted { false };
     std::string             m_open_method;
+    std::unique_ptr<GuiSmokeTest> m_gui_smoke_test;
 };
 
 DECLARE_APP(GUI_App)

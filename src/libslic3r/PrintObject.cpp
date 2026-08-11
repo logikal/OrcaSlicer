@@ -6,6 +6,7 @@
 #include "ClipperUtils.hpp"
 #include "Clipper2Utils.hpp"
 #include "ElephantFootCompensation.hpp"
+#include "FeatureProcessResolver.hpp"
 #include "Geometry.hpp"
 #include "I18N.hpp"
 #include "Layer.hpp"
@@ -26,10 +27,15 @@
 #include "format.hpp"
 #include "AABBTreeLines.hpp"
 
+#include <cctype>
 #include <cstddef>
+#include <cstdint>
 #include <float.h>
 #include <iterator>
+#include <limits>
+#include <map>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <oneapi/tbb/blocked_range.h>
 #include <oneapi/tbb/concurrent_vector.h>
@@ -81,6 +87,15 @@ using namespace std::literals;
 #endif
 
 namespace Slic3r {
+
+static int scaled_shell_layers(int shell_layers, int cadence_ratio, double feature_height, double base_height)
+{
+    if (shell_layers <= 0 || cadence_ratio <= 1 || std::abs(feature_height - base_height) > EPSILON)
+        return shell_layers;
+    return shell_layers * cadence_ratio;
+}
+
+static double feature_height_for_role(const PrintRegionConfig &config, FeatureRole role, double base_height);
 
 // Constructor is called from the main thread, therefore all Model / ModelObject / ModelIntance data are valid.
 PrintObject::PrintObject(Print* print, ModelObject* model_object, const Transform3d& trafo, PrintInstances&& instances) :
@@ -677,6 +692,9 @@ void PrintObject::prepare_infill()
     this->bridge_over_infill();
     m_print->throw_if_canceled();
 
+    this->recombine_feature_cadence();
+    m_print->throw_if_canceled();
+
     // combine fill surfaces to honor the "infill every N layers" option
     this->combine_infill();
     m_print->throw_if_canceled();
@@ -886,8 +904,14 @@ static const float g_min_overhang_percent_for_lift = 0.3f;
 void PrintObject::detect_overhangs_for_lift()
 {
     if (this->set_started(posDetectOverhangsForLift)) {
-        const double nozzle_diameter = m_print->config().nozzle_diameter.get_at(0);
-        const coordf_t line_width = this->config().get_abs_value("line_width", nozzle_diameter);
+        const auto *object_extruder = this->model_object()->config.get().option<ConfigOptionInt>("extruder");
+        const unsigned int filament_id = object_extruder == nullptr || object_extruder->value <= 0 ?
+            1u : unsigned(object_extruder->value);
+        const size_t config_index = m_print->get_print_config_index(filament_id);
+        const double nozzle_diameter = m_print->config().nozzle_diameter.get_at(
+            get_extruder_index_from_filament_id(m_print->config(), filament_id));
+        // The generic width follows the object's base filament for lift detection.
+        const coordf_t line_width = this->config().line_width.get_at(config_index).get_abs_value(nozzle_diameter);
 
         const float min_overlap = line_width * g_min_overhang_percent_for_lift;
         size_t num_layers = this->layer_count();
@@ -1240,6 +1264,20 @@ bool PrintObject::invalidate_state_by_config_options(
             steps.emplace_back(posPerimeters);
         } else if (
                opt_key == "layer_height"
+            || opt_key == "wall_layer_height"
+            || opt_key == "wall_process_projection"
+            || opt_key == "sparse_infill_process_layer_height"
+            || opt_key == "sparse_infill_process_projection"
+            || opt_key == "internal_solid_process_layer_height"
+            || opt_key == "internal_solid_process_projection"
+            || opt_key == "top_surface_process_layer_height"
+            || opt_key == "top_surface_process_projection"
+            || opt_key == "bottom_surface_process_layer_height"
+            || opt_key == "bottom_surface_process_projection"
+            || opt_key == "support_process_layer_height"
+            || opt_key == "support_process_projection"
+            || opt_key == "support_interface_process_layer_height"
+            || opt_key == "support_interface_process_projection"
             || opt_key == "mmu_segmented_region_max_width"
             || opt_key == "mmu_segmented_region_interlocking_depth"
             || opt_key == "raft_layers"
@@ -1257,6 +1295,22 @@ bool PrintObject::invalidate_state_by_config_options(
             || opt_key == "interlocking_boundary_avoidance"
             || opt_key == "interlocking_beam_width") {
             steps.emplace_back(posSlice);
+		} else if (
+               opt_key == "wall_process_policy"
+            || opt_key == "wall_process_preset"
+            || opt_key == "sparse_infill_process_policy"
+            || opt_key == "sparse_infill_process_preset"
+            || opt_key == "internal_solid_process_policy"
+            || opt_key == "internal_solid_process_preset"
+            || opt_key == "top_surface_process_policy"
+            || opt_key == "top_surface_process_preset"
+            || opt_key == "bottom_surface_process_policy"
+            || opt_key == "bottom_surface_process_preset"
+            || opt_key == "support_process_policy"
+            || opt_key == "support_process_preset"
+            || opt_key == "support_interface_process_policy"
+            || opt_key == "support_interface_process_preset") {
+            // Policy metadata affects slicing only after the resolver refreshes the derived projection/height keys.
 		} else if (
                opt_key == "elefant_foot_compensation"
             || opt_key == "elefant_foot_compensation_layers"
@@ -2183,7 +2237,14 @@ void PrintObject::discover_vertical_shells()
         Polygons    holes;
     };
     bool     spiral_mode      = this->print()->config().spiral_mode.value;
-    size_t   num_layers       = spiral_mode ? std::min(size_t(this->printing_region(0).config().bottom_shell_layers), m_layers.size()) : m_layers.size();
+    size_t   num_layers       = spiral_mode ?
+        std::min(size_t(scaled_shell_layers(this->printing_region(0).config().bottom_shell_layers.value,
+                                            !m_layers.empty() && layer_z_in_fine_zone(m_layers.front()->print_z) ?
+                                                m_slicing_params.cadence_ratio : 1,
+                                            feature_height_for_role(this->printing_region(0).config(), FeatureRole::BottomSurface,
+                                                                  m_slicing_params.base_layer_height),
+                                            m_slicing_params.base_layer_height)), m_layers.size()) :
+        m_layers.size();
     std::vector<DiscoverVerticalShellsCacheEntry> cache_top_botom_regions(num_layers, DiscoverVerticalShellsCacheEntry());
     bool top_bottom_surfaces_all_regions = this->num_printing_regions() > 1 && ! m_config.interface_shells.value;
 //    static constexpr const float top_bottom_expansion_coeff = 1.05f;
@@ -2384,7 +2445,11 @@ void PrintObject::discover_vertical_shells()
                         }
                     };
                     static constexpr const bool one_more_layer_below_top_bottom_surfaces = false;
-			        if (int n_top_layers = region_config.top_shell_layers.value; n_top_layers > 0) {
+                    if (int n_top_layers = scaled_shell_layers(region_config.top_shell_layers.value,
+                                                               layer_z_in_fine_zone(layer->print_z) ? m_slicing_params.cadence_ratio : 1,
+                                                               feature_height_for_role(region_config, FeatureRole::TopSurface,
+                                                                                     m_slicing_params.base_layer_height),
+                                                               m_slicing_params.base_layer_height); n_top_layers > 0) {
                         // Gather top regions projected to this layer.
                         coordf_t print_z = layer->print_z;
                         int i = int(idx_layer) + 1;
@@ -2412,8 +2477,12 @@ void PrintObject::discover_vertical_shells()
                             if (i < int(cache_top_botom_regions.size()) &&
                                 (i <= itop || m_layers[i]->bottom_z() - print_z < region_config.top_shell_thickness - EPSILON))
                                 combine_holes(cache_top_botom_regions[i].holes);
-	                }
-	                if (int n_bottom_layers = region_config.bottom_shell_layers.value; n_bottom_layers > 0) {
+                    }
+                    if (int n_bottom_layers = scaled_shell_layers(region_config.bottom_shell_layers.value,
+                                                                  layer_z_in_fine_zone(layer->print_z) ? m_slicing_params.cadence_ratio : 1,
+                                                                  feature_height_for_role(region_config, FeatureRole::BottomSurface,
+                                                                                     m_slicing_params.base_layer_height),
+                                                                  m_slicing_params.base_layer_height); n_bottom_layers > 0) {
                         // Gather bottom regions projected to this layer.
                         coordf_t bottom_z = layer->bottom_z();
                         int i = int(idx_layer) - 1;
@@ -2439,7 +2508,7 @@ void PrintObject::discover_vertical_shells()
                             if (i >= 0 &&
                                 (i > ibottom || bottom_z - m_layers[i]->print_z < region_config.bottom_shell_thickness - EPSILON))
                                 combine_holes(cache_top_botom_regions[i].holes);
-	                }
+                    }
 #ifdef SLIC3R_DEBUG_SLICE_PROCESSING
                     {
         				Slic3r::SVG svg(debug_out_path("discover_vertical_shells-perimeters-before-union-%d.svg", debug_idx), get_extents(shell));
@@ -3729,7 +3798,12 @@ static void clamp_feature_filament_to_valid(ConfigOptionInt &opt, size_t num_ext
         opt.value = 1;
 }
 
-PrintObjectConfig PrintObject::object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object, size_t num_extruders, std::vector<int>& variant_index)
+static void apply_filament_process_object_delta(PrintObjectConfig &config, const ModelObject &object,
+                                                const PrintConfig &print_config);
+
+PrintObjectConfig PrintObject::object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object,
+                                                               size_t num_extruders, std::vector<int>& variant_index,
+                                                               const PrintConfig &print_config)
 {
     PrintObjectConfig config = default_object_config;
     {
@@ -3737,6 +3811,7 @@ PrintObjectConfig PrintObject::object_config_from_model_object(const PrintObject
         src_normalized.normalize_fdm();
         update_static_print_config_from_dynamic(config, src_normalized, variant_index, print_options_with_variant, 1);
     }
+    apply_filament_process_object_delta(config, object, print_config);
     // Clamp invalid extruders to the default extruder (with index 1).
     clamp_exturder_to_default(config.support_filament,           num_extruders);
     clamp_exturder_to_default(config.support_interface_filament, num_extruders);
@@ -3763,8 +3838,232 @@ struct FeatureFilamentOverrideMask
     bool inner_wall_filament_id    = false;
 };
 
-static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPrintConfig &in, FeatureFilamentOverrideMask &feature_overrides, std::vector<int>& variant_index)
+static std::string_view trim_projection_token(std::string_view token)
 {
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.front())))
+        token.remove_prefix(1);
+    while (!token.empty() && std::isspace(static_cast<unsigned char>(token.back())))
+        token.remove_suffix(1);
+    return token;
+}
+
+static bool contains_key(const t_config_option_keys &keys, const std::string &key)
+{
+    return std::find(keys.begin(), keys.end(), key) != keys.end();
+}
+
+static void append_key(t_config_option_keys &keys, const std::string &key)
+{
+    if (!contains_key(keys, key))
+        keys.push_back(key);
+}
+
+static DynamicPrintConfig parse_filament_process_delta(const std::string &serialized)
+{
+    DynamicPrintConfig parsed;
+    for (size_t begin = 0; begin <= serialized.size();) {
+        const size_t end = serialized.find(';', begin);
+        const std::string_view entry(serialized.data() + begin,
+                                     (end == std::string::npos ? serialized.size() : end) - begin);
+        const size_t equals = entry.find('=');
+        const std::string key(trim_projection_token(entry.substr(0, equals)));
+        if (!key.empty()) {
+            if (equals == std::string_view::npos || print_config_def.get(key) == nullptr) {
+                BOOST_LOG_TRIVIAL(warning) << "Ignoring unknown filament process delta key: " << key;
+            } else {
+                try {
+                    parsed.set_deserialize_strict(key, std::string(trim_projection_token(entry.substr(equals + 1))));
+                } catch (...) {
+                    BOOST_LOG_TRIVIAL(warning) << "Ignoring malformed filament process delta key: " << key;
+                }
+            }
+        }
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+    return parsed;
+}
+
+using FilamentDeltaCache = std::map<unsigned int, DynamicPrintConfig>;
+
+static const DynamicPrintConfig &filament_process_delta(const PrintConfig &print_config, unsigned int filament,
+                                                        FilamentDeltaCache &cache)
+{
+    auto [it, inserted] = cache.try_emplace(filament);
+    if (inserted && filament > 0 && filament <= print_config.filament_process_projection.values.size()) {
+        const std::string &serialized = print_config.filament_process_projection.values[filament - 1];
+        if (!serialized.empty())
+            it->second = parse_filament_process_delta(serialized);
+    }
+    return it->second;
+}
+
+static void apply_delta_key(ConfigBase &target_config, const DynamicPrintConfig &delta, const std::string &key,
+                            size_t tool_id, const t_config_option_keys &explicit_keys)
+{
+    if (contains_key(explicit_keys, key))
+        return;
+    const ConfigOption *source = delta.option(key);
+    if (source == nullptr)
+        return;
+    ConfigOption *target = target_config.option(key, false);
+    if (target == nullptr) {
+        BOOST_LOG_TRIVIAL(warning) << "Ignoring unsupported filament process delta key: " << key;
+        return;
+    }
+    try {
+        if (auto *target_vector = dynamic_cast<ConfigOptionVectorBase *>(target); target_vector != nullptr)
+            target_vector->set_at(source, tool_id, 0);
+        else
+            target->set(source);
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(warning) << "Ignoring malformed filament process delta key: " << key;
+    }
+}
+
+static unsigned int effective_object_filament(const ModelObject &object)
+{
+    const auto *extruder = object.config.get().option<ConfigOptionInt>(key_extruder);
+    return extruder == nullptr || extruder->value <= 0 ? 1u : unsigned(extruder->value);
+}
+
+static void apply_filament_process_object_delta(PrintObjectConfig &config, const ModelObject &object,
+                                                const PrintConfig &print_config)
+{
+    FilamentDeltaCache cache;
+    const unsigned int base_filament = effective_object_filament(object);
+    const DynamicPrintConfig &base_delta = filament_process_delta(print_config, base_filament, cache);
+    if (!object.config.has("layer_height"))
+        apply_delta_key(config, base_delta, "layer_height",
+                        get_extruder_index_from_filament_id(print_config, base_filament), {});
+
+    const unsigned int support_filament = config.support_filament.value > 0 ?
+        unsigned(config.support_filament.value) : base_filament;
+    const DynamicPrintConfig &support_delta = filament_process_delta(print_config, support_filament, cache);
+    const size_t support_tool = get_extruder_index_from_filament_id(print_config, support_filament);
+    for (const char *key : {"support_line_width", "support_speed"})
+        if (!object.config.has(key))
+            apply_delta_key(config, support_delta, key, support_tool, {});
+
+    const unsigned int interface_filament = config.support_interface_filament.value > 0 ?
+        unsigned(config.support_interface_filament.value) : base_filament;
+    const DynamicPrintConfig &interface_delta = filament_process_delta(print_config, interface_filament, cache);
+    const size_t interface_tool = get_extruder_index_from_filament_id(print_config, interface_filament);
+    for (const char *key : {"support_interface_speed", "support_top_z_distance", "support_bottom_z_distance"})
+        if (!object.config.has(key))
+            apply_delta_key(config, interface_delta, key, interface_tool, {});
+}
+
+static bool feature_filament_overridden(const FeatureFilamentOverrideMask &overrides, FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return overrides.outer_wall_filament_id;
+    case FeatureRole::SparseInfill:  return overrides.sparse_infill_filament_id;
+    case FeatureRole::InternalSolid: return overrides.internal_solid_filament_id;
+    case FeatureRole::TopSurface:    return overrides.top_surface_filament_id;
+    case FeatureRole::BottomSurface: return overrides.bottom_surface_filament_id;
+    default:                         return false;
+    }
+}
+
+static unsigned int configured_feature_filament(const PrintRegionConfig &config, FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return unsigned(std::max(config.outer_wall_filament_id.value, 0));
+    case FeatureRole::SparseInfill:  return unsigned(std::max(config.sparse_infill_filament_id.value, 0));
+    case FeatureRole::InternalSolid: return unsigned(std::max(config.internal_solid_filament_id.value, 0));
+    case FeatureRole::TopSurface:    return unsigned(std::max(config.top_surface_filament_id.value, 0));
+    case FeatureRole::BottomSurface: return unsigned(std::max(config.bottom_surface_filament_id.value, 0));
+    default:                         return 0;
+    }
+}
+
+static unsigned int effective_feature_filament(const PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                               const FeatureFilamentOverrideMask &feature_overrides,
+                                               FeatureRole role, const char *filament_key)
+{
+    const auto *feature = in.option<ConfigOptionInt>(filament_key);
+    if (feature != nullptr && feature->value > 0)
+        return unsigned(feature->value);
+    const auto *base = in.option<ConfigOptionInt>(key_extruder);
+    if (base != nullptr && base->value > 0 &&
+        (feature == nullptr ? !feature_filament_overridden(feature_overrides, role) : feature->value == 0))
+        return unsigned(base->value);
+    return configured_feature_filament(out, role);
+}
+
+static void apply_feature_process_projection_for_role(PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                                      const FeatureFilamentOverrideMask &feature_overrides,
+                                                      const PrintConfig &print_config, t_config_option_keys *explicit_keys,
+                                                      FeatureRole role, const char *projection_key,
+                                                      const char *filament_key)
+{
+    const auto *serialized = in.option<ConfigOptionString>(projection_key);
+    if (serialized == nullptr || serialized->value.empty())
+        return;
+
+    const std::vector<std::string> &allowed = feature_projection_keys(role);
+    const size_t tool_slot = get_print_config_index_from_filament_id(
+        print_config, effective_feature_filament(out, in, feature_overrides, role, filament_key));
+    for (size_t begin = 0; begin <= serialized->value.size();) {
+        const size_t end = serialized->value.find(';', begin);
+        const std::string_view entry(serialized->value.data() + begin,
+                                     (end == std::string::npos ? serialized->value.size() : end) - begin);
+        const size_t equals = entry.find('=');
+        const std::string key(trim_projection_token(entry.substr(0, equals)));
+        if (!key.empty()) {
+            if (equals == std::string_view::npos || std::find(allowed.begin(), allowed.end(), key) == allowed.end()) {
+                BOOST_LOG_TRIVIAL(warning) << "Ignoring non-whitelisted feature process projection key: " << key;
+            } else if (ConfigOption *target = out.option(key, false); target != nullptr) {
+                try {
+                    DynamicPrintConfig parsed;
+                    parsed.set_deserialize_strict(key, std::string(trim_projection_token(entry.substr(equals + 1))));
+                    const ConfigOption *source = parsed.option(key);
+                    if (auto *target_vector = dynamic_cast<ConfigOptionVectorBase *>(target); target_vector != nullptr)
+                        target_vector->set_at(source, tool_slot, 0);
+                    else
+                        target->set(source);
+                    if (explicit_keys != nullptr)
+                        append_key(*explicit_keys, key);
+                } catch (...) {
+                    BOOST_LOG_TRIVIAL(warning) << "Ignoring malformed feature process projection key: " << key;
+                }
+            } else {
+                BOOST_LOG_TRIVIAL(warning) << "Ignoring unknown feature process projection key: " << key;
+            }
+        }
+        if (end == std::string::npos)
+            break;
+        begin = end + 1;
+    }
+}
+
+static void apply_feature_process_projections(PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                              const FeatureFilamentOverrideMask &feature_overrides,
+                                              const PrintConfig &print_config, t_config_option_keys *explicit_keys)
+{
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::Wall, "wall_process_projection", "outer_wall_filament_id");
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::SparseInfill, "sparse_infill_process_projection", "sparse_infill_filament_id");
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::InternalSolid, "internal_solid_process_projection", "internal_solid_filament_id");
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::TopSurface, "top_surface_process_projection", "top_surface_filament_id");
+    apply_feature_process_projection_for_role(out, in, feature_overrides, print_config, explicit_keys,
+        FeatureRole::BottomSurface, "bottom_surface_process_projection", "bottom_surface_filament_id");
+}
+
+static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPrintConfig &in,
+                                         FeatureFilamentOverrideMask &feature_overrides,
+                                         std::vector<int>& variant_index, const PrintConfig &print_config,
+                                         t_config_option_keys *explicit_keys, unsigned int &base_filament)
+{
+    // Derived process values are the first pass. The explicit loop below is intentionally
+    // second so a user override in this same scope always wins.
+    apply_feature_process_projections(out, in, feature_overrides, print_config, explicit_keys);
+
     // 1) Explicit feature filament values take precedence over base extruder fallback.
     auto *opt_extruder = in.opt<ConfigOptionInt>(key_extruder);
     int base_extruder = (opt_extruder != nullptr) ? opt_extruder->value : 0;
@@ -3773,6 +4072,8 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
     for (auto it = in.cbegin(); it != in.cend(); ++ it)
         if (it->first != key_extruder)
             if (ConfigOption* my_opt = out.option(it->first, false); my_opt != nullptr) {
+                if (explicit_keys != nullptr)
+                    append_key(*explicit_keys, it->first);
                 if (one_of(it->first, keys_extruders)) {
                     // "Default" (0) clears explicit override for this scope and lets fallback apply.
                     int extruder = static_cast<const ConfigOptionInt*>(it->second.get())->value;
@@ -3805,11 +4106,19 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
                             feature_overrides.inner_wall_filament_id = false;
                     }
                 } else {
-                    if (*my_opt != *(it->second)) {
-                        if (my_opt->is_scalar() || variant_index.empty() || (print_options_with_variant.find(it->first) == print_options_with_variant.end()))
+                    const bool types_differ = my_opt->type() != it->second->type();
+                    if (types_differ || *my_opt != *(it->second)) {
+                        auto *target_vector = dynamic_cast<ConfigOptionVectorBase *>(my_opt);
+                        if (target_vector != nullptr && it->second->is_scalar() &&
+                            print_options_with_variant.find(it->first) != print_options_with_variant.end()) {
+                            // Legacy scalar object / volume overrides broadcast to every variant column.
+                            const size_t count = std::max<size_t>(1, std::max(target_vector->size(), variant_index.size()));
+                            for (size_t index = 0; index < count; ++index)
+                                target_vector->set_at(it->second.get(), index, 0);
+                        } else if (my_opt->is_scalar() || variant_index.empty() ||
+                                   print_options_with_variant.find(it->first) == print_options_with_variant.end()) {
                             my_opt->set(it->second.get());
-                            //my_opt->set(it->second.get());
-                        else {
+                        } else {
                             ConfigOptionVectorBase* opt_vec_src = static_cast<ConfigOptionVectorBase*>(my_opt);
                             const ConfigOptionVectorBase* opt_vec_dest = static_cast<const ConfigOptionVectorBase*>(it->second.get());
                             opt_vec_src->set_to_index(opt_vec_dest, variant_index, 1);
@@ -3820,6 +4129,7 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
 
     // 3) Apply base extruder only to features that were not explicitly overridden.
     if (base_extruder > 0) {
+        base_filament = unsigned(base_extruder);
         if (!feature_overrides.sparse_infill_filament_id)
             out.sparse_infill_filament_id.value = base_extruder;
         if (!feature_overrides.internal_solid_filament_id)
@@ -3835,10 +4145,150 @@ static void apply_to_print_region_config(PrintRegionConfig &out, const DynamicPr
     }
 }
 
-PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &default_or_parent_region_config, const DynamicPrintConfig *layer_range_config, const ModelVolume &volume, size_t num_extruders, std::vector<int>& variant_index)
+static unsigned int filament_for_role(const PrintRegionConfig &config, FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return unsigned(std::max(config.outer_wall_filament_id.value, 1));
+    case FeatureRole::SparseInfill:  return unsigned(std::max(config.sparse_infill_filament_id.value, 1));
+    case FeatureRole::InternalSolid: return unsigned(std::max(config.internal_solid_filament_id.value, 1));
+    case FeatureRole::TopSurface:    return unsigned(std::max(config.top_surface_filament_id.value, 1));
+    case FeatureRole::BottomSurface: return unsigned(std::max(config.bottom_surface_filament_id.value, 1));
+    default:                         return 1;
+    }
+}
+
+static double feature_height_for_role(const PrintRegionConfig &config, FeatureRole role, double base_height)
+{
+    const auto resolve_height = [base_height](double role_height) {
+        return role_height > EPSILON ? role_height : base_height;
+    };
+    switch (role) {
+    case FeatureRole::Wall:          return resolve_height(config.wall_layer_height.value);
+    case FeatureRole::SparseInfill:  return resolve_height(config.sparse_infill_process_layer_height.value);
+    case FeatureRole::InternalSolid: return resolve_height(config.internal_solid_process_layer_height.value);
+    case FeatureRole::TopSurface:    return resolve_height(config.top_surface_process_layer_height.value);
+    case FeatureRole::BottomSurface: return resolve_height(config.bottom_surface_process_layer_height.value);
+    default:                         return base_height;
+    }
+}
+
+static const char *height_key_for_role(FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return "wall_layer_height";
+    case FeatureRole::SparseInfill:  return "sparse_infill_process_layer_height";
+    case FeatureRole::InternalSolid: return "internal_solid_process_layer_height";
+    case FeatureRole::TopSurface:    return "top_surface_process_layer_height";
+    case FeatureRole::BottomSurface: return "bottom_surface_process_layer_height";
+    default:                         return nullptr;
+    }
+}
+
+static const char *feature_name_for_role(FeatureRole role)
+{
+    switch (role) {
+    case FeatureRole::Wall:          return "Wall";
+    case FeatureRole::SparseInfill:  return "Sparse infill";
+    case FeatureRole::InternalSolid: return "Internal solid infill";
+    case FeatureRole::TopSurface:    return "Top surface";
+    case FeatureRole::BottomSurface: return "Bottom surface";
+    default:                         return "Feature";
+    }
+}
+
+void apply_filament_process_delta(PrintRegionConfig &config, const PrintConfig &print_config,
+                                  const PrintRegionConfig &global_region_defaults,
+                                  unsigned int base_filament, double object_layer_height,
+                                  const t_config_option_keys &explicit_keys)
+{
+    static const std::array<FeatureRole, 5> roles{
+        FeatureRole::Wall, FeatureRole::SparseInfill, FeatureRole::InternalSolid,
+        FeatureRole::TopSurface, FeatureRole::BottomSurface,
+    };
+    static const std::set<std::string> role_keys = [] {
+        std::set<std::string> result;
+        for (FeatureRole role : roles) {
+            const std::vector<std::string> &keys = filament_delta_keys_for_role(role);
+            result.insert(keys.begin(), keys.end());
+        }
+        return result;
+    }();
+
+    FilamentDeltaCache cache;
+    std::set<std::string> projected_keys;
+    for (size_t index = 0; index < print_config.filament_process_projection.values.size(); ++index) {
+        const DynamicPrintConfig &delta = filament_process_delta(print_config, unsigned(index + 1), cache);
+        const std::vector<std::string> keys = delta.keys();
+        projected_keys.insert(keys.begin(), keys.end());
+    }
+
+    // A modifier or painted region starts from its parent's already projected config. Restore
+    // every L1-capable region key first so an empty or sparser child delta cannot retain parent L1.
+    // The restore source must be the global process values, NOT compiled defaults — a preset that
+    // overrides e.g. wall_loops must survive when the region's own filament carries no delta.
+    const PrintRegionConfig &baseline = global_region_defaults;
+    for (const std::string &key : projected_keys) {
+        if (contains_key(explicit_keys, key))
+            continue;
+        ConfigOption *target = config.option(key, false);
+        const ConfigOption *source = baseline.option(key);
+        if (target != nullptr && source != nullptr)
+            target->set(source);
+    }
+    if (projected_keys.count("layer_height") != 0) {
+        for (FeatureRole role : roles) {
+            const char *height_key = height_key_for_role(role);
+            if (height_key != nullptr && !contains_key(explicit_keys, height_key))
+                config.option(height_key)->set(baseline.option(height_key));
+        }
+    }
+
+    base_filament = std::max(base_filament, 1u);
+    const DynamicPrintConfig &base_delta = filament_process_delta(print_config, base_filament, cache);
+    const size_t base_tool_slot = get_print_config_index_from_filament_id(print_config, base_filament);
+    for (const std::string &key : base_delta.keys()) {
+        if (role_keys.count(key) != 0 || key == "layer_height" || key == "wall_layer_height" ||
+            key.find("_process_") != std::string::npos ||
+            std::any_of(keys_extruders.begin(), keys_extruders.end(), [&key](std::string_view item) { return item == key; }))
+            continue;
+        if (config.option(key, false) != nullptr)
+            apply_delta_key(config, base_delta, key, base_tool_slot, explicit_keys);
+    }
+
+    if (object_layer_height <= 0.) {
+        if (const auto *height = base_delta.option<ConfigOptionFloat>("layer_height"); height != nullptr)
+            object_layer_height = height->value;
+    }
+    for (FeatureRole role : roles) {
+        const unsigned int filament = filament_for_role(config, role);
+        const DynamicPrintConfig &delta = filament_process_delta(print_config, filament, cache);
+        const size_t tool_slot = get_print_config_index_from_filament_id(print_config, filament);
+        for (const std::string &key : filament_delta_keys_for_role(role))
+            apply_delta_key(config, delta, key, tool_slot, explicit_keys);
+
+        const auto *height = delta.option<ConfigOptionFloat>("layer_height");
+        const char *height_key = height_key_for_role(role);
+        if (height != nullptr && height_key != nullptr && !contains_key(explicit_keys, height_key) &&
+            (object_layer_height <= 0. || std::abs(height->value - object_layer_height) > EPSILON))
+            config.option<ConfigOptionFloat>(height_key)->value = height->value;
+    }
+}
+
+PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &default_or_parent_region_config,
+                                                  const PrintRegionConfig &global_region_defaults,
+                                                  const DynamicPrintConfig *layer_range_config,
+                                                  const ModelVolume &volume, size_t num_extruders,
+                                                  std::vector<int>& variant_index, const PrintConfig &print_config,
+                                                  unsigned int inherited_base_filament, double object_layer_height,
+                                                  const t_config_option_keys *inherited_explicit_keys,
+                                                  unsigned int *resolved_base_filament,
+                                                  t_config_option_keys *resolved_explicit_keys)
 {
     PrintRegionConfig config = default_or_parent_region_config;
     FeatureFilamentOverrideMask feature_overrides;
+    t_config_option_keys explicit_keys = inherited_explicit_keys == nullptr ?
+        t_config_option_keys{} : *inherited_explicit_keys;
+    unsigned int base_filament = std::max(inherited_base_filament, 1u);
 
     // For model parts, non-zero values coming from the print defaults should stay explicit.
     if (volume.is_model_part()) {
@@ -3853,18 +4303,27 @@ PrintRegionConfig region_config_from_model_volume(const PrintRegionConfig &defau
     if (volume.is_model_part()) {
         // default_or_parent_region_config contains the Print's PrintRegionConfig.
         // Override with ModelObject's PrintRegionConfig values.
-        apply_to_print_region_config(config, volume.get_object()->config.get(), feature_overrides, variant_index);
+        apply_to_print_region_config(config, volume.get_object()->config.get(), feature_overrides, variant_index, print_config,
+                                     &explicit_keys, base_filament);
     } else {
         // default_or_parent_region_config contains parent PrintRegion config, which already contains ModelVolume's config.
     }
-    apply_to_print_region_config(config, volume.config.get(), feature_overrides, variant_index);
+    apply_to_print_region_config(config, volume.config.get(), feature_overrides, variant_index, print_config,
+                                 &explicit_keys, base_filament);
     if (! volume.material_id().empty())
-        apply_to_print_region_config(config, volume.material()->config.get(), feature_overrides, variant_index);
+        apply_to_print_region_config(config, volume.material()->config.get(), feature_overrides, variant_index, print_config,
+                                     &explicit_keys, base_filament);
     if (layer_range_config != nullptr) {
         // Not applicable to modifiers.
         assert(volume.is_model_part());
-    	apply_to_print_region_config(config, *layer_range_config, feature_overrides, variant_index);
+        apply_to_print_region_config(config, *layer_range_config, feature_overrides, variant_index, print_config,
+                                     &explicit_keys, base_filament);
     }
+    apply_filament_process_delta(config, print_config, global_region_defaults, base_filament, object_layer_height, explicit_keys);
+    if (resolved_base_filament != nullptr)
+        *resolved_base_filament = base_filament;
+    if (resolved_explicit_keys != nullptr)
+        *resolved_explicit_keys = explicit_keys;
     // Resolve feature defaults and clamp invalid extruders to index 1.
     clamp_feature_filament_to_valid(config.sparse_infill_filament_id, num_extruders);
     clamp_feature_filament_to_valid(config.outer_wall_filament_id, num_extruders);
@@ -3889,6 +4348,314 @@ struct POProfiler
     uint32_t duration2;
 };
 
+static bool update_feature_cadence_plan(FeatureCadencePlan &plan, const PrintRegionConfig &region_config)
+{
+    static const FeatureRole roles[] = {
+        FeatureRole::Wall,
+        FeatureRole::SparseInfill,
+        FeatureRole::InternalSolid,
+        FeatureRole::TopSurface,
+        FeatureRole::BottomSurface,
+    };
+    bool updated = false;
+    for (FeatureRole role : roles) {
+        const char *name = feature_name_for_role(role);
+        const double role_height = feature_height_for_role(region_config, role, plan.base_height);
+        if (role_height <= 0. || role_height >= plan.base_height - EPSILON)
+            continue;
+
+        const int region_ratio = feature_cadence_ratio(plan.base_height, role_height);
+        if (region_ratio <= 1) {
+            BOOST_LOG_TRIVIAL(debug) << "Ignoring non-divisor " << name << " layer height " << role_height
+                                     << " for base layer height " << plan.base_height;
+            continue;
+        }
+
+        const long long ratio = static_cast<long long>(plan.ratio / std::gcd(plan.ratio, region_ratio)) * region_ratio;
+        if (ratio > std::numeric_limits<int>::max()) {
+            BOOST_LOG_TRIVIAL(debug) << "Ignoring " << name << " cadence whose combined ratio exceeds the supported integer range";
+            continue;
+        }
+        if (ratio != plan.ratio)
+            updated = true;
+        plan.ratio       = static_cast<int>(ratio);
+        plan.grid_height = plan.base_height / plan.ratio;
+    }
+
+    return updated;
+}
+
+static void append_fine_cadence_extruders(const PrintConfig &print_config, const PrintRegionConfig &region_config,
+                                          const FeatureCadencePlan &plan, std::vector<unsigned int> &extruders)
+{
+    static const FeatureRole roles[] = {
+        FeatureRole::Wall,
+        FeatureRole::SparseInfill,
+        FeatureRole::InternalSolid,
+        FeatureRole::TopSurface,
+        FeatureRole::BottomSurface,
+    };
+    for (FeatureRole role : roles) {
+        const double role_height = feature_height_for_role(region_config, role, plan.base_height);
+        if (role_height >= plan.base_height - EPSILON)
+            continue;
+
+        if (role == FeatureRole::Wall) {
+            extruders.emplace_back(static_cast<unsigned int>(
+                get_extruder_index_from_filament_id(print_config, region_config.outer_wall_filament_id.value)));
+            extruders.emplace_back(static_cast<unsigned int>(
+                get_extruder_index_from_filament_id(print_config, region_config.inner_wall_filament_id.value)));
+            continue;
+        }
+
+        extruders.emplace_back(static_cast<unsigned int>(
+            get_extruder_index_from_filament_id(print_config, filament_for_role(region_config, role))));
+    }
+}
+
+static std::vector<CadenceZone> compute_cadence_zones(const PrintObject &object, const FeatureCadencePlan &plan,
+                                                       double first_layer_height, double object_height)
+{
+    if (object.shared_regions() == nullptr || object_height <= EPSILON)
+        return {};
+
+    struct Contribution {
+        const PrintRegion                       *region;
+        const PrintObjectRegions::BoundingBox   *bbox;
+        double                                   lo;
+        double                                   hi;
+    };
+    std::vector<Contribution> contributions;
+    const auto append_contribution = [&](const PrintRegion *region, const PrintObjectRegions::BoundingBox *bbox) {
+        if (region == nullptr || bbox == nullptr)
+            return;
+        // PrintApply expands these boxes by EPSILON. Remove that conservative expansion so
+        // touching volume endpoints become one exact geometric zone boundary.
+        const double lo = std::max(0., double(bbox->min().z()) + EPSILON);
+        const double hi = std::min(object_height, double(bbox->max().z()) - EPSILON);
+        if (lo + EPSILON < hi)
+            contributions.push_back({region, bbox, lo, hi});
+    };
+
+    for (const PrintObjectRegions::LayerRangeRegions &layer_range : object.shared_regions()->layer_ranges) {
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions)
+            append_contribution(volume_region.region, volume_region.bbox);
+        for (const PrintObjectRegions::PaintedRegion &painted_region : layer_range.painted_regions) {
+            if (painted_region.parent < 0 || painted_region.parent >= int(layer_range.volume_regions.size()))
+                continue;
+            // Painted regions have no independent bbox. Conservatively use the parent volume's full Z extent.
+            append_contribution(painted_region.region, layer_range.volume_regions[painted_region.parent].bbox);
+        }
+    }
+    if (contributions.empty())
+        return {};
+
+    static constexpr std::array<FeatureRole, 5> roles{
+        FeatureRole::Wall, FeatureRole::SparseInfill, FeatureRole::InternalSolid,
+        FeatureRole::TopSurface, FeatureRole::BottomSurface,
+    };
+    const PrintConfig &print_config = object.print()->config();
+    DynamicPrintConfig nozzle_config;
+    nozzle_config.set_key_value("nozzle_diameter", print_config.nozzle_diameter.clone());
+    nozzle_config.set_key_value("min_layer_height", print_config.min_layer_height.clone());
+    nozzle_config.set_key_value("max_layer_height", print_config.max_layer_height.clone());
+    const auto append_unique_height = [](std::vector<double> &heights, double height) {
+        if (std::none_of(heights.begin(), heights.end(), [height](double item) { return std::abs(item - height) <= EPSILON; }))
+            heights.push_back(height);
+    };
+    const auto collect_interval = [&](double lo, double hi, std::set<size_t> &tools, std::vector<double> &heights) {
+        for (const Contribution &contribution : contributions) {
+            if (contribution.hi <= lo + EPSILON || contribution.lo >= hi - EPSILON)
+                continue;
+            const PrintRegionConfig &config = contribution.region->config();
+            tools.insert(get_extruder_index_from_filament_id(
+                print_config, std::max(config.outer_wall_filament_id.value, 1)));
+            tools.insert(get_extruder_index_from_filament_id(
+                print_config, std::max(config.inner_wall_filament_id.value, 1)));
+            for (FeatureRole role : roles) {
+                if (role != FeatureRole::Wall)
+                    tools.insert(get_extruder_index_from_filament_id(print_config, filament_for_role(config, role)));
+                append_unique_height(heights, feature_height_for_role(config, role, plan.base_height));
+            }
+        }
+    };
+
+    // Zones exist to separate DIFFERENT layer heights (and the nozzles that own them). When every
+    // contribution resolves to one height on one nozzle diameter — every ordinary print, including
+    // multi-colour on a single-nozzle machine — there is nothing to zone: geometric boundaries
+    // (parts, layer ranges) must not manufacture zones whose span-fitted heights differ only by
+    // floating-point noise and destabilize layering. (Found by the vendor-profile slice check.)
+    {
+        std::vector<double> distinct_heights;
+        std::set<long long> distinct_nozzles;
+        const auto note_tool = [&](unsigned int filament_id) {
+            const size_t tool = get_extruder_index_from_filament_id(print_config, std::max(int(filament_id), 1));
+            distinct_nozzles.insert(llround(print_config.nozzle_diameter.get_at(tool) * 1e6));
+        };
+        for (const Contribution &contribution : contributions) {
+            const PrintRegionConfig &config = contribution.region->config();
+            note_tool(std::max(config.outer_wall_filament_id.value, 1));
+            note_tool(std::max(config.inner_wall_filament_id.value, 1));
+            for (FeatureRole role : roles) {
+                append_unique_height(distinct_heights, feature_height_for_role(config, role, plan.base_height));
+                if (role != FeatureRole::Wall)
+                    note_tool(filament_for_role(config, role));
+            }
+        }
+        if (distinct_heights.size() <= 1 && distinct_nozzles.size() <= 1)
+            return {};
+    }
+
+    std::vector<double> geometric_boundaries{0., object_height};
+    geometric_boundaries.reserve(2 + contributions.size() * 2);
+    for (const Contribution &contribution : contributions) {
+        geometric_boundaries.push_back(contribution.lo);
+        geometric_boundaries.push_back(contribution.hi);
+    }
+    std::sort(geometric_boundaries.begin(), geometric_boundaries.end());
+    geometric_boundaries.erase(std::unique(geometric_boundaries.begin(), geometric_boundaries.end(),
+        [](double lhs, double rhs) { return std::abs(lhs - rhs) <= EPSILON; }), geometric_boundaries.end());
+
+    std::vector<std::pair<double, double>> mixed_extents;
+    for (size_t i = 1; i < geometric_boundaries.size(); ++i) {
+        const double lo = geometric_boundaries[i - 1];
+        const double hi = geometric_boundaries[i];
+        if (lo + EPSILON >= hi)
+            continue;
+        std::set<size_t> tools;
+        std::vector<double> heights;
+        collect_interval(lo, hi, tools, heights);
+        // Multiple tools at one common height still use the ordinary uniform grid. A mixed
+        // cadence zone is needed only when distinct heights coexist in the same Z range.
+        if (heights.size() > 1) {
+            if (!mixed_extents.empty() && lo <= mixed_extents.back().second + EPSILON)
+                mixed_extents.back().second = hi;
+            else
+                mixed_extents.emplace_back(lo, hi);
+        }
+    }
+
+    const bool whole_object_mixed = mixed_extents.size() == 1 && mixed_extents.front().first <= EPSILON &&
+                                    mixed_extents.front().second >= object_height - EPSILON;
+    if (whole_object_mixed) {
+        std::set<size_t> tools;
+        std::vector<double> heights;
+        collect_interval(0., object_height, tools, heights);
+        const double fine_height = plan.ratio > 1 ? plan.grid_height :
+            *std::min_element(heights.begin(), heights.end());
+        return {{0., object_height, true, plan.base_height, fine_height}};
+    }
+
+    std::vector<std::pair<double, double>> snapped;
+    for (const auto &[extent_lo, extent_hi] : mixed_extents) {
+        // Bounding boxes are float-valued, so tolerate their representational noise when an
+        // extent is already on an exact base-layer boundary.
+        constexpr double snap_epsilon_in_steps = 1e-2;
+        double lo = std::floor(extent_lo / plan.base_height + snap_epsilon_in_steps) * plan.base_height;
+        double hi = std::ceil(extent_hi / plan.base_height - snap_epsilon_in_steps) * plan.base_height;
+        lo = std::max(first_layer_height, std::max(0., lo));
+        hi = std::min(object_height, hi);
+        if (lo + EPSILON >= hi)
+            continue;
+        if (!snapped.empty() && lo <= snapped.back().second + EPSILON)
+            snapped.back().second = std::max(snapped.back().second, hi);
+        else
+            snapped.emplace_back(lo, hi);
+    }
+    std::vector<double> boundaries = geometric_boundaries;
+    for (const auto &[lo, hi] : snapped) {
+        boundaries.push_back(lo);
+        boundaries.push_back(hi);
+    }
+    std::sort(boundaries.begin(), boundaries.end());
+    boundaries.erase(std::unique(boundaries.begin(), boundaries.end(),
+        [](double lhs, double rhs) { return std::abs(lhs - rhs) <= EPSILON; }), boundaries.end());
+
+    struct ClassifiedZone {
+        CadenceZone zone;
+        size_t      tool = size_t(-1);
+    };
+    std::vector<ClassifiedZone> classified;
+    for (size_t i = 1; i < boundaries.size(); ++i) {
+        const double lo = boundaries[i - 1];
+        const double hi = boundaries[i];
+        if (lo + EPSILON >= hi)
+            continue;
+        const bool mixed = std::any_of(snapped.begin(), snapped.end(), [lo, hi](const auto &extent) {
+            return extent.second > lo + EPSILON && extent.first < hi - EPSILON;
+        });
+        if (mixed) {
+            std::set<size_t> tools;
+            std::vector<double> heights;
+            collect_interval(lo, hi, tools, heights);
+            const double fine_height = plan.ratio > 1 ? plan.grid_height :
+                *std::min_element(heights.begin(), heights.end());
+            classified.push_back({{lo, hi, true, plan.base_height, fine_height}, size_t(-1)});
+            continue;
+        }
+
+        std::set<size_t> tools;
+        std::vector<double> heights;
+        collect_interval(lo, hi, tools, heights);
+        const size_t tool = tools.size() == 1 ? *tools.begin() : size_t(-1);
+        const double requested_height = heights.size() == 1 ? heights.front() : plan.base_height;
+        const double span = hi - std::max(lo, first_layer_height);
+        double fitted_height = requested_height;
+        if (span > EPSILON && tool != size_t(-1)) {
+            const double min_height = Slicing::min_layer_height_from_nozzle(nozzle_config, int(tool + 1));
+            const double max_height = Slicing::max_layer_height_from_nozzle(nozzle_config, int(tool + 1));
+            size_t count = std::max<size_t>(1, size_t(std::llround(span / requested_height)));
+            fitted_height = span / count;
+            if (fitted_height < min_height - EPSILON && count > 1)
+                fitted_height = span / --count;
+            else if (fitted_height > max_height + EPSILON)
+                fitted_height = span / ++count;
+        }
+        classified.push_back({{lo, hi, false, fitted_height, 0.}, tool});
+    }
+
+    std::vector<CadenceZone> zones;
+    size_t previous_tool = size_t(-1);
+    for (const ClassifiedZone &item : classified) {
+        if (!zones.empty() && is_approx(zones.back().hi, item.zone.lo) &&
+            zones.back().mixed == item.zone.mixed &&
+            is_approx(zones.back().height, item.zone.height) &&
+            is_approx(zones.back().fine_height, item.zone.fine_height) &&
+            (item.zone.mixed || previous_tool == item.tool)) {
+            zones.back().hi = item.zone.hi;
+        } else {
+            zones.push_back(item.zone);
+        }
+        previous_tool = item.tool;
+    }
+    if (zones.size() == 1 && !zones.front().mixed && is_approx(zones.front().height, plan.base_height))
+        return {};
+    return zones;
+}
+
+static uint64_t cadence_zone_digest(const std::vector<CadenceZone> &zones)
+{
+    if (zones.size() <= 1)
+        return 0;
+
+    uint64_t digest = 1469598103934665603ULL;
+    const auto append = [&digest](const void *data, size_t size) {
+        const auto *bytes = static_cast<const unsigned char *>(data);
+        for (size_t i = 0; i < size; ++i) {
+            digest ^= bytes[i];
+            digest *= 1099511628211ULL;
+        }
+    };
+    for (const CadenceZone &zone : zones) {
+        append(&zone.lo, sizeof(zone.lo));
+        append(&zone.hi, sizeof(zone.hi));
+        append(&zone.mixed, sizeof(zone.mixed));
+        append(&zone.height, sizeof(zone.height));
+        append(&zone.fine_height, sizeof(zone.fine_height));
+    }
+    return digest == 0 ? 1 : digest;
+}
+
 void PrintObject::generate_support_preview()
 {
     POProfiler profiler;
@@ -3907,9 +4674,75 @@ void PrintObject::update_slicing_parameters()
 {
     // Orca: updated function call for XYZ shrinkage compensation
     if (!m_slicing_params.valid) {
-          m_slicing_params = SlicingParameters::create_from_config(this->print()->config(), m_config, this->model_object()->max_z(),
-                                                                   this->object_extruders(), this->print()->shrinkage_compensation());
-      }
+        const FeatureCadencePlan plan = this->compute_feature_cadence_plan();
+        std::vector<unsigned int> fine_cadence_extruders;
+        if (plan.ratio > 1) {
+            for (const PrintRegion &region : this->all_regions())
+                append_fine_cadence_extruders(this->print()->config(), region.config(), plan, fine_cadence_extruders);
+            sort_remove_duplicates(fine_cadence_extruders);
+        }
+        const double first_layer_height = this->print()->config().initial_layer_print_height.value <= 0. ?
+            m_config.layer_height.value : this->print()->config().initial_layer_print_height.value;
+        m_cadence_zones = compute_cadence_zones(*this, plan, first_layer_height, this->model_object()->max_z());
+        double min_zone_height = 0.;
+        double max_zone_height = 0.;
+        if (m_cadence_zones.size() > 1) {
+            min_zone_height = std::numeric_limits<double>::max();
+            for (const CadenceZone &zone : m_cadence_zones) {
+                min_zone_height = std::min(min_zone_height, zone.height);
+                max_zone_height = std::max(max_zone_height, zone.height);
+                if (zone.mixed) {
+                    min_zone_height = std::min(min_zone_height, zone.fine_height);
+                    max_zone_height = std::max(max_zone_height, zone.fine_height);
+                }
+            }
+        }
+        m_slicing_params = SlicingParameters::create_from_config(
+            this->print()->config(), m_config, this->model_object()->max_z(), this->object_extruders(),
+            this->print()->shrinkage_compensation(), &plan, fine_cadence_extruders, min_zone_height, max_zone_height);
+        m_slicing_params.cadence_zone_digest = cadence_zone_digest(m_cadence_zones);
+    }
+}
+
+bool PrintObject::layer_z_in_fine_zone(coordf_t print_z) const
+{
+    if (m_cadence_zones.empty())
+        return m_slicing_params.cadence_ratio > 1;
+    return std::any_of(m_cadence_zones.begin(), m_cadence_zones.end(), [print_z](const CadenceZone &zone) {
+        return zone.mixed && print_z > zone.lo + EPSILON && print_z <= zone.hi + EPSILON;
+    });
+}
+
+bool PrintObject::region_intersects_cadence_zone(const PrintRegion &region, const CadenceZone &zone) const
+{
+    const auto bbox_intersects = [&](const PrintObjectRegions::BoundingBox *bbox) {
+        if (bbox == nullptr)
+            return false;
+        // Region bboxes are deliberately expanded by EPSILON in PrintApply. Require overlap
+        // beyond that expansion so touching a zone boundary is not geometry in both zones.
+        return bbox->max().z() > zone.lo + 2. * EPSILON && bbox->min().z() < zone.hi - 2. * EPSILON;
+    };
+    for (const PrintObjectRegions::LayerRangeRegions &layer_range : m_shared_regions->layer_ranges) {
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions)
+            if (volume_region.region == &region && bbox_intersects(volume_region.bbox))
+                return true;
+        for (const PrintObjectRegions::PaintedRegion &painted_region : layer_range.painted_regions)
+            if (painted_region.region == &region && painted_region.parent >= 0 &&
+                painted_region.parent < int(layer_range.volume_regions.size()) &&
+                bbox_intersects(layer_range.volume_regions[painted_region.parent].bbox))
+                return true;
+    }
+    return false;
+}
+
+FeatureCadencePlan PrintObject::compute_feature_cadence_plan() const
+{
+    FeatureCadencePlan plan;
+    plan.base_height = m_config.layer_height.value;
+    plan.grid_height = plan.base_height;
+    for (const PrintRegion &region : this->all_regions())
+        update_feature_cadence_plan(plan, region.config());
+    return plan;
 }
 
 // Orca: XYZ shrinkage compensation has introduced the const Vec3d &object_shrinkage_compensation parameter to the function below
@@ -3923,16 +4756,25 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 	default_region_config.apply(full_config, true);
     // BBS
 	size_t              filament_extruders = print_config.filament_diameter.size();
-	object_config = object_config_from_model_object(object_config, model_object, filament_extruders, variant_index);
+	object_config = object_config_from_model_object(object_config, model_object, filament_extruders, variant_index, print_config);
 
 	std::vector<unsigned int> object_extruders;
+	std::vector<unsigned int> fine_cadence_extruders;
+	FeatureCadencePlan cadence_plan;
+	cadence_plan.base_height = object_config.layer_height.value;
+	cadence_plan.grid_height = cadence_plan.base_height;
 	for (const ModelVolume* model_volume : model_object.volumes)
 		if (model_volume->is_model_part()) {
+			const PrintRegionConfig region_config = region_config_from_model_volume(
+				default_region_config, default_region_config, nullptr, *model_volume, filament_extruders, variant_index, print_config,
+                1, object_config.layer_height.value, nullptr, nullptr, nullptr);
 			PrintRegion::collect_object_printing_extruders(
 				print_config,
-				region_config_from_model_volume(default_region_config, nullptr, *model_volume, filament_extruders, variant_index),
+				region_config,
                 object_config.brim_type != btNoBrim && object_config.brim_width > 0.,
 				object_extruders);
+			update_feature_cadence_plan(cadence_plan, region_config);
+			append_fine_cadence_extruders(print_config, region_config, cadence_plan, fine_cadence_extruders);
 			for (const std::pair<const t_layer_height_range, ModelConfig> &range_and_config : model_object.layer_config_ranges)
 				if (range_and_config.second.has("outer_wall_filament_id") ||
 					range_and_config.second.has("inner_wall_filament_id") ||
@@ -3942,16 +4784,19 @@ SlicingParameters PrintObject::slicing_parameters(const DynamicPrintConfig &full
 					range_and_config.second.has("bottom_surface_filament_id"))
 					PrintRegion::collect_object_printing_extruders(
 						print_config,
-						region_config_from_model_volume(default_region_config, &range_and_config.second.get(), *model_volume, filament_extruders, variant_index),
+						region_config_from_model_volume(default_region_config, default_region_config, &range_and_config.second.get(), *model_volume, filament_extruders, variant_index,
+                                                        print_config, 1, object_config.layer_height.value, nullptr, nullptr, nullptr),
                         object_config.brim_type != btNoBrim && object_config.brim_width > 0.,
 						object_extruders);
 		}
     sort_remove_duplicates(object_extruders);
+    sort_remove_duplicates(fine_cadence_extruders);
     //FIXME add painting extruders
 
     if (object_max_z <= 0.f)
         object_max_z = (float)model_object.raw_bounding_box().size().z();
-    return SlicingParameters::create_from_config(print_config, object_config, object_max_z, object_extruders, object_shrinkage_compensation);
+    return SlicingParameters::create_from_config(print_config, object_config, object_max_z, object_extruders,
+                                                 object_shrinkage_compensation, &cadence_plan, fine_cadence_extruders);
 }
 
 // returns 0-based indices of extruders used to print the object (without brim, support and other helper extrusions)
@@ -3976,7 +4821,16 @@ std::vector<unsigned int> PrintObject::object_extruders() const
     return extruders;
 }
 
-bool PrintObject::update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters, std::vector<coordf_t> &layer_height_profile)
+bool PrintObject::update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters,
+                                              std::vector<coordf_t> &layer_height_profile)
+{
+    // The GUI layer editor has no PrintObjectRegions and therefore intentionally shows the uniform grid in D6.a.
+    return update_layer_height_profile(model_object, slicing_parameters, layer_height_profile, {});
+}
+
+bool PrintObject::update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters,
+                                              std::vector<coordf_t> &layer_height_profile,
+                                              const std::vector<CadenceZone> &cadence_zones)
 {
     bool updated = false;
 
@@ -3997,7 +4851,28 @@ bool PrintObject::update_layer_height_profile(const ModelObject &model_object, c
             std::abs(layer_height_profile[layer_height_profile.size() - 2] - slicing_parameters.object_print_z_uncompensated_max + slicing_parameters.object_print_z_min) > 1e-3))
         layer_height_profile.clear();
 
-    if (layer_height_profile.empty() || layer_height_profile[1] != slicing_parameters.first_object_layer_height) {
+    const bool cadence_zones_active = slicing_parameters.cadence_zone_digest != 0 && model_object.layer_height_profile.empty();
+    if (cadence_zones_active &&
+        (layer_height_profile.empty() || layer_height_profile[1] != slicing_parameters.first_object_layer_height)) {
+        const auto append = [&layer_height_profile](coordf_t z, coordf_t height) {
+            if (layer_height_profile.size() >= 2 && is_approx(layer_height_profile[layer_height_profile.size() - 2], z) &&
+                is_approx(layer_height_profile.back(), height))
+                return;
+            layer_height_profile.push_back(z);
+            layer_height_profile.push_back(height);
+        };
+        append(0., slicing_parameters.first_object_layer_height);
+        append(slicing_parameters.first_object_layer_height, slicing_parameters.first_object_layer_height);
+        for (const CadenceZone &zone : cadence_zones) {
+            const double lo = std::max(zone.lo, slicing_parameters.first_object_layer_height);
+            if (lo + EPSILON >= zone.hi)
+                continue;
+            const double height = zone.mixed ? zone.fine_height : zone.height;
+            append(lo, height);
+            append(zone.hi, height);
+        }
+        updated = true;
+    } else if (layer_height_profile.empty() || layer_height_profile[1] != slicing_parameters.first_object_layer_height) {
         //layer_height_profile = layer_height_profile_adaptive(slicing_parameters, model_object.layer_config_ranges, model_object.volumes);
         layer_height_profile = layer_height_profile_from_ranges(slicing_parameters, model_object.layer_config_ranges);
         // The layer height profile is already compressed.
@@ -4137,6 +5012,7 @@ void PrintObject::discover_horizontal_shells()
             LayerRegion             *layerm = layer->regions()[region_id];
             const PrintRegionConfig &region_config = layerm->region().config();
 
+            // Patterns are evaluated against fine-grid layer indices when feature cadence is active.
             if (!region_config.extra_solid_infills.value.empty() &&
                 check_layer_id_pattern(region_config.extra_solid_infills.value, i)) {
                 // Insert a solid internal layer. Mark stInternal surfaces as stInternalSolid.
@@ -4154,7 +5030,17 @@ void PrintObject::discover_horizontal_shells()
             for (size_t idx_surface_type = 0; idx_surface_type < 3; ++ idx_surface_type) {
                 m_print->throw_if_canceled();
                 SurfaceType type = (idx_surface_type == 0) ? stTop : (idx_surface_type == 1) ? stBottom : stBottomBridge;
-                int num_solid_layers = (type == stTop) ? region_config.top_shell_layers.value : region_config.bottom_shell_layers.value;
+                int num_solid_layers = scaled_shell_layers(
+                    (type == stTop) ? region_config.top_shell_layers.value : region_config.bottom_shell_layers.value,
+                    layer_z_in_fine_zone(layer->print_z) ? m_slicing_params.cadence_ratio : 1,
+                    feature_height_for_role(region_config,
+                                          type == stTop ? FeatureRole::TopSurface : FeatureRole::BottomSurface,
+                                          m_slicing_params.base_layer_height),
+                    m_slicing_params.base_layer_height);
+                if (type != stTop && i == 0 && layer_z_in_fine_zone(layer->print_z) &&
+                    m_slicing_params.cadence_ratio > 1 && num_solid_layers > 0)
+                    // The initial layer is already one full base-cadence group, not one fine-grid layer.
+                    num_solid_layers -= m_slicing_params.cadence_ratio - 1;
                 if (num_solid_layers == 0)
                 	continue;
                 // Find slices of current type for current layer.
@@ -4341,6 +5227,10 @@ void PrintObject::combine_infill()
 {
     // Work on each region separately.
     for (size_t region_id = 0; region_id < this->num_printing_regions(); ++ region_id) {
+        // TODO(D6.b): Base cadence zones could re-enable infill combination locally.
+        // Feature cadence owns every region while any refined object grid is active.
+        if (m_slicing_params.cadence_ratio > 1)
+            continue;
         const PrintRegion &region = this->printing_region(region_id);
         //BBS
         const bool enable_combine_infill = region.config().infill_combination.value;
@@ -4355,9 +5245,10 @@ void PrintObject::combine_infill()
 
         // Limit the number of combined layers to the maximum height allowed by this regions' nozzle.
         //FIXME limit the layer height to max_layer_height
+        const PrintConfig &print_config = this->print()->config();
         double nozzle_diameter = std::min(
-            this->print()->config().nozzle_diameter.get_at(region.config().sparse_infill_filament_id.value - 1),
-            this->print()->config().nozzle_diameter.get_at(region.config().internal_solid_filament_id.value - 1));
+            print_config.nozzle_diameter.get_at(get_extruder_index_from_filament_id(print_config, region.config().sparse_infill_filament_id.value)),
+            print_config.nozzle_diameter.get_at(get_extruder_index_from_filament_id(print_config, region.config().internal_solid_filament_id.value)));
         
         //Orca: Limit combination of infill to up to infill_combination_max_layer_height
         const double infill_combination_max_layer_height = region.config().infill_combination_max_layer_height.get_abs_value(nozzle_diameter);
@@ -4423,18 +5314,7 @@ void PrintObject::combine_infill()
             // so let's remove those areas from all layers.
             Polygons intersection_with_clearance;
             intersection_with_clearance.reserve(intersection.size());
-            float clearance_offset =
-                0.5f * layerms.back()->flow(frPerimeter).scaled_width() +
-             // Because fill areas for rectilinear and honeycomb are grown
-             // later to overlap perimeters, we need to counteract that too.
-                ((infill_pattern == ipRectilinear   ||
-                  infill_pattern == ipMonotonic     ||
-                  infill_pattern == ipGrid          ||
-                  infill_pattern == ipLateralLattice     ||
-                  infill_pattern == ipLine          ||
-                  infill_pattern == ipHoneycomb     ||
-                  infill_pattern == ipLateralHoneycomb) ? 1.5f : 0.5f) *
-                    layerms.back()->flow(frSolidInfill).scaled_width();
+            const float clearance_offset = infill_combination_clearance(*layerms.back(), infill_pattern);
             for (ExPolygon &expoly : intersection)
                 polygons_append(intersection_with_clearance, offset(expoly, clearance_offset));
             for (LayerRegion *layerm : layerms) {

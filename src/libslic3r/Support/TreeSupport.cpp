@@ -680,8 +680,12 @@ void TreeSupport::detect_overhangs(bool check_support_necessity/* = false*/)
     const PrintObjectConfig& config = m_object->config();
     SupportType stype = support_type;
     const coordf_t radius_sample_resolution = g_config_tree_support_collision_resolution;
-    const double nozzle_diameter = m_object->print()->config().nozzle_diameter.get_at(0);
-    const coordf_t extrusion_width = config.get_abs_value("line_width", nozzle_diameter);
+    const unsigned int interface_filament_id = std::max(1, config.support_interface_filament.value);
+    const size_t interface_config_index = m_object->print()->get_print_config_index(interface_filament_id);
+    const double nozzle_diameter = m_object->print()->config().nozzle_diameter.get_at(
+        get_extruder_index_from_filament_id(m_object->print()->config(), interface_filament_id));
+    // The generic width follows the support-interface tool used for overhang detection.
+    const coordf_t extrusion_width = config.line_width.get_at(interface_config_index).get_abs_value(nozzle_diameter);
     const coordf_t extrusion_width_scaled = scale_(extrusion_width);
     const coordf_t max_bridge_length = scale_(config.max_bridge_length.value);
     const bool bridge_no_support = max_bridge_length > 0;
@@ -2009,8 +2013,11 @@ void TreeSupport::draw_circles()
         int(m_support_params.num_top_base_interface_layers),
         top_interface_layers > 0 ? int(top_interface_layers) - 1 : 0);
     const size_t bottom_interface_layers = number_of_support_interface_bottom_layers(config);
-    const double nozzle_diameter = m_object->print()->config().nozzle_diameter.get_at(0);
-    const coordf_t line_width = config.get_abs_value("support_line_width", nozzle_diameter);
+    const unsigned int support_filament_id = std::max(1, config.support_filament.value);
+    const size_t support_config_index = m_object->print()->get_print_config_index(support_filament_id);
+    const double nozzle_diameter = m_object->print()->config().nozzle_diameter.get_at(
+        get_extruder_index_from_filament_id(m_object->print()->config(), support_filament_id));
+    const coordf_t line_width = config.support_line_width.get_at(support_config_index).get_abs_value(nozzle_diameter);
     const coordf_t line_width_scaled           = scale_(line_width);
     const bool with_lightning_infill = m_support_params.base_fill_pattern == ipLightning;
     coordf_t support_extrusion_width = m_support_params.support_extrusion_width;
@@ -3180,7 +3187,11 @@ void TreeSupport::smooth_nodes()
         }
     }
     
-    float max_move = scale_(m_object_config->support_line_width / 2);
+    const unsigned int support_filament_id = std::max(1, m_object_config->support_filament.value);
+    const size_t support_config_index = m_object->print()->get_print_config_index(support_filament_id);
+    const double nozzle_diameter = m_object->print()->config().nozzle_diameter.get_at(
+        get_extruder_index_from_filament_id(m_object->print()->config(), support_filament_id));
+    float max_move = scale_(m_object_config->support_line_width.get_at(support_config_index).get_abs_value(nozzle_diameter) / 2);
     // if the branch is very tall, the tip also needs extra wall
     float thresh_tall_branch = 100;
     float thresh_dist_to_top = 30;

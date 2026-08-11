@@ -2,6 +2,7 @@
 #include "PrintConfigConstants.hpp"
 #include "ClipperUtils.hpp"
 #include "Config.hpp"
+#include "Preset.hpp"
 #include "MaterialType.hpp"
 #include "I18N.hpp"
 #include "format.hpp"
@@ -103,6 +104,30 @@ size_t get_extruder_index(const GCodeConfig& config, unsigned int filament_id)
         return config.filament_map.get_at(filament_id)-1;
     }
     return 0;
+}
+
+size_t get_extruder_index_from_filament_id(const GCodeConfig& config, unsigned int filament_id)
+{
+    if (filament_id == 0)
+        return 0;
+    const unsigned int idx = filament_id - 1;
+    if (idx < config.filament_map.size())
+        return config.filament_map.get_at(idx) - 1;
+    // No materialized filament map for this slot: keep the legacy identity mapping.
+    return idx;
+}
+
+size_t get_print_config_index_from_filament_id(const GCodeConfig& config, unsigned int filament_id)
+{
+    if (filament_id > 0) {
+        const size_t filament_index = size_t(filament_id - 1);
+        if (filament_index < config.filament_map_2.size()) {
+            const int config_index = config.filament_map_2.get_at(filament_index);
+            if (config_index >= 0)
+                return size_t(config_index);
+        }
+    }
+    return get_extruder_index_from_filament_id(config, filament_id);
 }
 
 
@@ -634,6 +659,20 @@ static const t_config_enum_values s_keys_map_FilamentMapMode = {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FilamentMapMode)
 
+static const t_config_enum_values s_keys_map_FeatureProcessPolicy = {
+    { "auto_nozzle_variant", int(FeatureProcessPolicy::AutoNozzleVariant) },
+    { "pinned",              int(FeatureProcessPolicy::Pinned) },
+    { "same_as_object",      int(FeatureProcessPolicy::SameAsObject) },
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FeatureProcessPolicy)
+
+static const t_config_enum_values s_keys_map_FilamentProcessPolicy = {
+    { "auto_nozzle_variant", int(FilamentProcessPolicy::AutoNozzleVariant) },
+    { "pinned",              int(FilamentProcessPolicy::Pinned) },
+    { "global_process",      int(FilamentProcessPolicy::GlobalProcess) },
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(FilamentProcessPolicy)
+
 // PrimeVolumeMode. Serialized string keys must stay stable; they round-trip through .3mf.
 static const t_config_enum_values s_keys_map_PrimeVolumeMode = {
     { "Default", pvmDefault },
@@ -1105,6 +1144,50 @@ void PrintConfigDef::init_common_params()
 void PrintConfigDef::init_fff_params()
 {
     ConfigOptionDef* def;
+
+    auto add_feature_process_options = [this](
+        const char *process_prefix,
+        const char *layer_height_key,
+        const char *policy_label,
+        const char *preset_label,
+        const char *layer_height_label) {
+        ConfigOptionDef *feature_def = this->add(std::string(process_prefix) + "_policy", coEnum);
+        feature_def->label = policy_label;
+        feature_def->category = L("Extruders");
+        feature_def->tooltip = L("Selects the process settings for this feature. Automatic selects a nozzle-compatible variant for the feature's tool, Pinned uses the named preset, and Same as object keeps the object's process settings. Automatic is the nozzle-safe default.");
+        feature_def->enum_keys_map = &ConfigOptionEnum<FeatureProcessPolicy>::get_enum_values();
+        feature_def->enum_values.push_back("auto_nozzle_variant");
+        feature_def->enum_values.push_back("pinned");
+        feature_def->enum_values.push_back("same_as_object");
+        feature_def->enum_labels.push_back(L("Automatic nozzle-matched variant"));
+        feature_def->enum_labels.push_back(L("Pinned preset"));
+        feature_def->enum_labels.push_back(L("Same as object"));
+        feature_def->mode = comAdvanced;
+        feature_def->set_default_value(new ConfigOptionEnum<FeatureProcessPolicy>(FeatureProcessPolicy::AutoNozzleVariant));
+
+        feature_def = this->add(std::string(process_prefix) + "_preset", coString);
+        feature_def->label = preset_label;
+        feature_def->category = L("Extruders");
+        feature_def->tooltip = L("Process preset name used when the feature process policy is Pinned preset.");
+        feature_def->mode = comAdvanced;
+        feature_def->set_default_value(new ConfigOptionString());
+
+        feature_def = this->add(layer_height_key, coFloat);
+        feature_def->label = layer_height_label;
+        feature_def->category = L("Extruders");
+        feature_def->tooltip = L("Requested layer height for this feature. Zero follows the resolved process or object layer height.");
+        feature_def->sidetext = L("mm");
+        feature_def->min = 0.;
+        feature_def->mode = comDevelop;
+        feature_def->set_default_value(new ConfigOptionFloat(0.));
+
+        feature_def = this->add(std::string(process_prefix) + "_projection", coString);
+        feature_def->label = "Feature process projection";
+        feature_def->category = L("Extruders");
+        feature_def->tooltip = "Internal derived cache of resolved feature process settings. Recomputed from the selected policy and preset.";
+        feature_def->mode = comDevelop;
+        feature_def->set_default_value(new ConfigOptionString());
+    };
 
     // Maximum extruder temperature, bumped to 1500 to support printing of glass.
     const int max_temp = 1500;
@@ -2421,7 +2504,7 @@ void PrintConfigDef::init_fff_params()
     def->enum_labels   = def_top_fill_pattern->enum_labels;
     def->set_default_value(new ConfigOptionEnum<InfillPattern>(ipMonotonic));
     
-    def = this->add("outer_wall_line_width", coFloatOrPercent);
+    def = this->add("outer_wall_line_width", coFloatsOrPercents);
     def->label = L("Outer wall");
     def->category = L("Quality");
     def->tooltip = L("Line width of outer wall. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -2431,7 +2514,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("outer_wall_speed", coFloats);
     def->label = L("Outer wall");
@@ -2740,7 +2824,7 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionFloats { 0.0 });
 
-    def = this->add("line_width", coFloatOrPercent);
+    def = this->add("line_width", coFloatsOrPercents);
     def->label = L("Default");
     def->category = L("Quality");
     def->tooltip = L("Default line width if other line widths are set to 0. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -2750,7 +2834,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0, false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0, false)});
 
     def = this->add("reduce_fan_stop_start_freq", coBools);
     def->label = L("Keep fan always on");
@@ -2850,6 +2935,34 @@ void PrintConfigDef::init_fff_params()
     def->tooltip = "Map the logical extruder to physical extruder.";
     def->mode = comDevelop;
     def->set_default_value(new ConfigOptionInts{0});
+
+    def = this->add("project_nozzle_diameter", coFloats);
+    def->label = L("Project nozzle diameters");
+    def->tooltip = L("The physically installed nozzle diameter for each extruder. "
+                     "When set, these values override the nozzle diameters from the printer preset for this project.");
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionFloats{});
+
+    def = this->add("filament_process_policy", coEnums);
+    def->label = L("Filament process policy");
+    def->tooltip = L("Selects how the process preset is resolved for each filament slot.");
+    def->enum_keys_map = &ConfigOptionEnum<FilamentProcessPolicy>::get_enum_values();
+    def->enum_values = {"auto_nozzle_variant", "pinned", "global_process"};
+    def->enum_labels = {L("Automatic nozzle-matched variant"), L("Pinned preset"), L("Use the global process")};
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionEnumsGeneric{int(FilamentProcessPolicy::AutoNozzleVariant)});
+
+    def = this->add("filament_process_preset", coStrings);
+    def->label = L("Filament process preset");
+    def->tooltip = L("Process preset name used when the filament process policy is Pinned preset.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionStrings{""});
+
+    def = this->add("filament_process_projection", coStrings);
+    def->label = L("Filament process projection");
+    def->tooltip = L("Derived process settings for each filament slot.");
+    def->mode = comDevelop;
+    def->set_default_value(new ConfigOptionStrings{""});
 
     def = this->add("filament_map_mode", coEnum);
     // internal use only, don't need translation
@@ -3648,7 +3761,7 @@ void PrintConfigDef::init_fff_params()
     def->nullable = true;
     def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(100, true)});
 
-    def = this->add("initial_layer_line_width", coFloatOrPercent);
+    def = this->add("initial_layer_line_width", coFloatsOrPercents);
     def->label = L("First layer");
     def->category = L("Quality");
     def->tooltip = L("Line width of the first layer. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -3658,7 +3771,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("initial_layer_print_height", coFloat);
     def->label = L("First layer height");
@@ -4394,7 +4508,7 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionFloat(1.0));
 
-    def           = this->add("skin_infill_line_width", coFloatOrPercent);
+    def           = this->add("skin_infill_line_width", coFloatsOrPercents);
     def->label    = L("Skin line width");
     def->category = L("Strength");
     def->tooltip  = L("Adjust the line width of the selected skin paths.");
@@ -4402,9 +4516,10 @@ void PrintConfigDef::init_fff_params()
     def->ratio_over = "nozzle_diameter";
     def->min      = 0;
     def->mode     = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(100, true));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(100, true)});
 
-    def           = this->add("skeleton_infill_line_width", coFloatOrPercent);
+    def           = this->add("skeleton_infill_line_width", coFloatsOrPercents);
     def->label    = L("Skeleton line width");
     def->category = L("Strength");
     def->tooltip  = L("Adjust the line width of the selected skeleton paths.");
@@ -4412,7 +4527,8 @@ void PrintConfigDef::init_fff_params()
     def->ratio_over = "nozzle_diameter";
     def->min      = 0;
     def->mode     = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(100, true));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(100, true)});
 
     def           = this->add("symmetric_infill_y_axis", coBool);
     def->label    = L("Symmetric infill Y axis");
@@ -4578,7 +4694,11 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
-    def = this->add("sparse_infill_line_width", coFloatOrPercent);
+    add_feature_process_options(
+        "sparse_infill_process", "sparse_infill_process_layer_height",
+        L("Sparse infill process policy"), L("Sparse infill process preset"), L("Sparse infill layer height"));
+
+    def = this->add("sparse_infill_line_width", coFloatsOrPercents);
     def->label = L("Sparse infill");
     def->category = L("Quality");
     def->tooltip = L("Line width of internal sparse infill. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -4588,7 +4708,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("infill_wall_overlap", coPercent);
     def->label = L("Infill/wall overlap");
@@ -5496,7 +5617,11 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
-    def = this->add("inner_wall_line_width", coFloatOrPercent);
+    add_feature_process_options(
+        "wall_process", "wall_layer_height",
+        L("Wall process policy"), L("Wall process preset"), L("Wall layer height"));
+
+    def = this->add("inner_wall_line_width", coFloatsOrPercents);
     def->label = L("Inner wall");
     def->category = L("Quality");
     def->tooltip = L("Line width of inner wall. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -5506,7 +5631,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("inner_wall_speed", coFloats);
     def->label = L("Inner wall");
@@ -6366,7 +6492,17 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionInt(0));
 
-    def = this->add("internal_solid_infill_line_width", coFloatOrPercent);
+    add_feature_process_options(
+        "internal_solid_process", "internal_solid_process_layer_height",
+        L("Internal solid infill process policy"), L("Internal solid infill process preset"), L("Internal solid infill layer height"));
+    add_feature_process_options(
+        "top_surface_process", "top_surface_process_layer_height",
+        L("Top surface process policy"), L("Top surface process preset"), L("Top surface layer height"));
+    add_feature_process_options(
+        "bottom_surface_process", "bottom_surface_process_layer_height",
+        L("Bottom surface process policy"), L("Bottom surface process preset"), L("Bottom surface layer height"));
+
+    def = this->add("internal_solid_infill_line_width", coFloatsOrPercents);
     def->label = L("Internal solid infill");
     def->category = L("Quality");
     def->tooltip = L("Line width of internal solid infill. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -6376,7 +6512,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("internal_solid_infill_speed", coFloats);
     def->label = L("Internal solid infill");
@@ -6777,6 +6914,10 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
 
+    add_feature_process_options(
+        "support_process", "support_process_layer_height",
+        L("Support process policy"), L("Support process preset"), L("Support layer height"));
+
     def = this->add("support_interface_not_for_body",coBool);
     def->label    = L("Avoid interface filament for base");
     def->category = L("Support");
@@ -6784,7 +6925,7 @@ void PrintConfigDef::init_fff_params()
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionBool(true));
 
-    def = this->add("support_line_width", coFloatOrPercent);
+    def = this->add("support_line_width", coFloatsOrPercents);
     def->label = L("Support");
     def->category = L("Quality");
     def->tooltip = L("Line width of support. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -6794,7 +6935,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("support_interface_loop_pattern", coBool);
     def->label = L("Loop pattern interface");
@@ -6812,6 +6954,10 @@ void PrintConfigDef::init_fff_params()
     // BBS
     def->mode = comSimple;
     def->set_default_value(new ConfigOptionInt(0));
+
+    add_feature_process_options(
+        "support_interface_process", "support_interface_process_layer_height",
+        L("Support interface process policy"), L("Support interface process preset"), L("Support interface layer height"));
 
     auto support_interface_top_layers = def = this->add("support_interface_top_layers", coInt);
     def->gui_type = ConfigOptionDef::GUIType::i_enum_open;
@@ -7295,7 +7441,7 @@ void PrintConfigDef::init_fff_params()
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionStrings{ "" });
 
-    def = this->add("top_surface_line_width", coFloatOrPercent);
+    def = this->add("top_surface_line_width", coFloatsOrPercents);
     def->label = L("Top surface");
     def->category = L("Quality");
     def->tooltip = L("Line width for top surfaces. If expressed as a %, it will be computed over the nozzle diameter.");
@@ -7305,7 +7451,8 @@ void PrintConfigDef::init_fff_params()
     def->max = 1000;
     def->max_literal = 10;
     def->mode = comAdvanced;
-    def->set_default_value(new ConfigOptionFloatOrPercent(0., false));
+    def->nullable = true;
+    def->set_default_value(new ConfigOptionFloatsOrPercentsNullable{FloatOrPercent(0., false)});
 
     def = this->add("top_surface_speed", coFloats);
     def->label = L("Top surface");
@@ -9200,11 +9347,22 @@ const PrintConfigDef print_config_def;
 
 //todo
 std::set<std::string> print_options_with_variant = {
+    "line_width",
+    "outer_wall_line_width",
+    "inner_wall_line_width",
+    "sparse_infill_line_width",
+    "internal_solid_infill_line_width",
+    "top_surface_line_width",
+    "skin_infill_line_width",
+    "skeleton_infill_line_width",
+    "support_line_width",
+    "initial_layer_line_width",
     "initial_layer_speed",
     "initial_layer_infill_speed",
     "outer_wall_speed",
     "inner_wall_speed",
     "small_perimeter_speed",  //coFloatsOrPercents
+    "small_support_perimeter_speed",
     "small_perimeter_threshold",
     "sparse_infill_speed",
     "internal_solid_infill_speed",
@@ -9383,6 +9541,63 @@ std::set<std::string> filament_dev_options = {
 DynamicPrintConfig DynamicPrintConfig::full_print_config()
 {
 	return DynamicPrintConfig((const PrintRegionConfig&)FullPrintConfig::defaults());
+}
+
+std::vector<double> effective_nozzle_diameters(const DynamicPrintConfig &full_or_printer_config)
+{
+    const auto *nozzle_diameters = full_or_printer_config.option<ConfigOptionFloats>("nozzle_diameter");
+    if (nozzle_diameters == nullptr)
+        return {};
+
+    std::vector<double> result = nozzle_diameters->values;
+    const auto *project_diameters = full_or_printer_config.option<ConfigOptionFloats>("project_nozzle_diameter");
+    if (project_diameters == nullptr)
+        return result;
+
+    const size_t count = std::min(result.size(), project_diameters->values.size());
+    std::copy_n(project_diameters->values.begin(), count, result.begin());
+    return result;
+}
+
+void apply_project_nozzle_diameters(
+    DynamicPrintConfig &config,
+    const std::function<const Preset *(double)> &sibling_source)
+{
+    auto *nozzle_diameters = config.option<ConfigOptionFloats>("nozzle_diameter");
+    const auto *project_diameters = config.option<ConfigOptionFloats>("project_nozzle_diameter");
+    if (nozzle_diameters == nullptr || project_diameters == nullptr || project_diameters->values.empty())
+        return;
+
+    const size_t count = std::min(nozzle_diameters->values.size(), project_diameters->values.size());
+    for (size_t i = 0; i < count; ++i) {
+        if (nozzle_diameters->values[i] == project_diameters->values[i])
+            continue;
+
+        const double  project_diameter = project_diameters->values[i];
+        const Preset *sibling = sibling_source == nullptr ? nullptr : sibling_source(project_diameter);
+        nozzle_diameters->values[i] = project_diameter;
+        for (const char *key : {"min_layer_height", "max_layer_height"}) {
+            auto *limits = config.option<ConfigOptionFloats>(key, true);
+            if (limits->values.size() < nozzle_diameters->values.size())
+                limits->resize(nozzle_diameters->values.size(), FullPrintConfig::defaults().option(key));
+            const auto *sibling_limits = sibling == nullptr ? nullptr : sibling->config.option<ConfigOptionFloats>(key);
+            limits->values[i] = sibling_limits == nullptr || sibling_limits->values.empty() ? 0. : sibling_limits->get_at(0);
+        }
+    }
+}
+
+int logical_index_for_device_extruder(const DynamicPrintConfig &config, int device_ext_id)
+{
+    const auto *physical_map = config.option<ConfigOptionInts>("physical_extruder_map");
+    if (physical_map != nullptr) {
+        const auto found = std::find(physical_map->values.begin(), physical_map->values.end(), device_ext_id);
+        if (found != physical_map->values.end())
+            return int(std::distance(physical_map->values.begin(), found));
+    }
+
+    // H2D reports device extruder 0 as MAIN/right, while preset logical index 0 is left
+    // under physical_extruder_map ["1", "0"]. Unmapped or short maps use identity.
+    return device_ext_id;
 }
 
 DynamicPrintConfig::DynamicPrintConfig(const StaticPrintConfig& rhs) : DynamicConfig(rhs, rhs.keys_ref())
@@ -10831,6 +11046,9 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
         std::vector<int> variant_index;
 
         variant_index.resize(filament_count, -1);
+        // Filaments resolved through the identity fallback (no id-map match) must also get an
+        // identity id in the remapped id list, or later runtime lookups still collapse to slot 0.
+        std::vector<char> identity_fallback(filament_count, 0);
 
         for (int f_index = 0; f_index < filament_count; f_index++)
         {
@@ -10849,11 +11067,15 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
                 assert(false);
                 //for some updates happens in a invalid state(caused by popup window)
                 //we need to avoid crash
-                variant_index[f_index] = 0;
+                // Degrade to the identity column so a short or missing id map keeps this
+                // filament's own values instead of silently copying filament 1's.
+                variant_index[f_index] = f_index;
+                identity_fallback[f_index] = 1;
                 if (opt_ids) {
                     for (int i = 0; i < opt_ids->values.size(); i++)
                         if (opt_ids->values[i] == (f_index+1)) {
                             variant_index[f_index] = i;
+                            identity_fallback[f_index] = 0;
                             break;
                         }
                 }
@@ -11035,7 +11257,7 @@ void DynamicPrintConfig::update_values_to_printer_extruders_for_multiple_filamen
             std::vector<int> new_values;
             new_values.resize(filament_count);
             for (int f_index = 0; f_index < filament_count; f_index++) {
-                new_values[f_index] = opt_ids->get_at(variant_index[f_index]);
+                new_values[f_index] = identity_fallback[f_index] ? f_index + 1 : opt_ids->get_at(variant_index[f_index]);
             }
             const_cast<ConfigOptionInts*>(opt_ids)->values = new_values;
         }
@@ -11687,7 +11909,10 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
         for (size_t i = 0; i < sizeof(widths) / sizeof(widths[i]); ++ i) {
             std::string key(widths[i]);
             double abs_width = cfg.get_abs_value(key, max_nozzle_diameter);
-            double allowed_max = (key == "bridge_line_width") ? min_nozzle_diameter : MAX_LINE_WIDTH_MULTIPLIER * max_nozzle_diameter;
+            // Config-level pre-filter only: with mixed nozzle diameters the per-role bridge
+            // width check in Print::validate() is authoritative; bounding by the MIN nozzle
+            // here would reject widths that are valid on the coarser tool.
+            double allowed_max = (key == "bridge_line_width") ? max_nozzle_diameter : MAX_LINE_WIDTH_MULTIPLIER * max_nozzle_diameter;
             if (abs_width > allowed_max) {
                 if (key == "bridge_line_width")
                     error_message.emplace(key, L("Bridge line width must not exceed nozzle diameter: ") + std::to_string(abs_width));
@@ -11722,6 +11947,15 @@ std::map<std::string, std::string> validate(const FullPrintConfig &cfg, bool und
                     break;
                 }
             break;
+        case coFloatsOrPercents: {
+            const auto *values = static_cast<const ConfigOptionVector<FloatOrPercent> *>(opt);
+            for (size_t index = 0; index < values->values.size(); ++index)
+                if (!values->is_nil(index) && !optdef->is_value_valid(values->values[index].value)) {
+                    out_of_range = true;
+                    break;
+                }
+            break;
+        }
         case coInt:
         {
             auto *iopt = static_cast<const ConfigOptionInt*>(opt);
@@ -12133,6 +12367,27 @@ CLIMiscConfigDef::CLIMiscConfigDef()
     def = this->add("datadir", coString);
     def->label = L("Data directory");
     def->tooltip = L("Load and store settings at the given directory. This is useful for maintaining different profiles or including configurations from a network storage.");
+
+    def = this->add("gui_smoke", coBool);
+    def->label = "GUI smoke test";
+    def->tooltip = "Run the scripted GUI smoke test and exit.";
+    def->set_default_value(new ConfigOptionBool(false));
+
+    def = this->add("gui_smoke_steps", coString);
+    def->label = "GUI smoke test steps";
+    def->tooltip = "Comma-separated scripted GUI smoke test steps to run.";
+    def->set_default_value(new ConfigOptionString());
+
+#ifdef __APPLE__
+    // Cocoa consumes this per-launch argument to suppress saved-state recovery.
+    // Register it here only so Orca's CLI parser passes the native option through;
+    // it is intentionally never copied into AppConfig or persistent defaults.
+    def = this->add("apple_persistence_ignore_state", coString);
+    def->cli = "ApplePersistenceIgnoreState";
+    def->label = "Ignore macOS saved application state";
+    def->tooltip = "Pass-through for the macOS per-launch saved-state override.";
+    def->set_default_value(new ConfigOptionString());
+#endif
 
 
     def = this->add("outputdir", coString);

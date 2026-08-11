@@ -780,7 +780,7 @@ void PerimeterGenerator::split_top_surfaces(const ExPolygons &orig_polygons, ExP
     // get the real top surface
     ExPolygons grown_lower_slices;
     ExPolygons bridge_checker;
-    auto nozzle_diameter = this->print_config->nozzle_diameter.get_at(this->config->outer_wall_filament_id - 1);
+    auto nozzle_diameter = this->print_config->nozzle_diameter.get_at(get_extruder_index_from_filament_id(*this->print_config, this->config->outer_wall_filament_id));
     // Check whether surface be bridge or not
     if (this->lower_slices != NULL) {
         // BBS: get the Polygons below the polygon this layer
@@ -810,8 +810,12 @@ void PerimeterGenerator::split_top_surfaces(const ExPolygons &orig_polygons, ExP
     // increase by half peri the inner space to fill the frontier between last and stored.
     top_fills = union_ex(top_fills, top_polygons);
     //set the clip to the external wall but go back inside by infill_extrusion_width/2 to be sure the extrusion won't go outside even with a 100% overlap.
-    double infill_spacing_unscaled = this->config->sparse_infill_line_width.get_abs_value(nozzle_diameter);
-    if (infill_spacing_unscaled == 0) infill_spacing_unscaled = Flow::auto_extrusion_width(frInfill, nozzle_diameter);
+    const unsigned int infill_filament_id = this->config->sparse_infill_filament_id.value;
+    const size_t infill_tool_id = get_extruder_index_from_filament_id(*this->print_config, infill_filament_id);
+    const size_t infill_config_index = get_print_config_index_from_filament_id(*this->print_config, infill_filament_id);
+    const double infill_nozzle_diameter = this->print_config->nozzle_diameter.get_at(infill_tool_id);
+    double infill_spacing_unscaled = this->config->sparse_infill_line_width.get_at(infill_config_index).get_abs_value(infill_nozzle_diameter);
+    if (infill_spacing_unscaled == 0) infill_spacing_unscaled = Flow::auto_extrusion_width(frInfill, infill_nozzle_diameter);
     fill_clip = offset_ex(orig_polygons, double(ext_perimeter_spacing / 2.) - scale_(infill_spacing_unscaled / 2.));
     // ExPolygons oldLast = last;
 
@@ -1334,7 +1338,7 @@ void PerimeterGenerator::process_classic()
         // We consider overhang any part where the entire nozzle diameter is not supported by the
         // lower layer, so we take lower slices and offset them by half the nozzle diameter used
         // in the current layer
-        double nozzle_diameter = this->print_config->nozzle_diameter.get_at(this->config->outer_wall_filament_id - 1);
+        double nozzle_diameter = this->print_config->nozzle_diameter.get_at(get_extruder_index_from_filament_id(*this->print_config, this->config->outer_wall_filament_id));
         m_lower_slices_polygons = offset(*this->lower_slices, float(scale_(+nozzle_diameter / 2)));
     }
 
@@ -2354,7 +2358,7 @@ void PerimeterGenerator::process_arachne()
         // We consider overhang any part where the entire nozzle diameter is not supported by the
         // lower layer, so we take lower slices and offset them by half the nozzle diameter used
         // in the current layer
-        double nozzle_diameter = this->print_config->nozzle_diameter.get_at(this->config->outer_wall_filament_id - 1);
+        double nozzle_diameter = this->print_config->nozzle_diameter.get_at(get_extruder_index_from_filament_id(*this->print_config, this->config->outer_wall_filament_id));
         m_lower_slices_polygons = offset(*this->lower_slices, float(scale_(+nozzle_diameter / 2)));
     }
 
@@ -2800,7 +2804,7 @@ bool PerimeterGeneratorLoop::is_internal_contour() const
 
 std::vector<Polygons> PerimeterGenerator::generate_lower_polygons_series(float width)
 {
-    float nozzle_diameter = print_config->nozzle_diameter.get_at(config->outer_wall_filament_id - 1);
+    float nozzle_diameter = print_config->nozzle_diameter.get_at(get_extruder_index_from_filament_id(*print_config, config->outer_wall_filament_id));
     float start_offset = -0.5 * width;
     float end_offset = 0.5 * nozzle_diameter;
 

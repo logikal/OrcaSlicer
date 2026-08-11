@@ -72,6 +72,26 @@ Slic3r::Model model(const std::string& model_name, TriangleMesh&& _mesh);
 DynamicPrintConfig multifilament_config(unsigned int filaments,
     std::initializer_list<Slic3r::ConfigBase::SetDeserializeItem> extra = {});
 
+// Two physical tools (0.2 mm and 0.4 mm) with walls assigned to tool 0 and interiors to tool 1.
+DynamicPrintConfig mixed_nozzle_config(
+    std::initializer_list<Slic3r::ConfigBase::SetDeserializeItem> extra = {});
+
+struct GCodeExtrusion {
+    ExtrusionRole role   = erNone;
+    int           tool   = 0;
+    double        z      = 0.;
+    double        height = 0.;
+};
+
+struct GCodeToolChange {
+    int    tool = 0;
+    double z    = 0.;
+};
+
+// Stateful parsing of processor role/height tags plus the active tool and extrusion Z.
+std::vector<GCodeExtrusion>  gcode_extrusions(const std::string &gcode);
+std::vector<GCodeToolChange> gcode_tool_changes(const std::string &gcode);
+
 // Apply `meshes` and config to `print`/`model`; optional per-object overrides, auto-arranged unless `arrange` is false.
 void init_print(std::vector<TriangleMesh> &&meshes, Slic3r::Print &print, Slic3r::Model &model, const DynamicPrintConfig &config_in,
     const std::vector<std::vector<Slic3r::ConfigBase::SetDeserializeItem>> *per_object_overrides = nullptr, bool arrange = true);

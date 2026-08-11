@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -267,6 +268,66 @@ TEST_CASE("Each feature prints with its assigned filament", "[MultiFilament]")
         CHECK(tools_for_role(gcode, "infill")    == infill_tool); // sparse + solid + top/bottom
         CHECK(tools_for_role(gcode, "brim")      == wall_tool);
         CHECK(tools_for_role(gcode, "skirt")     == wall_tool);
+    }
+}
+
+TEST_CASE("Feature filament routing survives mixed-nozzle wall cadence", "[MultiFilament][FeatureCadence]")
+{
+    const DynamicPrintConfig config = mixed_nozzle_config({
+        { "sparse_infill_density",          15. },
+        { "top_shell_layers",               2 },
+        { "bottom_shell_layers",            2 },
+        { "top_shell_thickness",            0. },
+        { "bottom_shell_thickness",         0. },
+        { "ensure_vertical_shell_thickness", "none" },
+        { "enable_prime_tower",             false },
+    });
+    const std::string output = slice_with_object_overrides(
+        { cube(20.) }, config,
+        {{{ "wall_layer_height", 0.1 },
+          { "wall_process_projection", "outer_wall_line_width=0.24;inner_wall_line_width=0.24" }}});
+
+    std::map<ExtrusionRole, std::set<int>> tools_by_role;
+    for (const GCodeExtrusion &extrusion : gcode_extrusions(output))
+        tools_by_role[extrusion.role].insert(extrusion.tool);
+
+    CHECK(tools_by_role[erPerimeter] == std::set<int>{0});
+    CHECK(tools_by_role[erExternalPerimeter] == std::set<int>{0});
+    CHECK(tools_by_role[erInternalInfill] == std::set<int>{1});
+    CHECK(tools_by_role[erSolidInfill] == std::set<int>{1});
+    CHECK(tools_by_role[erTopSolidInfill] == std::set<int>{1});
+    CHECK(tools_by_role[erBottomSurface] == std::set<int>{1});
+}
+
+TEST_CASE("Wall flow width follows the filament to extruder map", "[MultiFilament][Regression]")
+{
+    const bool swapped = GENERATE(false, true);
+    DYNAMIC_SECTION("filament map " << (swapped ? "2,1" : "1,2")) {
+        const std::vector<int> filament_map = swapped ? std::vector<int>{2, 1} : std::vector<int>{1, 2};
+        DynamicPrintConfig config = multifilament_config(2, {
+            { "nozzle_diameter",          "0.2,0.4" },
+            { "printer_extruder_id",      "1,2" },
+            { "printer_extruder_variant", "Direct Drive Standard,Direct Drive Standard" },
+            { "outer_wall_filament_id",   1 },
+            { "inner_wall_filament_id",   1 },
+            { "outer_wall_line_width",    0 },
+            { "line_width",               0 },
+            { "layer_height",             0.1 },
+        });
+        config.option<ConfigOptionEnum<FilamentMapMode>>("filament_map_mode", true)->value = fmmManual;
+        config.option<ConfigOptionInts>("filament_map", true)->values = filament_map;
+
+        Print print;
+        Model model;
+        init_print({ cube(20) }, print, model, config);
+        REQUIRE(print.get_filament_maps() == filament_map);
+
+        const PrintObject &object          = *print.objects().front();
+        const Flow         flow            = object.printing_region(0).flow(object, frExternalPerimeter, 0.1, false);
+        const float        expected_nozzle = swapped ? 0.4f : 0.2f;
+        CHECK_THAT(flow.nozzle_diameter(), Catch::Matchers::WithinAbs(expected_nozzle, 1e-6));
+        CHECK_THAT(flow.width(), Catch::Matchers::WithinAbs(
+            Flow::auto_extrusion_width(frExternalPerimeter, expected_nozzle), 1e-6));
     }
 }
 
@@ -714,4 +775,3 @@ TEST_CASE("Multi-extruder slice stays in bounds with a short max_layer_height", 
     init_and_process_print({ cube(20) }, print, config);
     REQUIRE_FALSE(print.objects().front()->layers().empty());
 }
-

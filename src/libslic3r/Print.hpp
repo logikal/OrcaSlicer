@@ -32,6 +32,7 @@ namespace Slic3r {
 
 class GCode;
 class Layer;
+class LayerRegion;
 class ModelObject;
 class Print;
 class PrintObject;
@@ -247,6 +248,10 @@ public:
         PrintRegion         *region { nullptr };
         // Pointer to VolumeExtents::bbox.
         const BoundingBox   *bbox { nullptr };
+        // Effective base filament after the object / volume / material / layer-range chain.
+        unsigned int         base_filament { 1 };
+        // L2 projections and L3 model keys accumulated along the same scope chain.
+        t_config_option_keys explicit_keys;
         // To speed up merging of same regions.
         const VolumeRegion  *prev_same_region { nullptr };
     };
@@ -319,6 +324,22 @@ private:
     // Number of PrintObjects generated from the same ModelObject and sharing the regions.
     // ref_cnt could only be modified by the main thread, thus it does not need to be atomic.
     size_t                                      m_ref_cnt{ 0 };
+};
+
+struct FeatureCadencePlan
+{
+    double base_height = 0.;
+    double grid_height = 0.;
+    int    ratio       = 1;
+};
+
+struct CadenceZone
+{
+    double lo          = 0.;
+    double hi          = 0.;
+    bool   mixed       = false;
+    double height      = 0.;
+    double fine_height = 0.;
 };
 
 class PrintObject : public PrintObjectBaseWithState<Print, PrintObjectStep, posCount>
@@ -422,6 +443,8 @@ public:
     // Initialize the layer_height_profile from the model_object's layer_height_profile, from model_object's layer height table, or from slicing parameters.
     // Returns true, if the layer_height_profile was changed.
     static bool     update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters, std::vector<coordf_t> &layer_height_profile);
+    static bool     update_layer_height_profile(const ModelObject &model_object, const SlicingParameters &slicing_parameters,
+                                                std::vector<coordf_t> &layer_height_profile, const std::vector<CadenceZone> &cadence_zones);
 
     // Collect the slicing parameters, to be used by variable layer thickness algorithm,
     // by the interactive layer height editor and by the printing process itself.
@@ -436,6 +459,9 @@ public:
     //FIXME returing all possible regions before slicing, thus some of the regions may not be slicing at the end.
     std::vector<std::reference_wrapper<const PrintRegion>> all_regions() const;
     const PrintObjectRegions*   shared_regions() const throw() { return m_shared_regions; }
+    const std::vector<CadenceZone>& cadence_zones() const { return m_cadence_zones; }
+    bool                        layer_z_in_fine_zone(coordf_t print_z) const;
+    bool                        region_intersects_cadence_zone(const PrintRegion &region, const CadenceZone &zone) const;
 
     bool                        has_support()           const { return m_config.enable_support || m_config.enforce_support_layers > 0; }
     bool                        has_raft()              const { return m_config.raft_layers > 0; }
@@ -499,8 +525,11 @@ public:
         const ConfigOptionResolver &old_config, const ConfigOptionResolver &new_config, const std::vector<t_config_option_key> &opt_keys);
     // If ! m_slicing_params.valid, recalculate.
     void                    update_slicing_parameters();
+    FeatureCadencePlan      compute_feature_cadence_plan() const;
 
-    static PrintObjectConfig object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object, size_t num_extruders, std::vector<int>& variant_index);
+    static PrintObjectConfig object_config_from_model_object(const PrintObjectConfig &default_object_config, const ModelObject &object,
+                                                             size_t num_extruders, std::vector<int>& variant_index,
+                                                             const PrintConfig &print_config);
 
 private:
     void make_perimeters();
@@ -540,7 +569,9 @@ private:
     void bridge_over_infill();
     void clip_fill_surfaces();
     void discover_horizontal_shells();
+    void recombine_feature_cadence();
     void combine_infill();
+    static float infill_combination_clearance(const LayerRegion &layerm, InfillPattern infill_pattern);
     void _generate_support_material();
     std::pair<FillAdaptive::OctreePtr, FillAdaptive::OctreePtr> prepare_adaptive_infill_data(
         const std::vector<std::pair<const Surface*, float>>& surfaces_w_bottom_z) const;
@@ -566,6 +597,7 @@ private:
     PrintObjectRegions                     *m_shared_regions { nullptr };
 
     SlicingParameters                       m_slicing_params;
+    std::vector<CadenceZone>                m_cadence_zones;
     LayerPtrs                               m_layers;
     SupportLayerPtrs                        m_support_layers;
     // BBS
@@ -600,6 +632,11 @@ private:
     static bool clip_multipart_objects;
     static bool infill_only_where_needed;
 };
+
+void apply_filament_process_delta(PrintRegionConfig &config, const PrintConfig &print_config,
+                                  const PrintRegionConfig &global_region_defaults,
+                                  unsigned int base_filament, double object_layer_height,
+                                  const t_config_option_keys &explicit_keys);
 
 struct FakeWipeTower
 {
@@ -1037,6 +1074,8 @@ public:
     std::vector<int> get_filament_nozzle_maps() const;
     // get the group label of filament
     size_t get_extruder_id(unsigned int filament_id) const;
+    // Resolve a 1-based filament to its per-(extruder x variant) process-config slot.
+    size_t get_print_config_index(unsigned int filament_id) const;
 
     // The region every extruder can reach,
     // i.e. the intersection of all per-extruder printable areas. Falls back to the full printable_area

@@ -1084,8 +1084,8 @@ namespace client
     			            ctx->throw_exception("FloatOrPercent variable failed to resolve the \"ratio_over\" dependencies", opt.it_range);
     			        if (boost::ends_with(opt_def->ratio_over, "line_width")) {
                     		// Line width supports defaults and a complex graph of dependencies.
-                            assert(opt_parent->type() == coFloatOrPercent);
-                        	v *= Flow::extrusion_width(opt_def->ratio_over, static_cast<const ConfigOptionFloatOrPercent*>(opt_parent), *ctx, static_cast<unsigned int>(ctx->current_extruder_id));
+							assert(opt_parent->type() == coFloatOrPercent || opt_parent->type() == coFloatsOrPercents);
+							v *= Flow::extrusion_width(opt_def->ratio_over, opt_parent, *ctx, static_cast<unsigned int>(ctx->current_extruder_id));
                         	break;
                         }
                         if (opt_parent->type() == coFloat || opt_parent->type() == coFloatOrPercent) {
@@ -1141,8 +1141,8 @@ namespace client
                             ctx->throw_exception("FloatOrPercent variable failed to resolve the \"ratio_over\" dependencies", opt.it_range);
                         if (boost::ends_with(opt_def->ratio_over, "line_width")) {
                             // Line width supports defaults and a complex graph of dependencies.
-                            assert(opt_parent->type() == coFloatOrPercent);
-                            v *= Flow::extrusion_width(opt_def->ratio_over, static_cast<const ConfigOptionFloatOrPercent*>(opt_parent), *ctx, static_cast<unsigned int>(ctx->current_extruder_id));
+                            assert(opt_parent->type() == coFloatOrPercent || opt_parent->type() == coFloatsOrPercents);
+                            v *= Flow::extrusion_width(opt_def->ratio_over, opt_parent, *ctx, static_cast<unsigned int>(ctx->current_extruder_id));
                             break;
                         }
                         if (opt_parent->type() == coFloat || opt_parent->type() == coFloatOrPercent) {

@@ -76,6 +76,7 @@ private:
 
  private:
     FilamentMapManualPanel* m_manual_map_panel;
+    FilamentProcessPanel* m_process_panel{nullptr};
     FilamentMapAutoPanel* m_auto_map_panel;
     FilamentMapDefaultPanel* m_default_map_panel;
 

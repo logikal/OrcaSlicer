@@ -12,6 +12,10 @@ add_executable(${_TEST_NAME}_tests
     test_clipper_offset.cpp
     test_clipper_utils.cpp
     test_config.cpp
+    test_feature_process_config.cpp
+    test_feature_process_resolver.cpp
+    test_filament_value_overlay.cpp
+    test_filament_process_resolver.cpp
     test_config_variant_expansion.cpp
     test_toolordering_nozzle_group.cpp
     test_preset_bundle_loading.cpp
@@ -21,6 +25,7 @@ add_executable(${_TEST_NAME}_tests
     test_fill_plane_path.cpp
     test_geometry.cpp
     test_multimaterial_segmentation.cpp
+    test_nozzle_diameter_overlay.cpp
     test_placeholder_parser.cpp
     test_polygon.cpp
     test_mutable_polygon.cpp

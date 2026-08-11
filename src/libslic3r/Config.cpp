@@ -556,8 +556,20 @@ void ConfigBase::set(const std::string &opt_key, int value, bool create)
     switch (opt->type()) {
     	case coInt:    static_cast<ConfigOptionInt*>(opt)->value = value; break;
     	case coFloat:  static_cast<ConfigOptionFloat*>(opt)->value = value; break;
-		case coFloatOrPercent:  static_cast<ConfigOptionFloatOrPercent*>(opt)->value = value; static_cast<ConfigOptionFloatOrPercent*>(opt)->percent = false; break;
-		case coString: static_cast<ConfigOptionString*>(opt)->value = std::to_string(value); break;
+	case coFloatOrPercent:  static_cast<ConfigOptionFloatOrPercent*>(opt)->value = value; static_cast<ConfigOptionFloatOrPercent*>(opt)->percent = false; break;
+	case coFloatsOrPercents: {
+		if (opt_key != "line_width" &&
+		    (opt_key.size() < 11 || opt_key.compare(opt_key.size() - 11, 11, "_line_width") != 0))
+			throw BadOptionTypeException("Configbase::set() - conversion from int not possible");
+		auto *values = dynamic_cast<ConfigOptionVector<FloatOrPercent> *>(opt);
+		assert(values != nullptr);
+		if (values->values.empty())
+			values->values.emplace_back(value, false);
+		else
+			values->values.front() = {double(value), false};
+		break;
+	}
+	case coString: static_cast<ConfigOptionString*>(opt)->value = std::to_string(value); break;
     	default: throw BadOptionTypeException("Configbase::set() - conversion from int not possible");
     }
 }
@@ -567,7 +579,19 @@ void ConfigBase::set(const std::string &opt_key, double value, bool create)
     ConfigOption *opt = this->option_throw(opt_key, create);
     switch (opt->type()) {
     	case coFloat:  			static_cast<ConfigOptionFloat*>(opt)->value = value; break;
-    	case coFloatOrPercent:  static_cast<ConfigOptionFloatOrPercent*>(opt)->value = value; static_cast<ConfigOptionFloatOrPercent*>(opt)->percent = false; break;
+	case coFloatOrPercent:  static_cast<ConfigOptionFloatOrPercent*>(opt)->value = value; static_cast<ConfigOptionFloatOrPercent*>(opt)->percent = false; break;
+	case coFloatsOrPercents: {
+		if (opt_key != "line_width" &&
+		    (opt_key.size() < 11 || opt_key.compare(opt_key.size() - 11, 11, "_line_width") != 0))
+			throw BadOptionTypeException("Configbase::set() - conversion from float not possible");
+		auto *values = dynamic_cast<ConfigOptionVector<FloatOrPercent> *>(opt);
+		assert(values != nullptr);
+		if (values->values.empty())
+			values->values.emplace_back(value, false);
+		else
+			values->values.front() = {value, false};
+		break;
+	}
         case coString: 			static_cast<ConfigOptionString*>(opt)->value = float_to_string_decimal_point(value); break;
     	default: throw BadOptionTypeException("Configbase::set() - conversion from float not possible");
     }
@@ -701,14 +725,19 @@ double ConfigBase::get_abs_value_at(const t_config_option_key &opt_key, size_t i
         const ConfigOptionDef *opt_def = def->get(opt_key);
         assert(opt_def != nullptr);
 
-        if (opt_def->ratio_over.empty()) {
+        const FloatOrPercent &value = static_cast<const ConfigOptionFloatsOrPercents *>(raw_opt)->get_at(index);
+        if (!value.percent)
+            return value.value;
+        if (opt_def->ratio_over.empty())
             return 0;
-        } else {
-            const ConfigOption *ratio_opt = this->option(opt_def->ratio_over);
-            assert(ratio_opt->type() == coFloats);
-            const ConfigOptionFloats *ratio_values = static_cast<const ConfigOptionFloats *>(ratio_opt);
-            return static_cast<const ConfigOptionFloatsOrPercents *>(raw_opt)->get_at(index).get_abs_value(ratio_values->get_at(index));
-        }
+        // The ratio base may live in a different config domain (e.g. nozzle_diameter is a printer
+        // key absent from a bare print-preset config). Callers with a partial config must resolve
+        // percent values themselves; throwing beats the null-deref this used to be.
+        const ConfigOption *ratio_opt = this->option(opt_def->ratio_over);
+        if (ratio_opt == nullptr || ratio_opt->type() != coFloats)
+            throw ConfigurationError("ConfigBase::get_abs_value_at(): ratio base '" + opt_def->ratio_over +
+                                     "' for '" + opt_key + "' is not present in this config");
+        return value.get_abs_value(static_cast<const ConfigOptionFloats *>(ratio_opt)->get_at(index));
     }
 
     throw ConfigurationError("ConfigBase::get_abs_value_at(): Not a valid option type for get_abs_value_at()");
@@ -776,6 +805,10 @@ double ConfigBase::get_abs_value(const t_config_option_key &opt_key, double rati
     // Get stored option value.
     const ConfigOption *raw_opt = this->option(opt_key);
     assert(raw_opt != nullptr);
+    if (raw_opt->type() == coFloatsOrPercents) {
+        // Callers without role context use the broadcast/default column.
+        return static_cast<const ConfigOptionVector<FloatOrPercent> *>(raw_opt)->get_at(0).get_abs_value(ratio_over);
+    }
     if (raw_opt->type() != coFloatOrPercent)
         throw ConfigurationError("ConfigBase::get_abs_value(): opt_key is not of coFloatOrPercent");
     // Compute absolute value.
