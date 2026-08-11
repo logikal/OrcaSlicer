@@ -26,7 +26,11 @@ std::string strip_generated_timestamp(std::string gcode)
 void require_equivalent_gcode(const std::string &lhs, const std::string &rhs)
 {
     const auto volatile_line = [](const std::string &line) {
-        return line.rfind("; estimated printing time", 0) == 0 ||
+        // M73 progress/remaining-time annotations are estimator metadata, not geometry; the
+        // estimator's rounding differs across platforms. Geometry differences still surface
+        // through the G1 lines themselves.
+        return line.rfind("M73 ", 0) == 0 ||
+               line.rfind("; estimated printing time", 0) == 0 ||
                line.rfind("; prepare time", 0) == 0 ||
                line.rfind("; total estimated time", 0) == 0 ||
                line.rfind("; model printing time", 0) == 0;
