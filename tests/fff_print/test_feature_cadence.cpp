@@ -500,6 +500,50 @@ TEST_CASE("An object's base filament supplies its process delta", "[FeatureCaden
     CHECK_THAT(print.objects().front()->config().layer_height.value, Catch::Matchers::WithinAbs(0.12, 1e-9));
 }
 
+TEST_CASE("A single-nozzle two-colour print stays unzoned and slices", "[FeatureCadence][CadenceZones][Regression]")
+{
+    // The vendor-profile slice check's scene: one nozzle, two filaments, a layer range switching
+    // to filament 2 partway up, prime tower on. Zone computation once manufactured zones from the
+    // layer-range boundary (span-fitted heights differing by float noise), desynced layering, and
+    // broke the wipe tower on every single-nozzle vendor profile.
+    DynamicPrintConfig config = DynamicPrintConfig::full_print_config();
+    config.set_deserialize_strict({{"nozzle_diameter", "0.4"},
+                                   {"filament_diameter", "1.75,1.75"},
+                                   {"filament_map", "1,1"},
+                                   {"layer_height", 0.2},
+                                   {"initial_layer_print_height", 0.25},
+                                   {"enable_prime_tower", true},
+                                   {"wipe_tower_x", 40.},
+                                   {"use_relative_e_distances", true},
+                                   {"before_layer_change_gcode", ";BEFORE_LAYER_CHANGE\nG92 E0"},
+                                   {"wipe_tower_y", 40.},
+                                   {"skirt_loops", 0}});
+
+    Print print;
+    Model model;
+    ModelObject *object = model.add_object();
+    object->name = "two-colour";
+    object->add_volume(cube(10.));
+    object->add_instance();
+    DynamicPrintConfig range_config;
+    range_config.set_key_value("extruder", new ConfigOptionInt(2));
+    range_config.set_key_value("layer_height", new ConfigOptionFloat(0.2));
+    object->layer_config_ranges[{4.0, 10.0}].assign_config(std::move(range_config));
+    object->ensure_on_bed();
+    print.auto_assign_extruders(object);
+    print.apply(model, config);
+
+    CHECK(print.objects().front()->cadence_zones().empty());
+    CHECK(print.objects().front()->slicing_parameters().cadence_zone_digest == 0);
+    const StringObjectException error = print.validate();
+    INFO(error.string);
+    REQUIRE(error.string.empty());
+    print.set_status_silent();
+    REQUIRE_NOTHROW(print.process());
+    // Full g-code assembly across real vendor profiles is covered by the profile validator's
+    // slice check (OrcaSlicer_profile_validator -s), which is where this regression surfaced.
+}
+
 TEST_CASE("Multiple separated fine zones validate and slice", "[FeatureCadence][FilamentProcess][Zones][Regression]")
 {
     // ZoneRuler shape: a coarse staircase with a fine 1.2mm cap on each step — three disjoint

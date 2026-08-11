@@ -4480,6 +4480,32 @@ static std::vector<CadenceZone> compute_cadence_zones(const PrintObject &object,
         }
     };
 
+    // Zones exist to separate DIFFERENT layer heights (and the nozzles that own them). When every
+    // contribution resolves to one height on one nozzle diameter — every ordinary print, including
+    // multi-colour on a single-nozzle machine — there is nothing to zone: geometric boundaries
+    // (parts, layer ranges) must not manufacture zones whose span-fitted heights differ only by
+    // floating-point noise and destabilize layering. (Found by the vendor-profile slice check.)
+    {
+        std::vector<double> distinct_heights;
+        std::set<long long> distinct_nozzles;
+        const auto note_tool = [&](unsigned int filament_id) {
+            const size_t tool = get_extruder_index_from_filament_id(print_config, std::max(int(filament_id), 1));
+            distinct_nozzles.insert(llround(print_config.nozzle_diameter.get_at(tool) * 1e6));
+        };
+        for (const Contribution &contribution : contributions) {
+            const PrintRegionConfig &config = contribution.region->config();
+            note_tool(std::max(config.outer_wall_filament_id.value, 1));
+            note_tool(std::max(config.inner_wall_filament_id.value, 1));
+            for (FeatureRole role : roles) {
+                append_unique_height(distinct_heights, feature_height_for_role(config, role, plan.base_height));
+                if (role != FeatureRole::Wall)
+                    note_tool(filament_for_role(config, role));
+            }
+        }
+        if (distinct_heights.size() <= 1 && distinct_nozzles.size() <= 1)
+            return {};
+    }
+
     std::vector<double> geometric_boundaries{0., object_height};
     geometric_boundaries.reserve(2 + contributions.size() * 2);
     for (const Contribution &contribution : contributions) {
