@@ -3,6 +3,8 @@
 #include "test_helpers.hpp"
 
 #include <cmath>
+#include <cctype>
+#include <sstream>
 
 using namespace Slic3r;
 using namespace Slic3r::Test;
@@ -17,6 +19,54 @@ std::string strip_generated_timestamp(std::string gcode)
         gcode.erase(begin, end == std::string::npos ? std::string::npos : end - begin + 1);
     }
     return gcode;
+}
+
+// Compare two exports line by line, skipping wall-clock-dependent header lines, and report the
+// first divergence precisely (a whole-file compare is undebuggable in CI output).
+void require_equivalent_gcode(const std::string &lhs, const std::string &rhs)
+{
+    const auto volatile_line = [](const std::string &line) {
+        return line.rfind("; estimated printing time", 0) == 0 ||
+               line.rfind("; prepare time", 0) == 0 ||
+               line.rfind("; total estimated time", 0) == 0 ||
+               line.rfind("; model printing time", 0) == 0;
+    };
+    // Object-label ids are process-global counters, unstable across Print instantiations and
+    // test execution order; the label text itself is what must match.
+    const auto normalize = [](std::string line) {
+        if (line.rfind("; printing object", 0) == 0 || line.rfind("; stop printing object", 0) == 0) {
+            const size_t id = line.find(" id:");
+            if (id != std::string::npos) {
+                size_t end = id + 4;
+                while (end < line.size() && std::isdigit(static_cast<unsigned char>(line[end])))
+                    ++end;
+                line.erase(id, end - id);
+            }
+        }
+        return line;
+    };
+    std::istringstream ls(lhs), rs(rhs);
+    std::string ll, rl;
+    size_t line_no = 0;
+    while (true) {
+        bool lok = bool(std::getline(ls, ll));
+        bool rok = bool(std::getline(rs, rl));
+        while (lok && volatile_line(ll)) lok = bool(std::getline(ls, ll));
+        while (rok && volatile_line(rl)) rok = bool(std::getline(rs, rl));
+        ++line_no;
+        if (!lok || !rok) {
+            INFO("uneven line counts near line " << line_no);
+            REQUIRE(lok == rok);
+            return;
+        }
+        ll = normalize(ll);
+        rl = normalize(rl);
+        if (ll != rl) {
+            INFO("first differing line " << line_no << ":\n  baseline: " << ll << "\n  expanded: " << rl);
+            REQUIRE(ll == rl);
+            return;
+        }
+    }
 }
 
 double header_width(const std::string &gcode, const std::string &label)
@@ -73,8 +123,8 @@ TEST_CASE("Uniform-nozzle scalar width presets keep byte-identical G-code", "[Li
     expanded_print.validate();
     expanded_print.set_status_silent();
 
-    CHECK(strip_generated_timestamp(gcode(baseline_print)) ==
-          strip_generated_timestamp(gcode(expanded_print)));
+    require_equivalent_gcode(strip_generated_timestamp(gcode(baseline_print)),
+                             strip_generated_timestamp(gcode(expanded_print)));
 }
 
 TEST_CASE("Mixed tools use the line width column for each extrusion role", "[LineWidthVariants][GCode]")
